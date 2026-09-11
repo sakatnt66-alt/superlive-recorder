@@ -18,64 +18,151 @@ jobs:
   record-test:
     name: Record livestream test
     runs-on: ubuntu-latest
+
+    # Maximum time allowed for this test job.
     timeout-minutes: 15
 
     steps:
+
+      # --------------------------------------------------------
+      # 1. Download repository
+      # --------------------------------------------------------
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
+
+      # --------------------------------------------------------
+      # 2. Install Python
+      # --------------------------------------------------------
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
+
+      # --------------------------------------------------------
+      # 3. Install FFmpeg
+      # --------------------------------------------------------
+
       - name: Install FFmpeg
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
+
+
+      # --------------------------------------------------------
+      # 4. Install Python dependencies
+      # --------------------------------------------------------
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+
+      # --------------------------------------------------------
+      # 5. Install Chromium for Playwright
+      # --------------------------------------------------------
+
       - name: Install Playwright Chromium
         run: |
           python -m playwright install --with-deps chromium
 
+
+      # --------------------------------------------------------
+      # 6. Verify environment
+      # --------------------------------------------------------
+
       - name: Check environment
         run: |
-          echo "Python:"
+          echo "========================================"
+          echo "Python"
+          echo "========================================"
           python --version
 
-          echo "FFmpeg:"
+          echo ""
+          echo "========================================"
+          echo "FFmpeg"
+          echo "========================================"
           ffmpeg -version | head -n 1
 
-          echo "FFprobe:"
+          echo ""
+          echo "========================================"
+          echo "FFprobe"
+          echo "========================================"
           ffprobe -version | head -n 1
 
-          echo "Playwright:"
+          echo ""
+          echo "========================================"
+          echo "Playwright"
+          echo "========================================"
           python -c "import playwright; print('Playwright OK')"
+
+
+      # --------------------------------------------------------
+      # 7. Check Python syntax
+      # --------------------------------------------------------
 
       - name: Check recorder syntax
         run: |
           python -m py_compile record_once.py
+          echo "record_once.py syntax OK"
+
+
+      # --------------------------------------------------------
+      # 8. Prepare directories
+      # --------------------------------------------------------
 
       - name: Prepare recording directories
         run: |
           mkdir -p recordings
           mkdir -p recordings/_temp
 
+          echo "Recording directories ready."
+
+
+      # --------------------------------------------------------
+      # 9. Start actual recording
+      # --------------------------------------------------------
+
       - name: Start recording
         env:
           RECORDINGS_DIR: ./recordings
+
+          # Each MP4 segment target.
           SEGMENT_SECONDS: "90"
+
+          # Browser MediaRecorder bitrate.
           VIDEO_BITRATE: "4000000"
           AUDIO_BITRATE: "128000"
+
+          # IMPORTANT:
+          # Convert the minutes entered in the GitHub UI
+          # into seconds for record_once.py.
+          RECORD_DURATION_SECONDS: ${{ fromJSON(inputs.duration_minutes) * 60 }}
+
         run: |
+
           echo "========================================"
-          echo "Starting livestream recording"
-          echo "Duration requested: ${{ inputs.duration_minutes }} minutes"
+          echo "SUPERLIVE RECORDING TEST"
+          echo "========================================"
+
+          echo "URL:"
+          echo "${{ inputs.test_url }}"
+
+          echo ""
+          echo "Duration:"
+          echo "${{ inputs.duration_minutes }} minutes"
+
+          echo ""
+          echo "Duration in seconds:"
+          echo "${{ fromJSON(inputs.duration_minutes) * 60 }}"
+
+          echo ""
+          echo "========================================"
+          echo "Starting recorder..."
           echo "========================================"
 
           python record_once.py "${{ inputs.test_url }}" &
@@ -83,55 +170,69 @@ jobs:
 
           echo "Recorder PID: $RECORDER_PID"
 
-          DURATION_SECONDS=$(( ${{ inputs.duration_minutes }} * 60 ))
+          # Wait until the recorder exits by itself
+          # after RECORD_DURATION_SECONDS.
+          #
+          # We do NOT use sleep here to stop the process.
+          # The recorder itself controls the recording duration
+          # and performs a graceful MediaRecorder/FFmpeg shutdown.
 
-          echo "Waiting ${DURATION_SECONDS} seconds..."
+          while kill -0 "$RECORDER_PID" 2>/dev/null; do
 
-          sleep "$DURATION_SECONDS"
+            echo "Recorder is still running..."
 
-          echo "========================================"
-          echo "Recording test duration reached."
-          echo "Requesting graceful stop..."
-          echo "========================================"
+            sleep 10
 
-          kill -INT "$RECORDER_PID" || true
-
-          # Give the recorder time to finalize MediaRecorder and FFmpeg.
-          for i in {1..30}; do
-            if ! kill -0 "$RECORDER_PID" 2>/dev/null; then
-              echo "Recorder stopped successfully."
-              break
-            fi
-
-            echo "Waiting for recorder to finish... $i/30"
-            sleep 1
           done
 
-          # Safety fallback.
-          if kill -0 "$RECORDER_PID" 2>/dev/null; then
-            echo "Recorder did not stop gracefully."
-            echo "Sending TERM..."
-            kill -TERM "$RECORDER_PID" || true
-            sleep 5
-          fi
+          echo ""
+          echo "========================================"
+          echo "Recorder process finished."
+          echo "========================================"
+
+          # Do not immediately fail here.
+          # The validation step below will determine
+          # whether valid MP4 files were produced.
 
           wait "$RECORDER_PID" || true
+
+
+      # --------------------------------------------------------
+      # 10. Show generated files
+      # --------------------------------------------------------
 
       - name: List recordings
         if: always()
         run: |
+
           echo "========================================"
-          echo "Recording files"
+          echo "GENERATED RECORDINGS"
           echo "========================================"
 
-          find recordings -type f -printf '%p | %s bytes\n' \
-            | sort || true
+          if [ -d recordings ]; then
+
+            find recordings \
+              -type f \
+              -printf '%p | %s bytes\n' \
+              | sort
+
+          else
+
+            echo "No recordings directory found."
+
+          fi
+
+
+      # --------------------------------------------------------
+      # 11. Validate MP4 files with FFprobe
+      # --------------------------------------------------------
 
       - name: Validate MP4 files
         if: always()
         run: |
+
           echo "========================================"
-          echo "Validating MP4 files"
+          echo "VALIDATING MP4 FILES"
           echo "========================================"
 
           shopt -s nullglob
@@ -139,21 +240,73 @@ jobs:
           files=(recordings/*.mp4)
 
           if [ ${#files[@]} -eq 0 ]; then
+
             echo "ERROR: No MP4 files were produced."
+
             exit 1
+
           fi
 
+          echo "Found ${#files[@]} MP4 file(s)."
+
           for file in "${files[@]}"; do
+
             echo ""
-            echo "Checking: $file"
+            echo "----------------------------------------"
+            echo "File: $file"
+            echo "----------------------------------------"
 
             ffprobe \
               -v error \
-              -show_entries format=duration,size,format_name \
-              -show_entries stream=index,codec_type,codec_name,width,height \
+              -show_entries \
+              format=duration,size,format_name \
+              -show_entries \
+              stream=index,codec_type,codec_name,width,height \
               -of json \
               "$file"
+
           done
+
+
+      # --------------------------------------------------------
+      # 12. Display file sizes
+      # --------------------------------------------------------
+
+      - name: Check recording sizes
+        if: always()
+        run: |
+
+          echo "========================================"
+          echo "RECORDING SIZES"
+          echo "========================================"
+
+          shopt -s nullglob
+
+          files=(recordings/*.mp4)
+
+          if [ ${#files[@]} -eq 0 ]; then
+
+            echo "No MP4 files found."
+
+            exit 0
+
+          fi
+
+          for file in "${files[@]}"; do
+
+            SIZE_BYTES=$(stat -c%s "$file")
+
+            SIZE_MB=$(awk \
+              "BEGIN {printf \"%.2f\", $SIZE_BYTES / 1024 / 1024}")
+
+            echo "$file -> $SIZE_MB MB"
+
+          done
+
+
+      # --------------------------------------------------------
+      # 13. Upload recordings to GitHub Actions
+      # --------------------------------------------------------
 
       - name: Upload recordings
         if: always()
