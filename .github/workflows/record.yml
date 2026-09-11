@@ -1,5 +1,4 @@
 name: SuperLive Recorder
-
 on:
   workflow_dispatch:
     inputs:
@@ -7,226 +6,79 @@ on:
         description: "Livestream URL"
         required: true
         type: string
-
       duration_minutes:
         description: "Recording duration in minutes"
         required: false
         default: "5"
         type: string
 
-
 jobs:
-
   record-test:
-
     name: Record livestream
-
     runs-on: ubuntu-latest
-
-    timeout-minutes: 15
-
-
+    timeout-minutes: 30
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v4
-
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-
-      - name: Install FFmpeg
+      - name: Install System Dependencies (FFmpeg + Xvfb)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
-
+          sudo apt-get install -y ffmpeg xvfb
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-
       - name: Install Playwright Chromium
         run: |
           python -m playwright install --with-deps chromium
-
-
-      - name: Check environment
-        run: |
-          echo "========================================"
-          echo "ENVIRONMENT"
-          echo "========================================"
-
-          python --version
-
-          echo ""
-          echo "FFmpeg:"
-          ffmpeg -version | head -n 1
-
-          echo ""
-          echo "FFprobe:"
-          ffprobe -version | head -n 1
-
-          echo ""
-          echo "Playwright:"
-          python -m playwright --version
-
-          echo ""
-          echo "Chromium:"
-          python -m playwright install --list
-
-
-      - name: Check Python syntax
-        run: |
-          python -m py_compile record_once.py
-
 
       - name: Prepare directories
         run: |
           mkdir -p recordings
           mkdir -p recordings/_temp
 
-
-      - name: Start recording
+      - name: Start recording (with Virtual Display)
         env:
-          # IMPORTANT:
-          # Pass the URL entered in GitHub Actions
-          # directly to record_once.py.
           RECORD_URL: ${{ inputs.test_url }}
-
           RECORDINGS_DIR: ./recordings
-
-          # 60 seconds is intentionally conservative
-          # for Telegram's ordinary 50 MB upload limit.
           SEGMENT_SECONDS: 60
-
-          # Browser-side MediaRecorder bitrate.
           VIDEO_BITRATE: 4000000
           AUDIO_BITRATE: 128000
-
           PAGE_TIMEOUT_MS: 60000
-
-          # Give the site up to 2 minutes to establish WebRTC.
           VIDEO_WAIT_SECONDS: 120
-
-          # Do not waste several minutes on a bad WebRTC stream.
-          # The recorder will try another candidate if needed.
-          FIRST_CHUNK_TIMEOUT_SECONDS: 15
-
-          # Maximum number of WebRTC stream candidates to test.
+          FIRST_CHUNK_TIMEOUT_SECONDS: 20
           MAX_CANDIDATES: 8
-
         run: |
-
           DURATION_SECONDS=$(( ${{ inputs.duration_minutes }} * 60 ))
-
           export RECORD_DURATION_SECONDS="$DURATION_SECONDS"
-
           echo "========================================"
-          echo "SUPERLIVE RECORDER"
+          echo "SUPERLIVE RECORDER (XVFB EDITION)"
           echo "========================================"
-
-          echo "Requested URL:"
-          echo "${{ inputs.test_url }}"
-
-          echo ""
-          echo "Environment RECORD_URL:"
-          echo "${RECORD_URL}"
-
-          echo ""
-          echo "Duration:"
-          echo "${{ inputs.duration_minutes }} minutes"
-
-          echo "${DURATION_SECONDS} seconds"
-
+          echo "URL: ${RECORD_URL}"
+          echo "Duration: ${DURATION_SECONDS}s"
           echo "========================================"
-
-
-          # record_once.py reads RECORD_URL from the environment.
-          python record_once.py
-
-          RECORDER_EXIT_CODE=$?
-
-          echo ""
-          echo "Recorder exit code: ${RECORDER_EXIT_CODE}"
-
-          exit "${RECORDER_EXIT_CODE}"
-
-
-      - name: List all output files
-        if: always()
-        run: |
-
-          echo "========================================"
-          echo "OUTPUT FILES"
-          echo "========================================"
-
-          find recordings \
-            -maxdepth 2 \
-            -type f \
-            -printf '%p | %s bytes\n' \
-            | sort || true
-
-
-      - name: Validate recordings
-        if: always()
-        run: |
-
-          echo "========================================"
-          echo "MP4 VALIDATION"
-          echo "========================================"
-
-          FOUND=0
-
-          for file in recordings/*.mp4; do
-
-            if [ -f "$file" ]; then
-
-              FOUND=1
-
-              echo ""
-              echo "----------------------------------------"
-              echo "FILE:"
-              echo "$file"
-
-              echo "SIZE:"
-              ls -lh "$file"
-
-              echo ""
-              echo "FFPROBE:"
-
-              ffprobe \
-                -v error \
-                -show_entries \
-                format=duration,size,format_name \
-                -of default=noprint_wrappers=1 \
-                "$file" || true
-
-            fi
-
-          done
-
-
-          if [ "$FOUND" -eq 0 ]; then
-            echo ""
-            echo "No MP4 recordings were produced."
-          fi
-
+          
+          # xvfb-run creates a virtual screen so headless=False works perfectly!
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" python record_once.py
+          
+          exit $?
 
       - name: Upload recordings and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: superlive-test-results
+          name: superlive-recordings
           path: |
             recordings/*.mp4
             recordings/_temp/*
             recordings/_diagnostic.png
-            recordings/_diagnostic.html
-            recordings/_diagnostic.json
           if-no-files-found: warn
           retention-days: 7
