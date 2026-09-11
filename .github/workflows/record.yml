@@ -93,6 +93,11 @@ jobs:
 
       - name: Start recording
         env:
+          # IMPORTANT:
+          # Pass the URL entered in GitHub Actions
+          # directly to record_once.py.
+          RECORD_URL: ${{ inputs.test_url }}
+
           RECORDINGS_DIR: ./recordings
 
           # 60 seconds is intentionally conservative
@@ -108,6 +113,13 @@ jobs:
           # Give the site up to 2 minutes to establish WebRTC.
           VIDEO_WAIT_SECONDS: 120
 
+          # Do not waste several minutes on a bad WebRTC stream.
+          # The recorder will try another candidate if needed.
+          FIRST_CHUNK_TIMEOUT_SECONDS: 15
+
+          # Maximum number of WebRTC stream candidates to test.
+          MAX_CANDIDATES: 8
+
         run: |
 
           DURATION_SECONDS=$(( ${{ inputs.duration_minutes }} * 60 ))
@@ -117,16 +129,25 @@ jobs:
           echo "========================================"
           echo "SUPERLIVE RECORDER"
           echo "========================================"
-          echo "URL:"
+
+          echo "Requested URL:"
           echo "${{ inputs.test_url }}"
+
+          echo ""
+          echo "Environment RECORD_URL:"
+          echo "${RECORD_URL}"
+
           echo ""
           echo "Duration:"
           echo "${{ inputs.duration_minutes }} minutes"
+
           echo "${DURATION_SECONDS} seconds"
+
           echo "========================================"
 
 
-          python record_once.py "${{ inputs.test_url }}"
+          # record_once.py reads RECORD_URL from the environment.
+          python record_once.py
 
           RECORDER_EXIT_CODE=$?
 
@@ -171,6 +192,7 @@ jobs:
               echo "----------------------------------------"
               echo "FILE:"
               echo "$file"
+
               echo "SIZE:"
               ls -lh "$file"
 
@@ -202,6 +224,7 @@ jobs:
           name: superlive-test-results
           path: |
             recordings/*.mp4
+            recordings/_temp/*
             recordings/_diagnostic.png
             recordings/_diagnostic.html
             recordings/_diagnostic.json
