@@ -2,9 +2,7 @@ import asyncio
 import base64
 import json
 import os
-import shutil
 import signal
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -23,7 +21,7 @@ RECORDINGS_DIR = Path(
 TEMP_DIR = RECORDINGS_DIR / "_temp"
 
 SEGMENT_SECONDS = int(
-    os.getenv("SEGMENT_SECONDS", "90")
+    os.getenv("SEGMENT_SECONDS", "60")
 )
 
 RECORD_DURATION_SECONDS = int(
@@ -42,73 +40,99 @@ PAGE_TIMEOUT_MS = int(
     os.getenv("PAGE_TIMEOUT_MS", "60000")
 )
 
-HEALTH_INTERVAL = 10
-
-FFMPEG = os.getenv(
-    "FFMPEG",
-    "ffmpeg"
+VIDEO_WAIT_SECONDS = int(
+    os.getenv("VIDEO_WAIT_SECONDS", "120")
 )
 
-FFPROBE = os.getenv(
-    "FFPROBE",
-    "ffprobe"
+CHUNK_TRANSFER_TIMEOUT = int(
+    os.getenv("CHUNK_TRANSFER_TIMEOUT", "30")
 )
 
 
 # ============================================================
-# Global stop flag
+# Global stop handling
 # ============================================================
 
 _stop_requested = False
 
 
+def request_stop(signum=None, frame=None):
+    global _stop_requested
+
+    if not _stop_requested:
+        print("")
+        print("[STOP] Stop requested.")
+        _stop_requested = True
+
+
+signal.signal(signal.SIGINT, request_stop)
+
+if hasattr(signal, "SIGTERM"):
+    signal.signal(signal.SIGTERM, request_stop)
+
+
 # ============================================================
-# WebRTC hook
-# IMPORTANT:
-# This must be installed before page navigation.
+# WebRTC / media hook
 # ============================================================
 
 WEBRTC_HOOK = r"""
 (() => {
-    if (window.__superliveWebRTCHookInstalled) {
+    if (window.__superliveHookInstalled) {
         return;
     }
 
-    window.__superliveWebRTCHookInstalled = true;
+    window.__superliveHookInstalled = true;
 
-    window.__superliveTracks = {
-        audio: new Set(),
-        video: new Set(),
-        all: new Set()
+    window.__superliveState = {
+        peerConnections: [],
+        tracks: [],
+        streams: [],
+        videos: [],
+        errors: [],
+        logs: []
     };
 
-    window.__superliveStreams = new Set();
+    const state = window.__superliveState;
 
-    const OriginalPC =
-        window.RTCPeerConnection ||
-        window.webkitRTCPeerConnection;
-
-    if (!OriginalPC) {
-        return;
-    }
-
-    function rememberTrack(track) {
+    function log(message) {
         try {
-            window.__superliveTracks.all.add(track);
-
-            if (track.kind === "video") {
-                window.__superliveTracks.video.add(track);
-            }
-
-            if (track.kind === "audio") {
-                window.__superliveTracks.audio.add(track);
+            state.logs.push(String(message));
+            if (state.logs.length > 200) {
+                state.logs.shift();
             }
         } catch (_) {}
     }
 
-    function rememberStream(stream) {
+    function rememberTrack(track) {
+        if (!track) return;
+
         try {
-            window.__superliveStreams.add(stream);
+            if (!state.tracks.includes(track)) {
+                state.tracks.push(track);
+            }
+
+            log(
+                "TRACK " +
+                track.kind +
+                " id=" +
+                track.id +
+                " readyState=" +
+                track.readyState +
+                " enabled=" +
+                track.enabled +
+                " muted=" +
+                track.muted
+            );
+        } catch (_) {}
+    }
+
+    function rememberStream(stream) {
+        if (!stream) return;
+
+        try {
+            if (!state.streams.includes(stream)) {
+                state.streams.push(stream);
+            }
 
             for (const track of stream.getTracks()) {
                 rememberTrack(track);
@@ -116,767 +140,1070 @@ WEBRTC_HOOK = r"""
         } catch (_) {}
     }
 
-    function HookedPC(...args) {
-        const pc = new OriginalPC(...args);
+    // --------------------------------------------------------
+    // RTCPeerConnection interception
+    // --------------------------------------------------------
 
-        try {
-            pc.addEventListener(
-                "track",
-                event => {
+    const OriginalRTCPeerConnection =
+        window.RTCPeerConnection ||
+        window.webkitRTCPeerConnection;
+
+    if (OriginalRTCPeerConnection) {
+
+        class SuperLiveRTCPeerConnection
+            extends OriginalRTCPeerConnection {
+
+            constructor(...args) {
+                super(...args);
+
+                try {
+                    state.peerConnections.push(this);
+                } catch (_) {}
+
+                const rememberEvent = (event) => {
                     try {
-                        rememberTrack(event.track);
+                        if (event && event.track) {
+                            rememberTrack(event.track);
+                        }
 
-                        if (event.streams) {
+                        if (event && event.streams) {
                             for (const stream of event.streams) {
                                 rememberStream(stream);
                             }
                         }
-                    } catch (_) {}
-                }
-            );
-        } catch (_) {}
 
-        return pc;
+                        log(
+                            "ONTRACK " +
+                            (
+                                event &&
+                                event.track &&
+                                event.track.kind
+                            )
+                        );
+                    } catch (_) {}
+                };
+
+                try {
+                    this.addEventListener(
+                        "track",
+                        rememberEvent
+                    );
+                } catch (_) {}
+
+                try {
+                    const originalOnTrack =
+                        Object.getOwnPropertyDescriptor(
+                            Object.getPrototypeOf(this),
+                            "ontrack"
+                        );
+
+                    if (originalOnTrack) {
+                        Object.defineProperty(
+                            this,
+                            "ontrack",
+                            {
+                                configurable: true,
+                                get() {
+                                    return originalOnTrack.get.call(this);
+                                },
+                                set(fn) {
+                                    const wrapped = function(event) {
+                                        rememberEvent(event);
+
+                                        if (typeof fn === "function") {
+                                            return fn.call(
+                                                this,
+                                                event
+                                            );
+                                        }
+                                    };
+
+                                    return originalOnTrack.set.call(
+                                        this,
+                                        wrapped
+                                    );
+                                }
+                            }
+                        );
+                    }
+                } catch (_) {}
+            }
+        }
+
+        window.RTCPeerConnection =
+            SuperLiveRTCPeerConnection;
+
+        window.webkitRTCPeerConnection =
+            SuperLiveRTCPeerConnection;
     }
 
-    HookedPC.prototype = OriginalPC.prototype;
+    // --------------------------------------------------------
+    // HTMLMediaElement.srcObject interception
+    // --------------------------------------------------------
 
     try {
-        for (const key of Object.keys(OriginalPC)) {
-            try {
-                HookedPC[key] = OriginalPC[key];
-            } catch (_) {}
+        const mediaPrototype =
+            HTMLMediaElement.prototype;
+
+        const srcObjectDescriptor =
+            Object.getOwnPropertyDescriptor(
+                mediaPrototype,
+                "srcObject"
+            );
+
+        if (
+            srcObjectDescriptor &&
+            srcObjectDescriptor.set &&
+            srcObjectDescriptor.get
+        ) {
+            Object.defineProperty(
+                mediaPrototype,
+                "srcObject",
+                {
+                    configurable: true,
+
+                    get() {
+                        return srcObjectDescriptor.get.call(this);
+                    },
+
+                    set(value) {
+                        try {
+                            if (value) {
+                                rememberStream(value);
+                            }
+                        } catch (_) {}
+
+                        return srcObjectDescriptor.set.call(
+                            this,
+                            value
+                        );
+                    }
+                }
+            );
         }
     } catch (_) {}
 
-    window.RTCPeerConnection = HookedPC;
+    // --------------------------------------------------------
+    // Video discovery
+    // --------------------------------------------------------
 
-    window.__superliveGetTracks = () => {
+    function rememberVideo(video) {
+        try {
+            if (!state.videos.includes(video)) {
+                state.videos.push(video);
+            }
+
+            if (video.srcObject) {
+                rememberStream(video.srcObject);
+            }
+        } catch (_) {}
+    }
+
+    function scanVideos() {
+        try {
+            document
+                .querySelectorAll("video")
+                .forEach(rememberVideo);
+        } catch (_) {}
+    }
+
+    try {
+        const observer =
+            new MutationObserver(() => {
+                scanVideos();
+            });
+
+        observer.observe(
+            document.documentElement || document,
+            {
+                subtree: true,
+                childList: true
+            }
+        );
+    } catch (_) {}
+
+    setInterval(scanVideos, 1000);
+
+    // --------------------------------------------------------
+    // Exposed diagnostics
+    // --------------------------------------------------------
+
+    window.__superliveGetState = () => {
+        const videos = [];
+
+        try {
+            document
+                .querySelectorAll("video")
+                .forEach((video) => {
+                    let tracks = [];
+
+                    try {
+                        if (video.srcObject) {
+                            tracks =
+                                video.srcObject
+                                    .getTracks()
+                                    .map(t => ({
+                                        kind: t.kind,
+                                        id: t.id,
+                                        readyState: t.readyState,
+                                        enabled: t.enabled,
+                                        muted: t.muted
+                                    }));
+                        }
+                    } catch (_) {}
+
+                    videos.push({
+                        readyState: video.readyState,
+                        paused: video.paused,
+                        ended: video.ended,
+                        muted: video.muted,
+                        autoplay: video.autoplay,
+                        width: video.videoWidth,
+                        height: video.videoHeight,
+                        currentTime: video.currentTime,
+                        hasSrcObject: !!video.srcObject,
+                        tracks
+                    });
+                });
+        } catch (_) {}
+
         return {
-            audio: Array.from(
-                window.__superliveTracks.audio
-            ),
+            peerConnections: state.peerConnections.length,
 
-            video: Array.from(
-                window.__superliveTracks.video
-            ),
+            tracks: state.tracks.map(track => ({
+                kind: track.kind,
+                id: track.id,
+                readyState: track.readyState,
+                enabled: track.enabled,
+                muted: track.muted
+            })),
 
-            all: Array.from(
-                window.__superliveTracks.all
-            )
+            streams: state.streams.length,
+
+            videos,
+
+            logs: state.logs.slice(-100),
+
+            errors: state.errors.slice(-100)
         };
     };
+
+    // --------------------------------------------------------
+    // Find / prepare recording stream
+    // --------------------------------------------------------
+
+    window.__superlivePrepareRecordingStream = () => {
+
+        scanVideos();
+
+        let videoTrack = null;
+        let audioTrack = null;
+
+        // First: inspect all video elements.
+        for (const video of state.videos) {
+
+            try {
+                if (video.srcObject) {
+
+                    const tracks =
+                        video.srcObject.getTracks();
+
+                    for (const track of tracks) {
+
+                        if (
+                            track.kind === "video" &&
+                            track.readyState === "live"
+                        ) {
+                            videoTrack = track;
+                        }
+
+                        if (
+                            track.kind === "audio" &&
+                            track.readyState === "live" &&
+                            !track.muted
+                        ) {
+                            audioTrack = track;
+                        }
+                    }
+                }
+            } catch (_) {}
+        }
+
+        // Second: inspect remembered WebRTC tracks.
+        if (!videoTrack) {
+            videoTrack =
+                state.tracks.find(
+                    track =>
+                        track.kind === "video" &&
+                        track.readyState === "live"
+                ) || null;
+        }
+
+        if (!audioTrack) {
+            audioTrack =
+                state.tracks.find(
+                    track =>
+                        track.kind === "audio" &&
+                        track.readyState === "live" &&
+                        !track.muted
+                ) || null;
+        }
+
+        // Third: inspect all remembered streams.
+        if (!videoTrack || !audioTrack) {
+
+            for (const stream of state.streams) {
+
+                try {
+                    if (!videoTrack) {
+                        videoTrack =
+                            stream
+                                .getVideoTracks()
+                                .find(
+                                    t =>
+                                        t.readyState === "live"
+                                ) || null;
+                    }
+
+                    if (!audioTrack) {
+                        audioTrack =
+                            stream
+                                .getAudioTracks()
+                                .find(
+                                    t =>
+                                        t.readyState === "live" &&
+                                        !t.muted
+                                ) || null;
+                    }
+                } catch (_) {}
+            }
+        }
+
+        if (!videoTrack) {
+            return {
+                ok: false,
+                reason: "No live video WebRTC track found."
+            };
+        }
+
+        const stream =
+            new MediaStream();
+
+        stream.addTrack(videoTrack);
+
+        if (audioTrack) {
+            stream.addTrack(audioTrack);
+        }
+
+        window.__superliveRecordingStream = stream;
+
+        return {
+            ok: true,
+
+            hasVideo: true,
+
+            hasAudio: !!audioTrack,
+
+            videoTrack: {
+                id: videoTrack.id,
+                readyState: videoTrack.readyState
+            },
+
+            audioTrack: audioTrack
+                ? {
+                    id: audioTrack.id,
+                    readyState: audioTrack.readyState
+                }
+                : null
+        };
+    };
+
+
+    // --------------------------------------------------------
+    // Recorder
+    // --------------------------------------------------------
+
+    window.__superliveRecorder = null;
+
+    window.__superliveRecorderQueue = [];
+
+    window.__superliveRecorderDone = false;
+
+    window.__superliveRecorderError = null;
+
+    window.__superliveRecorderBytes = 0;
+
+    window.__superliveStartRecorder = (videoBits, audioBits) => {
+
+        const stream =
+            window.__superliveRecordingStream;
+
+        if (!stream) {
+            throw new Error(
+                "Recording stream does not exist."
+            );
+        }
+
+        const mimeCandidates = [
+            "video/webm;codecs=vp9,opus",
+            "video/webm;codecs=vp8,opus",
+            "video/webm"
+        ];
+
+        let mimeType = "";
+
+        for (const candidate of mimeCandidates) {
+
+            try {
+                if (
+                    MediaRecorder.isTypeSupported(
+                        candidate
+                    )
+                ) {
+                    mimeType = candidate;
+                    break;
+                }
+            } catch (_) {}
+        }
+
+        const options = {
+            videoBitsPerSecond: videoBits,
+            audioBitsPerSecond: audioBits
+        };
+
+        if (mimeType) {
+            options.mimeType = mimeType;
+        }
+
+        const recorder =
+            new MediaRecorder(
+                stream,
+                options
+            );
+
+        window.__superliveRecorder =
+            recorder;
+
+        window.__superliveRecorderQueue = [];
+
+        window.__superliveRecorderDone = false;
+
+        window.__superliveRecorderError = null;
+
+        window.__superliveRecorderBytes = 0;
+
+        recorder.ondataavailable = (event) => {
+
+            try {
+                if (
+                    event.data &&
+                    event.data.size > 0
+                ) {
+                    window
+                        .__superliveRecorderQueue
+                        .push(event.data);
+
+                    window
+                        .__superliveRecorderBytes +=
+                        event.data.size;
+                }
+            } catch (error) {
+
+                window
+                    .__superliveRecorderError =
+                    String(error);
+            }
+        };
+
+        recorder.onerror = (event) => {
+
+            try {
+                window
+                    .__superliveRecorderError =
+                    event.error
+                        ? String(event.error)
+                        : "MediaRecorder error";
+            } catch (_) {
+                window
+                    .__superliveRecorderError =
+                    "MediaRecorder error";
+            }
+        };
+
+        recorder.onstop = () => {
+            window.__superliveRecorderDone = true;
+        };
+
+        recorder.start(1000);
+
+        return {
+            mimeType:
+                recorder.mimeType || mimeType,
+
+            state:
+                recorder.state
+        };
+    };
+
+
+    window.__superliveTakeRecorderChunk = async () => {
+
+        const queue =
+            window.__superliveRecorderQueue;
+
+        if (!queue || queue.length === 0) {
+            return null;
+        }
+
+        const blob =
+            queue.shift();
+
+        if (!blob) {
+            return null;
+        }
+
+        const buffer =
+            await blob.arrayBuffer();
+
+        const bytes =
+            new Uint8Array(buffer);
+
+        let binary = "";
+
+        const step = 0x8000;
+
+        for (
+            let i = 0;
+            i < bytes.length;
+            i += step
+        ) {
+            binary += String.fromCharCode(
+                ...bytes.subarray(
+                    i,
+                    Math.min(
+                        i + step,
+                        bytes.length
+                    )
+                )
+            );
+        }
+
+        return {
+            base64:
+                btoa(binary),
+
+            size:
+                bytes.length
+        };
+    };
+
+
+    window.__superliveRecorderStatus = () => {
+
+        const recorder =
+            window.__superliveRecorder;
+
+        return {
+            state:
+                recorder
+                    ? recorder.state
+                    : "none",
+
+            queued:
+                window
+                    .__superliveRecorderQueue
+                    .length,
+
+            bytes:
+                window
+                    .__superliveRecorderBytes,
+
+            done:
+                window
+                    .__superliveRecorderDone,
+
+            error:
+                window
+                    .__superliveRecorderError
+        };
+    };
+
+
+    window.__superliveStopRecorder = () => {
+
+        const recorder =
+            window.__superliveRecorder;
+
+        if (!recorder) {
+            return false;
+        }
+
+        if (
+            recorder.state === "recording"
+        ) {
+
+            try {
+                recorder.requestData();
+            } catch (_) {}
+
+            setTimeout(() => {
+
+                try {
+                    if (
+                        recorder.state !==
+                        "inactive"
+                    ) {
+                        recorder.stop();
+                    }
+                } catch (error) {
+
+                    window
+                        .__superliveRecorderError =
+                        String(error);
+
+                    window
+                        .__superliveRecorderDone =
+                        true;
+                }
+
+            }, 500);
+
+            return true;
+        }
+
+        return false;
+    };
+
 })();
 """
 
 
 # ============================================================
-# Signal handling
+# Browser helpers
 # ============================================================
 
-def request_stop(signum, frame):
-    global _stop_requested
+async def install_diagnostics(page):
+    messages = []
 
-    if not _stop_requested:
-        _stop_requested = True
+    def on_console(msg):
+        try:
+            text = msg.text
 
-        print(
-            "\n[INFO] Stop requested."
-        )
+            if len(text) > 1000:
+                text = text[:1000]
 
-        print(
-            "[INFO] Finishing the current recording safely..."
-        )
+            messages.append(
+                f"[CONSOLE:{msg.type}] {text}"
+            )
 
+            if len(messages) > 200:
+                messages.pop(0)
 
-# ============================================================
-# Utilities
-# ============================================================
+        except Exception:
+            pass
 
-def ensure_directories():
-    RECORDINGS_DIR.mkdir(
-        parents=True,
-        exist_ok=True
+    page.on("console", on_console)
+
+    page.on(
+        "pageerror",
+        lambda error:
+            messages.append(
+                f"[PAGEERROR] {error}"
+            )
     )
 
-    TEMP_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    return messages
 
 
-def check_program(name):
-    path = shutil.which(name)
-
-    if not path:
-        raise RuntimeError(
-            f"Required program not found: {name}"
-        )
-
-    return path
-
-
-def timestamp():
-    return time.strftime(
-        "%Y%m%d_%H%M%S"
-    )
-
-
-def safe_prefix():
-    return (
-        f"recording_"
-        f"{timestamp()}_"
-        f"{int(time.time())}"
-    )
-
-
-# ============================================================
-# Video discovery
-# ============================================================
-
-async def find_video(page):
-    """
-    Search the main page and child frames
-    for a usable video element.
-    """
+async def get_all_frames(page):
+    frames = []
 
     try:
-        videos = await page.locator(
-            "video"
-        ).all()
-
-        if videos:
-            for video in videos:
-                try:
-                    box = await video.bounding_box()
-
-                    if (
-                        box
-                        and box["width"] > 0
-                        and box["height"] > 0
-                    ):
-                        return video
-
-                except Exception:
-                    continue
-
-            return videos[0]
-
+        frames = page.frames
     except Exception:
         pass
 
-    for frame in page.frames:
-        if frame == page.main_frame:
-            continue
+    return frames
+
+
+async def inspect_frame(frame):
+    try:
+        return await frame.evaluate(
+            """
+            () => {
+                const videos =
+                    Array.from(
+                        document.querySelectorAll("video")
+                    ).map(v => ({
+                        readyState: v.readyState,
+                        paused: v.paused,
+                        ended: v.ended,
+                        muted: v.muted,
+                        autoplay: v.autoplay,
+                        width: v.videoWidth,
+                        height: v.videoHeight,
+                        currentTime: v.currentTime,
+                        hasSrcObject: !!v.srcObject,
+                        src: v.currentSrc || v.src || "",
+                        tracks: v.srcObject
+                            ? v.srcObject.getTracks().map(t => ({
+                                kind: t.kind,
+                                id: t.id,
+                                readyState: t.readyState,
+                                enabled: t.enabled,
+                                muted: t.muted
+                            }))
+                            : []
+                    }));
+
+                return {
+                    url: location.href,
+                    title: document.title,
+                    videoCount: videos.length,
+                    videos,
+                    hookState:
+                        window.__superliveGetState
+                            ? window.__superliveGetState()
+                            : null
+                };
+            }
+            """
+        )
+    except Exception as exc:
+        return {
+            "error": str(exc)
+        }
+
+
+async def find_best_media_frame(page):
+    """
+    Search every frame for actual media.
+
+    We deliberately do not require a <video> element to be
+    already playable. A frame containing WebRTC tracks is enough.
+    """
+
+    best = None
+
+    for frame in await get_all_frames(page):
 
         try:
-            videos = await frame.locator(
-                "video"
-            ).all()
+            result = await inspect_frame(frame)
 
-            if videos:
-                for video in videos:
-                    try:
-                        box = await video.bounding_box()
+            if result.get("error"):
+                continue
 
-                        if (
-                            box
-                            and box["width"] > 0
-                            and box["height"] > 0
-                        ):
-                            return video
+            score = 0
 
-                    except Exception:
-                        continue
+            if result.get("videoCount", 0) > 0:
+                score += 10
 
-                return videos[0]
+            hook_state = result.get(
+                "hookState"
+            ) or {}
+
+            tracks = hook_state.get(
+                "tracks"
+            ) or []
+
+            if any(
+                t.get("kind") == "video" and
+                t.get("readyState") == "live"
+                for t in tracks
+            ):
+                score += 100
+
+            if any(
+                t.get("kind") == "audio" and
+                t.get("readyState") == "live"
+                for t in tracks
+            ):
+                score += 50
+
+            for video in result.get(
+                "videos",
+                []
+            ):
+                if video.get("width", 0) > 0:
+                    score += 25
+
+                if video.get("height", 0) > 0:
+                    score += 25
+
+                if video.get(
+                    "hasSrcObject"
+                ):
+                    score += 30
+
+            if best is None or score > best[0]:
+                best = (
+                    score,
+                    frame,
+                    result
+                )
 
         except Exception:
             continue
 
-    return None
+    return best
 
 
-async def wait_for_video(
-    page,
-    timeout=120
-):
-    """
-    Wait until a video element exists,
-    has dimensions, and its currentTime advances.
-    """
+async def force_media_play(frame):
+    try:
+        await frame.evaluate(
+            """
+            async () => {
+
+                const videos =
+                    Array.from(
+                        document.querySelectorAll("video")
+                    );
+
+                for (const video of videos) {
+
+                    try {
+                        video.autoplay = true;
+                        video.playsInline = true;
+
+                        await video.play().catch(() => {});
+                    } catch (_) {}
+                }
+
+                try {
+                    document.body.click();
+                } catch (_) {}
+
+                return videos.length;
+            }
+            """
+        )
+    except Exception:
+        pass
+
+
+async def wait_for_media(page):
+    print(
+        f"[2/6] Waiting for live WebRTC media "
+        f"(up to {VIDEO_WAIT_SECONDS}s)..."
+    )
 
     deadline = (
         time.monotonic()
-        + timeout
+        + VIDEO_WAIT_SECONDS
+    )
+
+    last_report = 0
+
+    while (
+        time.monotonic() < deadline
+        and not _stop_requested
+    ):
+
+        best = await find_best_media_frame(page)
+
+        if best:
+
+            score, frame, result = best
+
+            try:
+                await force_media_play(frame)
+            except Exception:
+                pass
+
+            try:
+                prepared =
+                    await frame.evaluate(
+                        """
+                        () =>
+                            window.__superlivePrepareRecordingStream
+                                ? window.__superlivePrepareRecordingStream()
+                                : {
+                                    ok: false,
+                                    reason:
+                                        "WebRTC hook unavailable"
+                                }
+                        """
+                    )
+
+                if prepared.get("ok"):
+                    print(
+                        "[MEDIA] WebRTC recording "
+                        "stream prepared."
+                    )
+
+                    print(
+                        "[MEDIA] Video:",
+                        prepared.get(
+                            "videoTrack"
+                        )
+                    )
+
+                    print(
+                        "[MEDIA] Audio:",
+                        prepared.get(
+                            "audioTrack"
+                        )
+                    )
+
+                    return frame
+
+            except Exception as exc:
+                if time.monotonic() - last_report > 5:
+                    print(
+                        "[MEDIA] Preparation error:",
+                        exc
+                    )
+                    last_report = time.monotonic()
+
+        await asyncio.sleep(2)
+
+        if time.monotonic() - last_report > 10:
+
+            print(
+                "[MEDIA] Still waiting for WebRTC..."
+            )
+
+            last_report = time.monotonic()
+
+    return None
+
+
+# ============================================================
+# Recorder helpers
+# ============================================================
+
+async def start_recorder(frame):
+    result = await frame.evaluate(
+        """
+        ({videoBits, audioBits}) =>
+            window.__superliveStartRecorder(
+                videoBits,
+                audioBits
+            )
+        """,
+        {
+            "videoBits": VIDEO_BITRATE,
+            "audioBits": AUDIO_BITRATE
+        }
+    )
+
+    print(
+        "[RECORDER] MIME:",
+        result.get("mimeType")
+    )
+
+    print(
+        "[RECORDER] State:",
+        result.get("state")
+    )
+
+    return result
+
+
+async def drain_recorder_queue(
+    frame,
+    ffmpeg_stdin
+):
+    transferred = 0
+
+    while True:
+
+        item = await frame.evaluate(
+            """
+            () =>
+                window.__superliveTakeRecorderChunk
+                    ? window.__superliveTakeRecorderChunk()
+                    : null
+            """
+        )
+
+        if not item:
+            break
+
+        data = base64.b64decode(
+            item["base64"]
+        )
+
+        await ffmpeg_stdin.write(data)
+
+        transferred += len(data)
+
+    return transferred
+
+
+async def get_recorder_status(frame):
+    try:
+        return await frame.evaluate(
+            """
+            () =>
+                window.__superliveRecorderStatus
+                    ? window.__superliveRecorderStatus()
+                    : {
+                        state: "missing"
+                    }
+            """
+        )
+    except Exception as exc:
+        return {
+            "state": "error",
+            "error": str(exc)
+        }
+
+
+async def stop_recorder(frame):
+    try:
+        await frame.evaluate(
+            """
+            () =>
+                window.__superliveStopRecorder
+                    ? window.__superliveStopRecorder()
+                    : false
+            """
+        )
+    except Exception as exc:
+        print(
+            "[RECORDER] Stop request error:",
+            exc
+        )
+
+
+async def wait_recorder_done(
+    frame,
+    ffmpeg_stdin
+):
+    deadline = (
+        time.monotonic()
+        + 30
     )
 
     while time.monotonic() < deadline:
 
-        video = await find_video(page)
-
-        if video:
-            try:
-                state = await video.evaluate(
-                    """
-                    v => ({
-                        readyState: v.readyState,
-                        width: v.videoWidth,
-                        height: v.videoHeight,
-                        currentTime: v.currentTime,
-                        paused: v.paused
-                    })
-                    """
-                )
-
-                if (
-                    state["readyState"] >= 2
-                    and state["width"] > 0
-                    and state["height"] > 0
-                ):
-                    first_time = (
-                        state["currentTime"]
-                    )
-
-                    await asyncio.sleep(2)
-
-                    second_time = (
-                        await video.evaluate(
-                            "v => v.currentTime"
-                        )
-                    )
-
-                    if second_time > first_time:
-                        return video
-
-            except Exception:
-                pass
-
-        await asyncio.sleep(2)
-
-    raise RuntimeError(
-        "A playable video could not be detected."
-    )
-
-
-# ============================================================
-# Track preparation
-# ============================================================
-
-async def prepare_recording_stream(page):
-    """
-    Select the live WebRTC video and audio tracks
-    and create a dedicated MediaStream.
-    """
-
-    video = await find_video(page)
-
-    if not video:
-        raise RuntimeError(
-            "Video element not found."
+        await drain_recorder_queue(
+            frame,
+            ffmpeg_stdin
         )
 
-    result = await video.evaluate(
-        """
-        async video => {
-
-            function live(track) {
-                return (
-                    track &&
-                    track.readyState === "live"
-                );
-            }
-
-            const videoTracks = [];
-            const audioTracks = [];
-
-            const src = video.srcObject;
-
-            if (src instanceof MediaStream) {
-
-                for (const track of src.getTracks()) {
-
-                    if (
-                        track.kind === "video"
-                        && live(track)
-                    ) {
-                        videoTracks.push(track);
-                    }
-
-                    if (
-                        track.kind === "audio"
-                        && live(track)
-                    ) {
-                        audioTracks.push(track);
-                    }
-                }
-            }
-
-            if (!videoTracks.length) {
-
-                const remembered =
-                    window.__superliveGetTracks
-                        ? window.__superliveGetTracks()
-                        : {
-                            video: [],
-                            audio: []
-                        };
-
-                for (
-                    const track
-                    of remembered.video || []
-                ) {
-                    if (live(track)) {
-                        videoTracks.push(track);
-                    }
-                }
-            }
-
-            if (!audioTracks.length) {
-
-                const remembered =
-                    window.__superliveGetTracks
-                        ? window.__superliveGetTracks()
-                        : {
-                            video: [],
-                            audio: []
-                        };
-
-                for (
-                    const track
-                    of remembered.audio || []
-                ) {
-                    if (live(track)) {
-                        audioTracks.push(track);
-                    }
-                }
-            }
-
-            if (!videoTracks.length) {
-                return {
-                    ok: false,
-                    reason:
-                        "No live video track found."
-                };
-            }
-
-            if (!audioTracks.length) {
-                return {
-                    ok: false,
-                    reason:
-                        "No live audio track found."
-                };
-            }
-
-            const selectedVideo =
-                videoTracks[0];
-
-            let selectedAudio = null;
-
-            // Prefer audio from the same MediaStream.
-            if (
-                src instanceof MediaStream
-            ) {
-                selectedAudio =
-                    src
-                        .getAudioTracks()
-                        .find(
-                            track => live(track)
-                        ) || null;
-            }
-
-            // Fallback to remembered audio.
-            if (!selectedAudio) {
-                selectedAudio =
-                    audioTracks[0];
-            }
-
-            if (!selectedAudio) {
-                return {
-                    ok: false,
-                    reason:
-                        "Could not select audio track."
-                };
-            }
-
-            const stream =
-                new MediaStream([
-                    selectedVideo,
-                    selectedAudio
-                ]);
-
-            window.__superliveRecordingStream =
-                stream;
-
-            return {
-                ok: true,
-
-                videoTrack: {
-                    id: selectedVideo.id,
-                    readyState:
-                        selectedVideo.readyState
-                },
-
-                audioTrack: {
-                    id: selectedAudio.id,
-                    readyState:
-                        selectedAudio.readyState
-                }
-            };
-        }
-        """
-    )
-
-    if not result.get("ok"):
-        raise RuntimeError(
-            result.get(
-                "reason",
-                "Track selection failed."
-            )
+        status = await get_recorder_status(
+            frame
         )
 
-    return result
-
-
-# ============================================================
-# MediaRecorder
-# ============================================================
-
-async def start_recorder(page):
-    """
-    Start MediaRecorder.
-
-    Chunks are placed into a browser-side queue.
-    They are transferred incrementally to FFmpeg.
-    """
-
-    result = await page.evaluate(
-        f"""
-        () => {{
-
-            const stream =
-                window.__superliveRecordingStream;
-
-            if (!stream) {{
-                throw new Error(
-                    "Recording stream does not exist."
-                );
-            }}
-
-            if (!window.MediaRecorder) {{
-                throw new Error(
-                    "MediaRecorder is not supported."
-                );
-            }}
-
-            const candidates = [
-                "video/webm;codecs=vp9,opus",
-                "video/webm;codecs=vp8,opus",
-                "video/webm"
-            ];
-
-            let mimeType = null;
-
-            for (
-                const candidate
-                of candidates
-            ) {{
-                try {{
-                    if (
-                        MediaRecorder.isTypeSupported(
-                            candidate
-                        )
-                    ) {{
-                        mimeType = candidate;
-                        break;
-                    }}
-                }} catch (_) {{}}
-            }}
-
-            if (!mimeType) {{
-                throw new Error(
-                    "No supported WebM MediaRecorder MIME type."
-                );
-            }}
-
-            window.__superliveRecorderQueue =
-                [];
-
-            window.__superliveRecorderDone =
-                false;
-
-            window.__superliveRecorderError =
-                null;
-
-            window.__superliveRecorderBytes =
-                0;
-
-            const recorder =
-                new MediaRecorder(
-                    stream,
-                    {{
-                        mimeType,
-
-                        videoBitsPerSecond:
-                            {VIDEO_BITRATE},
-
-                        audioBitsPerSecond:
-                            {AUDIO_BITRATE}
-                    }}
-                );
-
-            recorder.addEventListener(
-                "dataavailable",
-                event => {{
-
-                    if (
-                        event.data
-                        && event.data.size > 0
-                    ) {{
-                        window
-                            .__superliveRecorderQueue
-                            .push(event.data);
-
-                        window
-                            .__superliveRecorderBytes
-                            += event.data.size;
-                    }}
-                }}
-            );
-
-            recorder.addEventListener(
-                "error",
-                event => {{
-
-                    window
-                        .__superliveRecorderError =
-                        event.error
-                            ? String(event.error)
-                            : "MediaRecorder error";
-                }}
-            );
-
-            recorder.addEventListener(
-                "stop",
-                () => {{
-                    window
-                        .__superliveRecorderDone =
-                        true;
-                }}
-            );
-
-            window.__superliveRecorder =
-                recorder;
-
-            recorder.start(1000);
-
-            return {{
-                mimeType,
-
-                videoBitsPerSecond:
-                    recorder.videoBitsPerSecond,
-
-                audioBitsPerSecond:
-                    recorder.audioBitsPerSecond
-            }};
-        }}
-        """
-    )
-
-    return result
-
-
-# ============================================================
-# Blob transfer
-# ============================================================
-
-async def blob_to_bytes(
-    page,
-    blob
-):
-    """
-    Transfer a browser Blob to Python
-    through base64 in manageable pieces.
-    """
-
-    data = await page.evaluate(
-        """
-        async blob => {
-
-            const buffer =
-                await blob.arrayBuffer();
-
-            const bytes =
-                new Uint8Array(buffer);
-
-            let binary = "";
-
-            const step =
-                1024 * 1024;
-
-            for (
-                let i = 0;
-                i < bytes.length;
-                i += step
-            ) {
-
-                const slice =
-                    bytes.subarray(
-                        i,
-                        Math.min(
-                            i + step,
-                            bytes.length
-                        )
-                    );
-
-                binary += String.fromCharCode(
-                    ...slice
-                );
-            }
-
-            return btoa(binary);
-        }
-        """,
-        blob
-    )
-
-    return base64.b64decode(
-        data
-    )
-
-
-# ============================================================
-# Queue drain
-# ============================================================
-
-async def drain_recorder_queue(
-    page,
-    ffmpeg_process
-):
-    """
-    Move all currently available MediaRecorder
-    chunks to FFmpeg.
-    """
-
-    while True:
-
-        error = await page.evaluate(
-            """
-            () =>
-                window.__superliveRecorderError
-            """
-        )
-
-        if error:
-            raise RuntimeError(
-                error
+        if status.get("error"):
+            print(
+                "[RECORDER] Browser error:",
+                status.get("error")
             )
 
-        chunks = await page.evaluate(
-            """
-            () => {
+        if status.get("done"):
+            await drain_recorder_queue(
+                frame,
+                ffmpeg_stdin
+            )
+            return
 
-                const q =
-                    window.__superliveRecorderQueue
-                    || [];
+        await asyncio.sleep(0.2)
 
-                if (!q.length) {
-                    return [];
-                }
-
-                window.__superliveRecorderQueue =
-                    [];
-
-                return q;
-            }
-            """
-        )
-
-        if chunks:
-
-            for chunk in chunks:
-
-                raw = await blob_to_bytes(
-                    page,
-                    chunk
-                )
-
-                try:
-                    ffmpeg_process.stdin.write(
-                        raw
-                    )
-
-                    await ffmpeg_process.stdin.drain()
-
-                except (
-                    BrokenPipeError,
-                    ConnectionResetError
-                ):
-                    raise RuntimeError(
-                        "FFmpeg pipe closed unexpectedly."
-                    )
-
-        done = await page.evaluate(
-            """
-            () =>
-                window.__superliveRecorderDone
-            """
-        )
-
-        if done and not chunks:
-            break
-
-        await asyncio.sleep(
-            0.2
-        )
-
-
-# ============================================================
-# Stop MediaRecorder
-# ============================================================
-
-async def stop_recorder(page):
-    """
-    Request final data and then stop MediaRecorder.
-    """
-
-    await page.evaluate(
-        """
-        async () => {
-
-            const recorder =
-                window.__superliveRecorder;
-
-            if (!recorder) {
-                return;
-            }
-
-            if (
-                recorder.state !==
-                "inactive"
-            ) {
-
-                try {
-                    recorder.requestData();
-                } catch (_) {}
-
-                await new Promise(
-                    resolve =>
-                        setTimeout(
-                            resolve,
-                            500
-                        )
-                );
-
-                if (
-                    recorder.state !==
-                    "inactive"
-                ) {
-                    recorder.stop();
-                }
-            }
-        }
-        """
+    print(
+        "[WARN] Recorder finalization timeout."
     )
 
 
@@ -884,21 +1211,17 @@ async def stop_recorder(page):
 # FFmpeg
 # ============================================================
 
-def create_ffmpeg_process(
-    prefix
-):
+async def start_ffmpeg(output_pattern):
     """
-    FFmpeg receives WebM through stdin
-    and creates MP4 segments.
+    Convert browser WebM stream to MP4 segments.
+
+    The output video bitrate is deliberately capped so that
+    60-second segments remain comfortably below Telegram's
+    ordinary 50 MB Bot API upload limit.
     """
 
-    output_pattern = str(
-        TEMP_DIR
-        / f"{prefix}_part_%03d.mp4"
-    )
-
-    command = [
-        FFMPEG,
+    cmd = [
+        "ffmpeg",
 
         "-hide_banner",
         "-loglevel", "warning",
@@ -912,11 +1235,16 @@ def create_ffmpeg_process(
 
         "-c:v", "libx264",
         "-preset", "veryfast",
-        "-crf", "21",
+
+        # Hard bitrate cap for predictable segment sizes.
+        "-b:v", "3500k",
+        "-maxrate", "3500k",
+        "-bufsize", "7000k",
+
         "-pix_fmt", "yuv420p",
 
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "96k",
 
         "-movflags", "+faststart",
 
@@ -928,688 +1256,651 @@ def create_ffmpeg_process(
 
         "-segment_format", "mp4",
 
-        output_pattern
+        str(output_pattern)
     ]
 
-    return subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE
+    print(
+        "[FFMPEG]",
+        " ".join(cmd)
     )
 
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE
+    )
 
-async def finish_ffmpeg(
-    process
-):
-    """
-    Close FFmpeg stdin and wait for FFmpeg
-    to finalize all MP4 files.
-    """
-
-    if process.stdin:
-
-        try:
-            process.stdin.close()
-        except Exception:
-            pass
-
-    try:
-        return_code = await asyncio.to_thread(
-            process.wait,
-            120
-        )
-
-    except subprocess.TimeoutExpired:
-
-        print(
-            "[WARN] FFmpeg did not finish in time."
-        )
-
-        process.kill()
-
-        return_code = await asyncio.to_thread(
-            process.wait
-        )
-
-    stderr = b""
-
-    try:
-        if process.stderr:
-            stderr = process.stderr.read()
-    except Exception:
-        pass
-
-    if return_code != 0:
-
-        message = stderr.decode(
-            "utf-8",
-            errors="replace"
-        )
-
-        raise RuntimeError(
-            "FFmpeg failed with exit code "
-            f"{return_code}:\n{message}"
-        )
+    return process
 
 
 # ============================================================
-# FFprobe
+# Validation
 # ============================================================
 
-def probe_file(path):
-    command = [
-        FFPROBE,
+async def validate_file(path):
+    if not path.exists():
+        return False
 
+    if path.stat().st_size < 10000:
+        return False
+
+    cmd = [
+        "ffprobe",
         "-v", "error",
-
         "-show_entries",
         "format=duration,size,format_name",
-
         "-of",
         "json",
-
         str(path)
     ]
 
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
     )
 
-    if result.returncode != 0:
-        return None
+    stdout, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        print(
+            "[FFPROBE ERROR]",
+            stderr.decode(
+                "utf-8",
+                errors="replace"
+            )
+        )
+        return False
 
     try:
         data = json.loads(
-            result.stdout
+            stdout.decode("utf-8")
         )
 
-        return data.get(
+        fmt = data.get(
             "format",
             {}
         )
 
-    except Exception:
-        return None
-
-
-def validate_segment(path):
-    if not path.exists():
-        return (
-            False,
-            "file does not exist"
+        print(
+            f"[VALID] {path.name} | "
+            f"{fmt.get('format_name')} | "
+            f"{fmt.get('duration')} sec | "
+            f"{fmt.get('size')} bytes"
         )
 
-    size = path.stat().st_size
+        return True
 
-    if size < 1024:
-        return (
-            False,
-            "file is too small"
+    except Exception as exc:
+        print(
+            "[FFPROBE PARSE ERROR]",
+            exc
         )
-
-    info = probe_file(
-        path
-    )
-
-    if not info:
-        return (
-            False,
-            "ffprobe could not read file"
-        )
-
-    duration = float(
-        info.get("duration") or 0
-    )
-
-    if duration <= 0:
-        return (
-            False,
-            "duration is zero"
-        )
-
-    return (
-        True,
-        {
-            "size": size,
-            "duration": duration,
-            "format": info.get(
-                "format_name"
-            )
-        }
-    )
+        return False
 
 
 # ============================================================
-# Finalize segments
+# Diagnostics
 # ============================================================
 
-def finalize_segments(
-    prefix
-):
-    files = sorted(
-        TEMP_DIR.glob(
-            f"{prefix}_part_*.mp4"
-        )
-    )
-
-    results = []
-
-    for source in files:
-
-        ok, info = validate_segment(
-            source
+async def save_diagnostics(page):
+    try:
+        RECORDINGS_DIR.mkdir(
+            parents=True,
+            exist_ok=True
         )
 
-        if not ok:
+        screenshot =
+            RECORDINGS_DIR / "_diagnostic.png"
 
-            print(
-                "[WARN] Invalid segment: "
-                f"{source.name} -> {info}"
-            )
+        html =
+            RECORDINGS_DIR / "_diagnostic.html"
 
-            continue
-
-        destination = (
-            RECORDINGS_DIR
-            / source.name
+        await page.screenshot(
+            path=str(screenshot),
+            full_page=True
         )
 
-        shutil.move(
-            str(source),
-            str(destination)
+        html_text =
+            await page.content()
+
+        html.write_text(
+            html_text,
+            encoding="utf-8"
         )
 
-        results.append(
-            {
-                "file": str(
-                    destination
-                ),
+        diagnostics = []
 
-                "size": info["size"],
+        for frame in page.frames:
 
-                "duration":
-                    info["duration"]
-            }
-        )
+            try:
+                data =
+                    await inspect_frame(frame)
 
-        size_mb = (
-            info["size"]
-            / 1024
-            / 1024
+                diagnostics.append(data)
+
+            except Exception as exc:
+                diagnostics.append({
+                    "error": str(exc)
+                })
+
+        json_path =
+            RECORDINGS_DIR / "_diagnostic.json"
+
+        json_path.write_text(
+            json.dumps(
+                diagnostics,
+                indent=2,
+                ensure_ascii=False
+            ),
+            encoding="utf-8"
         )
 
         print(
-            f"[OK] {destination.name} "
-            f"{size_mb:.2f} MB "
-            f"{info['duration']:.1f}s"
+            "[DIAGNOSTICS] Saved:"
         )
 
-    return results
+        print(
+            screenshot
+        )
+
+        print(
+            html
+        )
+
+        print(
+            json_path
+        )
+
+    except Exception as exc:
+        print(
+            "[DIAGNOSTICS] Failed:",
+            exc
+        )
 
 
 # ============================================================
-# Recording
+# Main recording routine
 # ============================================================
 
-async def record_stream(
-    url
-):
-    ensure_directories()
+async def record(url):
+    RECORDINGS_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
-    prefix = safe_prefix()
+    TEMP_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
+    print("")
     print("=" * 60)
     print("SUPERLIVE RECORDER")
     print("=" * 60)
-
+    print("URL:", url)
+    print("Output:", RECORDINGS_DIR)
+    print("Segment:", SEGMENT_SECONDS, "s")
     print(
-        f"URL: {url}"
+        "Duration limit:",
+        RECORD_DURATION_SECONDS,
+        "s"
     )
-
     print(
-        f"Output: {RECORDINGS_DIR}"
+        "Browser video bitrate:",
+        VIDEO_BITRATE
     )
-
     print(
-        f"Segment: {SEGMENT_SECONDS}s"
+        "Browser audio bitrate:",
+        AUDIO_BITRATE
     )
-
-    print(
-        f"Duration limit: "
-        f"{RECORD_DURATION_SECONDS}s"
-    )
-
-    print(
-        f"Video bitrate: "
-        f"{VIDEO_BITRATE}"
-    )
-
-    print(
-        f"Audio bitrate: "
-        f"{AUDIO_BITRATE}"
-    )
-
     print("=" * 60)
-
-    ffmpeg_process = None
 
     async with async_playwright() as p:
 
+        print("[1/6] Launching full Chromium...")
+
         browser = await p.chromium.launch(
+            channel="chromium",
             headless=True,
+
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
 
-                "--autoplay-policy="
-                "no-user-gesture-required",
+                "--autoplay-policy=no-user-gesture-required",
+
+                "--use-fake-ui-for-media-stream",
+
+                "--enable-features=WebRtcHideLocalIpsWithMdns",
 
                 "--disable-background-timer-throttling",
                 "--disable-backgrounding-occluded-windows",
-                "--disable-renderer-backgrounding"
+                "--disable-renderer-backgrounding",
+
+                "--disable-blink-features=AutomationControlled"
             ]
         )
 
         context = await browser.new_context(
+            viewport={
+                "width": 1920,
+                "height": 1080
+            },
+
+            user_agent=(
+                "Mozilla/5.0 "
+                "(X11; Linux x86_64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/140.0.0.0 "
+                "Safari/537.36"
+            ),
+
             locale="fr-FR",
 
-            viewport={
-                "width": 1280,
-                "height": 720
-            }
+            timezone_id="Africa/Casablanca",
+
+            permissions=[
+                "microphone",
+                "camera"
+            ]
         )
 
-        # IMPORTANT:
-        # Hook must be installed before navigation.
+        # CRITICAL:
+        # Install WebRTC hook before navigation.
         await context.add_init_script(
             WEBRTC_HOOK
         )
 
         page = await context.new_page()
 
+        diagnostics = await install_diagnostics(
+            page
+        )
+
         page.set_default_timeout(
             PAGE_TIMEOUT_MS
         )
 
-        print(
-            "[1/6] Opening page..."
-        )
+        print("[1/6] Opening page...")
 
-        await page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=PAGE_TIMEOUT_MS
-        )
-
-        print(
-            "[2/6] Waiting for live video..."
-        )
-
-        await wait_for_video(
-            page,
-            timeout=120
-        )
-
-        print(
-            "[3/6] Preparing WebRTC tracks..."
-        )
-
-        track_info = (
-            await prepare_recording_stream(
-                page
+        try:
+            await page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=PAGE_TIMEOUT_MS
             )
-        )
-
-        print(
-            "[OK] Tracks:",
-            json.dumps(
-                track_info,
-                ensure_ascii=False
+        except Exception as exc:
+            print(
+                "[WARN] page.goto:",
+                exc
             )
+
+        await asyncio.sleep(5)
+
+        print(
+            "[PAGE] URL:",
+            page.url
         )
 
         print(
-            "[4/6] Starting MediaRecorder..."
+            "[PAGE] Title:",
+            await page.title()
         )
 
-        recorder_info = (
+        # Give dynamically-created frames time to appear.
+        await asyncio.sleep(5)
+
+        frame = await wait_for_media(
+            page
+        )
+
+        if frame is None:
+
+            print(
+                "[FATAL] No live WebRTC "
+                "video track could be prepared."
+            )
+
+            print(
+                "[DIAGNOSTIC] Frames:",
+                len(page.frames)
+            )
+
+            for index, current_frame in enumerate(
+                page.frames
+            ):
+
+                try:
+                    info =
+                        await inspect_frame(
+                            current_frame
+                        )
+
+                    print(
+                        "[FRAME]",
+                        index,
+                        json.dumps(
+                            info,
+                            ensure_ascii=False
+                        )[:5000]
+                    )
+
+                except Exception as exc:
+                    print(
+                        "[FRAME ERROR]",
+                        index,
+                        exc
+                    )
+
+            print(
+                "[CONSOLE]"
+            )
+
+            for message in diagnostics[-100:]:
+                print(message)
+
+            await save_diagnostics(page)
+
+            await browser.close()
+
+            raise RuntimeError(
+                "No playable WebRTC video "
+                "could be detected."
+            )
+
+        print(
+            "[3/6] Starting MediaRecorder..."
+        )
+
+        recorder_info =
             await start_recorder(
-                page
+                frame
             )
-        )
 
         print(
-            "[OK] MediaRecorder:",
-            json.dumps(
-                recorder_info,
-                ensure_ascii=False
-            )
+            "[RECORDER]",
+            recorder_info
         )
+
+        timestamp =
+            time.strftime(
+                "%Y%m%d_%H%M%S"
+            )
+
+        output_pattern =
+            TEMP_DIR / (
+                f"recording_{timestamp}_%03d.mp4"
+            )
 
         print(
-            "[5/6] Starting FFmpeg..."
+            "[4/6] Starting FFmpeg..."
         )
 
-        ffmpeg_process = (
-            create_ffmpeg_process(
-                prefix
+        ffmpeg =
+            await start_ffmpeg(
+                output_pattern
             )
-        )
 
-        start_time = (
+        started_at =
             time.monotonic()
-        )
 
-        print(
-            "[OK] Recording started."
-        )
+        transferred_total = 0
 
         try:
 
-            while True:
+            while not _stop_requested:
 
-                # ------------------------------------------------
-                # Stop requested externally?
-                # ------------------------------------------------
-
-                if _stop_requested:
-                    print(
-                        "[INFO] External stop detected."
-                    )
-                    break
-
-                # ------------------------------------------------
-                # Duration limit reached?
-                # ------------------------------------------------
-
-                elapsed = (
-                    time.monotonic()
-                    - start_time
-                )
+                elapsed =
+                    time.monotonic() - started_at
 
                 if (
                     RECORD_DURATION_SECONDS > 0
-                    and elapsed
-                    >= RECORD_DURATION_SECONDS
+                    and elapsed >=
+                    RECORD_DURATION_SECONDS
                 ):
                     print(
-                        "[INFO] Recording duration "
-                        "limit reached."
+                        "[TIME] Recording duration reached."
                     )
-
                     break
 
-                # ------------------------------------------------
-                # Drain browser chunks.
-                # ------------------------------------------------
+                transferred =
+                    await drain_recorder_queue(
+                        frame,
+                        ffmpeg.stdin
+                    )
 
-                await drain_recorder_queue(
-                    page,
-                    ffmpeg_process
-                )
+                transferred_total += transferred
 
-                # ------------------------------------------------
-                # Check track health.
-                # ------------------------------------------------
+                status =
+                    await get_recorder_status(
+                        frame
+                    )
 
-                health = await page.evaluate(
-                    """
-                    () => {
-
-                        const stream =
-                            window.__superliveRecordingStream;
-
-                        if (!stream) {
-                            return {
-                                ok: false,
-                                reason:
-                                    "stream missing"
-                            };
-                        }
-
-                        const tracks =
-                            stream.getTracks();
-
-                        return {
-                            ok: true,
-
-                            tracks:
-                                tracks.map(
-                                    t => ({
-                                        kind: t.kind,
-                                        id: t.id,
-                                        readyState:
-                                            t.readyState,
-                                        enabled:
-                                            t.enabled,
-                                        muted:
-                                            t.muted
-                                    })
-                                )
-                        };
-                    }
-                    """
-                )
-
-                print(
-                    f"[HEALTH] "
-                    f"{elapsed / 60:.1f} min | "
-                    f"{json.dumps(health, ensure_ascii=False)}"
-                )
-
-                if not health.get("ok"):
-
+                if status.get("error"):
                     raise RuntimeError(
-                        health.get(
-                            "reason",
-                            "recording stream failed"
+                        "MediaRecorder error: "
+                        + str(
+                            status.get("error")
                         )
                     )
 
-                dead_tracks = [
-                    track
-                    for track in health["tracks"]
-                    if track["readyState"]
-                    != "live"
-                ]
-
-                if dead_tracks:
-
-                    raise RuntimeError(
-                        "A recording track stopped: "
-                        + json.dumps(
-                            dead_tracks,
-                            ensure_ascii=False
-                        )
+                if int(elapsed) % 10 == 0:
+                    print(
+                        f"[RECORDING] "
+                        f"{int(elapsed)}s | "
+                        f"browser bytes="
+                        f"{status.get('bytes', 0)} | "
+                        f"transferred="
+                        f"{transferred_total}"
                     )
 
-                await asyncio.sleep(
-                    HEALTH_INTERVAL
-                )
+                # Check WebRTC track health.
+                try:
+                    health =
+                        await frame.evaluate(
+                            """
+                            () => {
+                                const s =
+                                    window.__superliveRecordingStream;
 
-        except asyncio.CancelledError:
+                                if (!s) {
+                                    return {
+                                        ok: false,
+                                        reason: "stream missing"
+                                    };
+                                }
 
-            print(
-                "[INFO] Recording cancelled."
-            )
+                                const video =
+                                    s.getVideoTracks()[0];
+
+                                const audio =
+                                    s.getAudioTracks()[0];
+
+                                return {
+                                    ok: !!video &&
+                                        video.readyState === "live",
+
+                                    video: video
+                                        ? {
+                                            readyState:
+                                                video.readyState,
+                                            muted:
+                                                video.muted,
+                                            enabled:
+                                                video.enabled
+                                        }
+                                        : null,
+
+                                    audio: audio
+                                        ? {
+                                            readyState:
+                                                audio.readyState,
+                                            muted:
+                                                audio.muted,
+                                            enabled:
+                                                audio.enabled
+                                        }
+                                        : null
+                                };
+                            }
+                            """
+                        )
+
+                    if not health.get("ok"):
+                        print(
+                            "[WARN] Video track is "
+                            "no longer live."
+                        )
+
+                        print(
+                            json.dumps(
+                                health,
+                                ensure_ascii=False
+                            )
+                        )
+
+                        break
+
+                except Exception as exc:
+                    print(
+                        "[HEALTH] Check failed:",
+                        exc
+                    )
+
+                await asyncio.sleep(1)
 
         finally:
 
             print(
-                "[6/6] Stopping MediaRecorder..."
+                "[5/6] Stopping MediaRecorder..."
+            )
+
+            await stop_recorder(
+                frame
+            )
+
+            await wait_recorder_done(
+                frame,
+                ffmpeg.stdin
             )
 
             try:
-                await stop_recorder(
-                    page
-                )
-
-            except Exception as exc:
-
-                print(
-                    "[WARN] Could not stop "
-                    f"MediaRecorder: {exc}"
-                )
-
-            # ----------------------------------------------------
-            # Drain final dataavailable event.
-            # ----------------------------------------------------
+                await ffmpeg.stdin.close()
+            except Exception:
+                pass
 
             try:
+                await ffmpeg.stdin.wait_closed()
+            except Exception:
+                pass
 
-                await drain_recorder_queue(
-                    page,
-                    ffmpeg_process
-                )
+            try:
+                stderr =
+                    await asyncio.wait_for(
+                        ffmpeg.stderr.read(),
+                        timeout=30
+                    )
+            except asyncio.TimeoutError:
+                stderr = b""
 
-            except Exception as exc:
+            return_code =
+                await ffmpeg.wait()
 
+            if stderr:
                 print(
-                    "[WARN] Final drain failed: "
-                    f"{exc}"
+                    "[FFMPEG]",
+                    stderr.decode(
+                        "utf-8",
+                        errors="replace"
+                    )
                 )
 
             print(
-                "[INFO] Finalizing FFmpeg..."
+                "[FFMPEG] Exit code:",
+                return_code
             )
 
-            try:
+        print(
+            "[6/6] Validating MP4 segments..."
+        )
 
-                await finish_ffmpeg(
-                    ffmpeg_process
+        valid_count = 0
+
+        for path in sorted(
+            TEMP_DIR.glob("*.mp4")
+        ):
+
+            if await validate_file(path):
+
+                destination =
+                    RECORDINGS_DIR / path.name
+
+                path.replace(
+                    destination
                 )
 
-            except Exception as exc:
+                valid_count += 1
 
-                print(
-                    f"[ERROR] {exc}"
-                )
+        print(
+            "[RESULT] Valid segments:",
+            valid_count
+        )
 
-            ffmpeg_process = None
+        if valid_count == 0:
+            await save_diagnostics(page)
 
-        await context.close()
+            await browser.close()
+
+            raise RuntimeError(
+                "FFmpeg produced no valid MP4 segments."
+            )
+
+        print(
+            "[RESULT] Total browser bytes:",
+            transferred_total
+        )
 
         await browser.close()
 
-    segments = finalize_segments(
-        prefix
-    )
-
-    if not segments:
-
-        raise RuntimeError(
-            "Recording finished but no valid "
-            "MP4 segments were produced."
-        )
-
-    total_size = sum(
-        segment["size"]
-        for segment in segments
-    )
-
-    total_duration = sum(
-        segment["duration"]
-        for segment in segments
-    )
-
-    print("=" * 60)
-    print("RECORDING COMPLETE")
-    print("=" * 60)
-
-    print(
-        f"Segments: {len(segments)}"
-    )
-
-    print(
-        f"Duration: "
-        f"{total_duration / 60:.2f} min"
-    )
-
-    print(
-        f"Size: "
-        f"{total_size / 1024 / 1024:.2f} MB"
-    )
-
-    print("=" * 60)
-
-    return segments
-
 
 # ============================================================
-# Main
+# Entry point
 # ============================================================
-
-async def main_async():
-
-    ensure_directories()
-
-    check_program(
-        FFMPEG
-    )
-
-    check_program(
-        FFPROBE
-    )
-
-    if len(sys.argv) >= 2:
-
-        url = sys.argv[1].strip()
-
-    else:
-
-        url = input(
-            "Enter livestream URL: "
-        ).strip()
-
-    if not url:
-
-        raise RuntimeError(
-            "No URL provided."
-        )
-
-    return await record_stream(
-        url
-    )
-
 
 def main():
-
-    signal.signal(
-        signal.SIGINT,
-        request_stop
-    )
-
-    if hasattr(
-        signal,
-        "SIGTERM"
-    ):
-        signal.signal(
-            signal.SIGTERM,
-            request_stop
+    if len(sys.argv) < 2:
+        print(
+            "Usage: python record_once.py <URL>"
         )
+        sys.exit(2)
+
+    url = sys.argv[1].strip()
+
+    if not url:
+        print("URL is empty.")
+        sys.exit(2)
 
     try:
-
         asyncio.run(
-            main_async()
+            record(url)
         )
 
     except KeyboardInterrupt:
-
         print(
-            "\n[INFO] Stopped by user."
+            "[STOP] Interrupted."
         )
+        sys.exit(130)
 
     except Exception as exc:
-
+        print("")
         print(
-            f"\n[FATAL] {exc}"
+            "[FATAL]",
+            exc
         )
-
         sys.exit(1)
 
 
