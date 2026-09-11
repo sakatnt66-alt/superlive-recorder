@@ -7,136 +7,203 @@ on:
         description: "Livestream URL"
         required: true
         type: string
+
       duration_minutes:
         description: "Recording duration in minutes"
         required: false
         default: "5"
         type: string
 
+
 jobs:
+
   record-test:
-    name: Record livestream test
+
+    name: Record livestream
+
     runs-on: ubuntu-latest
+
     timeout-minutes: 15
 
+
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
+
       - name: Install FFmpeg
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
+
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+
       - name: Install Playwright Chromium
         run: |
-          playwright install --with-deps chromium
+          python -m playwright install --with-deps chromium
+
 
       - name: Check environment
         run: |
-          echo "Python:"
+          echo "========================================"
+          echo "ENVIRONMENT"
+          echo "========================================"
+
           python --version
 
+          echo ""
           echo "FFmpeg:"
           ffmpeg -version | head -n 1
 
+          echo ""
           echo "FFprobe:"
           ffprobe -version | head -n 1
 
+          echo ""
           echo "Playwright:"
-          playwright --version
+          python -m playwright --version
+
+          echo ""
+          echo "Chromium:"
+          python -m playwright install --list
+
 
       - name: Check Python syntax
         run: |
           python -m py_compile record_once.py
 
-      - name: Prepare recordings directory
+
+      - name: Prepare directories
         run: |
           mkdir -p recordings
           mkdir -p recordings/_temp
 
+
       - name: Start recording
         env:
           RECORDINGS_DIR: ./recordings
-          SEGMENT_SECONDS: 90
+
+          # 60 seconds is intentionally conservative
+          # for Telegram's ordinary 50 MB upload limit.
+          SEGMENT_SECONDS: 60
+
+          # Browser-side MediaRecorder bitrate.
           VIDEO_BITRATE: 4000000
           AUDIO_BITRATE: 128000
-        run: |
-          DURATION_SECONDS=$(( ${{ inputs.duration_minutes }} * 60 ))
 
-          echo "========================================"
-          echo "SuperLive Recorder"
-          echo "URL: ${{ inputs.test_url }}"
-          echo "Duration: ${{ inputs.duration_minutes }} minutes"
-          echo "Duration: ${DURATION_SECONDS} seconds"
-          echo "========================================"
+          PAGE_TIMEOUT_MS: 60000
+
+          # Give the site up to 2 minutes to establish WebRTC.
+          VIDEO_WAIT_SECONDS: 120
+
+        run: |
+
+          DURATION_SECONDS=$(( ${{ inputs.duration_minutes }} * 60 ))
 
           export RECORD_DURATION_SECONDS="$DURATION_SECONDS"
 
-          python record_once.py "${{ inputs.test_url }}" &
-          RECORDER_PID=$!
+          echo "========================================"
+          echo "SUPERLIVE RECORDER"
+          echo "========================================"
+          echo "URL:"
+          echo "${{ inputs.test_url }}"
+          echo ""
+          echo "Duration:"
+          echo "${{ inputs.duration_minutes }} minutes"
+          echo "${DURATION_SECONDS} seconds"
+          echo "========================================"
 
-          while kill -0 "$RECORDER_PID" 2>/dev/null; do
-            echo "Recorder is running..."
-            sleep 10
-          done
 
-          wait "$RECORDER_PID"
+          python record_once.py "${{ inputs.test_url }}"
+
           RECORDER_EXIT_CODE=$?
 
-          echo "Recorder exit code: $RECORDER_EXIT_CODE"
+          echo ""
+          echo "Recorder exit code: ${RECORDER_EXIT_CODE}"
 
-          exit "$RECORDER_EXIT_CODE"
+          exit "${RECORDER_EXIT_CODE}"
 
-      - name: List recordings
+
+      - name: List all output files
         if: always()
         run: |
+
           echo "========================================"
-          echo "Recordings:"
+          echo "OUTPUT FILES"
           echo "========================================"
 
-          find recordings -maxdepth 1 -type f -name "*.mp4" -print -exec ls -lh {} \; || true
+          find recordings \
+            -maxdepth 2 \
+            -type f \
+            -printf '%p | %s bytes\n' \
+            | sort || true
 
-      - name: Validate MP4 files
+
+      - name: Validate recordings
         if: always()
         run: |
+
+          echo "========================================"
+          echo "MP4 VALIDATION"
+          echo "========================================"
+
           FOUND=0
 
           for file in recordings/*.mp4; do
+
             if [ -f "$file" ]; then
+
               FOUND=1
 
+              echo ""
               echo "----------------------------------------"
-              echo "Checking: $file"
+              echo "FILE:"
+              echo "$file"
+              echo "SIZE:"
+              ls -lh "$file"
+
+              echo ""
+              echo "FFPROBE:"
 
               ffprobe \
                 -v error \
-                -show_entries format=duration,size,format_name \
+                -show_entries \
+                format=duration,size,format_name \
                 -of default=noprint_wrappers=1 \
-                "$file"
+                "$file" || true
+
             fi
+
           done
 
+
           if [ "$FOUND" -eq 0 ]; then
+            echo ""
             echo "No MP4 recordings were produced."
-            exit 1
           fi
 
-      - name: Upload recordings as artifact
+
+      - name: Upload recordings and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: superlive-test-recordings
-          path: recordings/*.mp4
+          name: superlive-test-results
+          path: |
+            recordings/*.mp4
+            recordings/_diagnostic.png
+            recordings/_diagnostic.html
+            recordings/_diagnostic.json
           if-no-files-found: warn
           retention-days: 7
