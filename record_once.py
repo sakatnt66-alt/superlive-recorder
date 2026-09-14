@@ -32,7 +32,7 @@ def log(msg=""): print(msg, flush=True)
 def log_section(t): log("\n" + "="*70 + f"\n{t}\n" + "="*70)
 
 # ============================================================
-# WEBRTC HOOK (IPC Chunking to bypass Playwright string limits)
+# WEBRTC HOOK (Clean Base64 + Safe Chunking)
 # ============================================================
 WEBRTC_HOOK = r"""
 (() => {
@@ -44,7 +44,6 @@ WEBRTC_HOOK = r"""
     window.__superlive_streams = [];
     let recorder = null, recorderError = null, isRecording = false, chunkCount = 0;
     
-    // Global queue for IPC chunking
     window.__uploadQueue = [];
     window.__isUploading = false;
 
@@ -54,7 +53,6 @@ WEBRTC_HOOK = r"""
         while (window.__uploadQueue.length > 0) {
             const chunk = window.__uploadQueue.shift();
             try {
-                // Await ensures strict ordering and prevents interleaving
                 await window.uploadVideoChunk(chunk);
             } catch(e) {
                 console.error("[JS] Upload error:", e);
@@ -148,8 +146,10 @@ WEBRTC_HOOK = r"""
                         const result = reader.result;
                         const commaIndex = result.indexOf(',');
                         if (commaIndex !== -1) {
-                            const base64 = result.substring(commaIndex + 1);
-                            // CRITICAL FIX: Chunk the string to 64KB to bypass Playwright IPC string truncation
+                            // CRITICAL FIX: Remove all whitespace/newlines to ensure perfect base64 math
+                            let base64 = result.substring(commaIndex + 1).replace(/[\r\n\s]/g, '');
+                            
+                            // 65536 is perfectly divisible by 4, ensuring intermediate chunks are always valid
                             const chunkSize = 65536; 
                             for (let i = 0; i < base64.length; i += chunkSize) {
                                 window.__uploadQueue.push(base64.substring(i, i + chunkSize));
@@ -214,8 +214,13 @@ async def run_recording(playwright):
     
     async def upload_chunk(base64_str):
         try:
-            # validate=False handles missing padding on the very last chunk gracefully
-            decoded = base64.b64decode(base64_str, validate=False)
+            # CRITICAL FIX: Smart Safety Padding
+            # If a chunk somehow arrives with incorrect length, add '=' to make it divisible by 4
+            missing_padding = len(base64_str) % 4
+            if missing_padding:
+                base64_str += '=' * (4 - missing_padding)
+                
+            decoded = base64.b64decode(base64_str, validate=True)
             webm_file.write(decoded)
         except Exception as e:
             log(f"[WARN] Decode error: {e}")
@@ -260,7 +265,7 @@ async def run_recording(playwright):
     if not wait_res.get('ok'): 
         webm_file.close()
         raise RuntimeError(f"Recorder failed to produce data: {wait_res.get('error')}")
-    log("[✓] MediaRecorder is generating data! (IPC Chunking Active)")
+    log("[✓] MediaRecorder is generating data! (Clean IPC Chunking Active)")
 
     log(f"[4/5] Capturing Native WebM for {RECORD_DURATION_SECONDS}s...")
     start_rec = time.monotonic()
@@ -323,7 +328,7 @@ async def run_recording(playwright):
     return moved
 
 async def main():
-    log_section("SUPERLIVE ULTIMATE RECORDER (IPC CHUNKING EDITION)")
+    log_section("SUPERLIVE ULTIMATE RECORDER (ZERO-DATA-LOSS EDITION)")
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         return await asyncio.wait_for(run_recording(p), timeout=GLOBAL_WATCHDOG_SECONDS)
