@@ -1,5 +1,6 @@
 name: SuperLive Recorder
 on:
+  # Manual trigger from GitHub UI
   workflow_dispatch:
     inputs:
       test_url:
@@ -7,16 +8,25 @@ on:
         required: true
         type: string
       duration_minutes:
-        description: "Recording duration in minutes (e.g., 5 or 5.5)"
+        description: "Recording duration in minutes"
         required: false
         default: "5"
         type: string
+      stream_id:
+        description: "Stream ID (for state tracking)"
+        required: false
+        default: ""
+        type: string
+  
+  # Remote trigger from Cloudflare Worker (Telegram)
+  repository_dispatch:
+    types: [record_stream]
 
 jobs:
   record-test:
     name: Record livestream
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # Increased to handle long recordings safely
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -45,9 +55,56 @@ jobs:
           mkdir -p recordings
           mkdir -p recordings/_temp
 
+      - name: Update state - Recording started
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
+          STREAM_ID: ${{ github.event.client_payload.stream_id || inputs.stream_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          python -c "
+          import os, json, urllib.request
+          
+          stream_id = os.environ.get('STREAM_ID', '')
+          run_id = os.environ.get('GITHUB_RUN_ID', '')
+          account_id = os.environ.get('CLOUDFLARE_ACCOUNT_ID', '')
+          namespace_id = os.environ.get('CF_KV_NAMESPACE_ID', '')
+          api_token = os.environ.get('CLOUDFLARE_API_TOKEN', '')
+          
+          if not stream_id or not all([account_id, namespace_id, api_token]):
+              print('No stream_id or Cloudflare credentials, skipping state update')
+              exit(0)
+          
+          url = f'https://api.cloudflare.com/client/v4/accounts/{account_id}/storage/kv/namespaces/{namespace_id}/values/recording:{stream_id}'
+          
+          # Read existing state
+          state = {}
+          try:
+              req = urllib.request.Request(url)
+              req.add_header('Authorization', f'Bearer {api_token}')
+              with urllib.request.urlopen(req) as response:
+                  state = json.loads(response.read().decode())
+          except Exception as e:
+              print(f'Could not read existing state: {e}')
+          
+          state['github_run_id'] = run_id
+          state['status'] = 'recording'
+          state['started_at'] = __import__('datetime').datetime.utcnow().isoformat() + 'Z'
+          
+          req = urllib.request.Request(url, method='PUT')
+          req.add_header('Authorization', f'Bearer {api_token}')
+          req.add_header('Content-Type', 'application/json')
+          try:
+              with urllib.request.urlopen(req, data=json.dumps(state).encode()) as response:
+                  print(f'Updated state for {stream_id}: {response.status}')
+          except Exception as e:
+              print(f'Failed to update state: {e}')
+          "
+
       - name: Start recording (with Virtual Display)
         env:
-          RECORD_URL: ${{ inputs.test_url }}
+          RECORD_URL: ${{ github.event.client_payload.stream_url || inputs.test_url }}
           RECORDINGS_DIR: ./recordings
           TEMP_DIR: ./recordings/_temp
           SEGMENT_SECONDS: 60
@@ -56,11 +113,20 @@ jobs:
           PAGE_TIMEOUT_MS: 60000
           VIDEO_WAIT_SECONDS: 120
           FIRST_CHUNK_TIMEOUT_SECONDS: 20
-          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+          DURATION_MINUTES: ${{ github.event.client_payload.duration_minutes || inputs.duration_minutes || '5' }}
+          STREAM_ID: ${{ github.event.client_payload.stream_id || inputs.stream_id }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
         run: |
           echo "========================================"
-          echo "SUPERLIVE RECORDER (NATIVE CAPTURE EDITION)"
+          echo "SUPERLIVE RECORDER (REMOTE TRIGGER MODE)"
           echo "========================================"
+          echo "URL: ${RECORD_URL}"
+          echo "Stream ID: ${STREAM_ID}"
+          echo "Duration: ${DURATION_MINUTES} minutes"
+          echo "========================================"
+          
           xvfb-run -a --server-args="-screen 0 1920x1080x24" python record_once.py
           exit $?
 
@@ -68,7 +134,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: superlive-recordings
+          name: superlive-recordings-${{ github.run_id }}
           path: |
             recordings/*.mp4
             recordings/_temp/*.webm
