@@ -32,7 +32,7 @@ def log(msg=""): print(msg, flush=True)
 def log_section(t): log("\n" + "="*70 + f"\n{t}\n" + "="*70)
 
 # ============================================================
-# WEBRTC HOOK (Optimized for Stable String Transfer via FileReader)
+# WEBRTC HOOK (IPC Chunking to bypass Playwright string limits)
 # ============================================================
 WEBRTC_HOOK = r"""
 (() => {
@@ -43,6 +43,25 @@ WEBRTC_HOOK = r"""
     window.__superlive_track_links = [];
     window.__superlive_streams = [];
     let recorder = null, recorderError = null, isRecording = false, chunkCount = 0;
+    
+    // Global queue for IPC chunking
+    window.__uploadQueue = [];
+    window.__isUploading = false;
+
+    async function processQueue() {
+        if (window.__isUploading) return;
+        window.__isUploading = true;
+        while (window.__uploadQueue.length > 0) {
+            const chunk = window.__uploadQueue.shift();
+            try {
+                // Await ensures strict ordering and prevents interleaving
+                await window.uploadVideoChunk(chunk);
+            } catch(e) {
+                console.error("[JS] Upload error:", e);
+            }
+        }
+        window.__isUploading = false;
+    }
 
     function addUnique(arr, value) { if (value && !arr.includes(value)) arr.push(value); }
     function rememberStream(stream) {
@@ -118,7 +137,6 @@ WEBRTC_HOOK = r"""
         recorder = new MediaRecorder(window.__preparedStream, { mimeType, videoBitsPerSecond: vb, audioBitsPerSecond: ab });
         isRecording = true;
         
-        // CRITICAL FIX: Use FileReader for stable Base64 string transfer
         recorder.ondataavailable = (e) => {
             if (e.data.size > 0 && isRecording) {
                 chunkCount++;
@@ -131,11 +149,15 @@ WEBRTC_HOOK = r"""
                         const commaIndex = result.indexOf(',');
                         if (commaIndex !== -1) {
                             const base64 = result.substring(commaIndex + 1);
-                            // Call Python function with plain string (highly stable in Playwright)
-                            window.uploadVideoChunk(base64);
+                            // CRITICAL FIX: Chunk the string to 64KB to bypass Playwright IPC string truncation
+                            const chunkSize = 65536; 
+                            for (let i = 0; i < base64.length; i += chunkSize) {
+                                window.__uploadQueue.push(base64.substring(i, i + chunkSize));
+                            }
+                            processQueue();
                         }
                     } catch (err) {
-                        console.error("[JS] Upload error:", err);
+                        console.error("[JS] FileReader error:", err);
                     }
                 };
                 reader.readAsDataURL(e.data);
@@ -190,11 +212,11 @@ async def run_recording(playwright):
     webm_path = TEMP_DIR / f"rec_{timestamp}.webm"
     webm_file = open(webm_path, "wb")
     
-    # Expose stable string upload function to JavaScript
     async def upload_chunk(base64_str):
         try:
-            # validate=False is CRITICAL to ignore missing '=' padding in Python 3.12+
-            webm_file.write(base64.b64decode(base64_str, validate=False))
+            # validate=False handles missing padding on the very last chunk gracefully
+            decoded = base64.b64decode(base64_str, validate=False)
+            webm_file.write(decoded)
         except Exception as e:
             log(f"[WARN] Decode error: {e}")
             
@@ -238,22 +260,26 @@ async def run_recording(playwright):
     if not wait_res.get('ok'): 
         webm_file.close()
         raise RuntimeError(f"Recorder failed to produce data: {wait_res.get('error')}")
-    log("[✓] MediaRecorder is generating data! (Stable String Transfer Active)")
+    log("[✓] MediaRecorder is generating data! (IPC Chunking Active)")
 
     log(f"[4/5] Capturing Native WebM for {RECORD_DURATION_SECONDS}s...")
     start_rec = time.monotonic()
     
-    # Main recording loop - just wait, data is written asynchronously via expose_function
     while time.monotonic() - start_rec < RECORD_DURATION_SECONDS:
         await asyncio.sleep(1)
         if (time.monotonic() - start_rec) % 30 < 1:
             size_mb = webm_path.stat().st_size / 1024 / 1024
             log(f"[*] Progress: {int(time.monotonic() - start_rec)}s | File Size: {size_mb:.2f} MB")
 
-    log("[*] Stopping Recorder & Flushing...")
+    log("[*] Stopping Recorder & Flushing Queue...")
     await safe_eval(page, "window.__superliveStopRec()")
-    await asyncio.sleep(3) # Allow final chunks to arrive and write
     
+    # Wait for JS queue to empty completely before closing file
+    for _ in range(30):
+        is_empty = await safe_eval(page, "() => window.__uploadQueue.length === 0 && !window.__isUploading")
+        if is_empty: break
+        await asyncio.sleep(0.5)
+        
     webm_file.close()
     log(f"[✓] Native Capture Complete. Final File size: {webm_path.stat().st_size / 1024 / 1024:.2f} MB")
     
@@ -283,7 +309,6 @@ async def run_recording(playwright):
         log(f"[ERROR] FFmpeg failed:\n{stderr.decode()}")
         raise RuntimeError("FFmpeg post-processing failed")
         
-    # Cleanup temp webm file to save space
     webm_path.unlink(missing_ok=True)
     
     moved = []
@@ -298,7 +323,7 @@ async def run_recording(playwright):
     return moved
 
 async def main():
-    log_section("SUPERLIVE ULTIMATE RECORDER (STABLE STRING EDITION)")
+    log_section("SUPERLIVE ULTIMATE RECORDER (IPC CHUNKING EDITION)")
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         return await asyncio.wait_for(run_recording(p), timeout=GLOBAL_WATCHDOG_SECONDS)
