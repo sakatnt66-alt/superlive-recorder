@@ -7,7 +7,7 @@ on:
         required: true
         type: string
       duration_minutes:
-        description: "Recording duration in minutes"
+        description: "Recording duration in minutes (e.g., 5 or 5.5)"
         required: false
         default: "5"
         type: string
@@ -16,7 +16,7 @@ jobs:
   record-test:
     name: Record livestream
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 360 # Increased to handle long recordings safely
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -49,26 +49,19 @@ jobs:
         env:
           RECORD_URL: ${{ inputs.test_url }}
           RECORDINGS_DIR: ./recordings
+          TEMP_DIR: ./recordings/_temp
           SEGMENT_SECONDS: 60
           VIDEO_BITRATE: 4000000
           AUDIO_BITRATE: 128000
           PAGE_TIMEOUT_MS: 60000
           VIDEO_WAIT_SECONDS: 120
           FIRST_CHUNK_TIMEOUT_SECONDS: 20
-          MAX_CANDIDATES: 8
+          DURATION_MINUTES: ${{ inputs.duration_minutes }}
         run: |
-          DURATION_SECONDS=$(( ${{ inputs.duration_minutes }} * 60 ))
-          export RECORD_DURATION_SECONDS="$DURATION_SECONDS"
           echo "========================================"
-          echo "SUPERLIVE RECORDER (XVFB EDITION)"
+          echo "SUPERLIVE RECORDER (NATIVE CAPTURE EDITION)"
           echo "========================================"
-          echo "URL: ${RECORD_URL}"
-          echo "Duration: ${DURATION_SECONDS}s"
-          echo "========================================"
-          
-          # xvfb-run creates a virtual screen so headless=False works perfectly!
           xvfb-run -a --server-args="-screen 0 1920x1080x24" python record_once.py
-          
           exit $?
 
       - name: Upload recordings and diagnostics
@@ -78,7 +71,7 @@ jobs:
           name: superlive-recordings
           path: |
             recordings/*.mp4
-            recordings/_temp/*
-            recordings/_diagnostic.png
+            recordings/_temp/*.webm
+            recordings/_temp/*.png
           if-no-files-found: warn
           retention-days: 7
