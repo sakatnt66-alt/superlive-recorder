@@ -16,38 +16,13 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # ============================================================
-# CLOUDFLARE KV STATE MANAGEMENT
+# WORKER API SETTINGS (NEW: Use Worker instead of direct KV access)
 # ============================================================
+WORKER_URL = os.environ.get("WORKER_URL", "")  # e.g., https://superlive-recorder.username.workers.dev
 
-def kv_get_state(stream_id):
-    """Read recording state from Cloudflare KV"""
-    account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
-    namespace_id = os.environ.get("CF_KV_NAMESPACE_ID", "")
-    api_token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
-    
-    if not stream_id or not all([account_id, namespace_id, api_token]):
-        log(f"[KV] Missing credentials: stream_id={bool(stream_id)}, account={bool(account_id)}, ns={bool(namespace_id)}, token={bool(api_token)}")
-        return None
-    
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/storage/kv/namespaces/{namespace_id}/values/recording:{stream_id}"
-    
-    try:
-        req = urllib.request.Request(url)
-        req.add_header('Authorization', f'Bearer {api_token}')
-        req.add_header('Content-Type', 'application/json')
-        with urllib.request.urlopen(req, timeout=15) as response:
-            data = response.read().decode()
-            return json.loads(data)
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            log(f"[KV] Key not found: recording:{stream_id}")
-        else:
-            log(f"[KV] HTTP error {e.code}: {e.reason}")
-        return None
-    except Exception as e:
-        log(f"[KV] Read error: {type(e).__name__}: {e}")
-        return None
-
+# ============================================================
+# CLOUDFLARE KV STATE MANAGEMENT (Only for writing, not reading)
+# ============================================================
 
 def kv_update_state(stream_id, status, file_size_mb=0, error=None, telegram_sent=False):
     """Update recording state in Cloudflare KV"""
@@ -62,7 +37,16 @@ def kv_update_state(stream_id, status, file_size_mb=0, error=None, telegram_sent
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/storage/kv/namespaces/{namespace_id}/values/recording:{stream_id}"
     
     try:
-        state = kv_get_state(stream_id) or {}
+        # Try to read existing state (optional, may fail due to 401)
+        state = {}
+        try:
+            req = urllib.request.Request(url)
+            req.add_header('Authorization', f'Bearer {api_token}')
+            with urllib.request.urlopen(req, timeout=10) as response:
+                state = json.loads(response.read().decode())
+        except Exception as e:
+            log(f"[KV] Could not read existing state (will create new): {type(e).__name__}")
+        
         state['status'] = status
         if file_size_mb > 0:
             state['file_size_mb'] = file_size_mb
@@ -74,7 +58,7 @@ def kv_update_state(stream_id, status, file_size_mb=0, error=None, telegram_sent
         req = urllib.request.Request(url, method='PUT')
         req.add_header('Authorization', f'Bearer {api_token}')
         req.add_header('Content-Type', 'application/json')
-        with urllib.request.urlopen(req, data=json.dumps(state).encode(), timeout=15) as response:
+        with urllib.request.urlopen(req, data=json.dumps(state).encode(), timeout=10) as response:
             log(f"[KV] ✓ State updated: {stream_id} -> {status}")
         return True
     except Exception as e:
@@ -83,23 +67,34 @@ def kv_update_state(stream_id, status, file_size_mb=0, error=None, telegram_sent
 
 
 def check_stop_requested(stream_id):
-    """Check if stop was requested via Telegram bot - DETAILED LOGGING"""
+    """Check if stop was requested via Worker API (not direct KV access)"""
     if not stream_id:
-        log("[STOP-CHECK] ✗ No STREAM_ID set!")
         return False
     
-    state = kv_get_state(stream_id)
-    if state is None:
-        log(f"[STOP-CHECK] ✗ Could not read state for {stream_id}")
+    if not WORKER_URL:
+        log("[STOP-CHECK] ✗ WORKER_URL not set!")
         return False
     
-    current_status = state.get('status', 'unknown')
-    log(f"[STOP-CHECK] Stream {stream_id} status = '{current_status}'")
-    
-    if current_status == 'stopped':
-        log(f"[STOP-CHECK] ✓✓✓ STOP DETECTED for {stream_id}!")
-        return True
-    return False
+    try:
+        url = f"{WORKER_URL.rstrip('/')}/api/check-stop/{stream_id}"
+        req = urllib.request.Request(url)
+        req.add_header('User-Agent', 'SuperLive-Recorder-Python')
+        
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode())
+            should_stop = data.get('should_stop', False)
+            status = data.get('status', 'unknown')
+            
+            log(f"[STOP-CHECK] Stream {stream_id} status = '{status}', should_stop = {should_stop}")
+            
+            if should_stop:
+                log(f"[STOP-CHECK] ✓✓✓ STOP DETECTED for {stream_id}!")
+                return True
+            return False
+            
+    except Exception as e:
+        log(f"[STOP-CHECK] ✗ API error: {type(e).__name__}: {e}")
+        return False
 
 
 # ============================================================
@@ -152,7 +147,6 @@ def split_large_files(mp4_files):
 
 
 def send_to_telegram(file_path, stream_id, part_number, total_parts):
-    """Send a single file to Telegram"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log("[TG] ✗ No Telegram credentials!")
         return False
@@ -204,7 +198,6 @@ def send_to_telegram(file_path, stream_id, part_number, total_parts):
 
 
 def upload_all_to_telegram(mp4_files, stream_id):
-    """Upload all MP4 files to Telegram"""
     if not mp4_files:
         return False
     
@@ -240,7 +233,7 @@ FIRST_CHUNK_TIMEOUT_SECONDS = int(os.environ.get("FIRST_CHUNK_TIMEOUT_SECONDS", 
 
 STREAM_ID = os.environ.get("STREAM_ID", "")
 
-STOP_CHECK_INTERVAL = 2
+STOP_CHECK_INTERVAL = 3
 STREAM_IDLE_TIMEOUT = 30
 MAX_RECORDING_SECONDS = 6 * 3600
 
@@ -433,6 +426,7 @@ async def safe_eval(page, expr, arg=None, timeout=15):
 async def run_recording(playwright):
     log("[1/6] Launching Chromium (headless=False via Xvfb)...")
     log(f"[DEBUG] STREAM_ID = '{STREAM_ID}'")
+    log(f"[DEBUG] WORKER_URL = '{WORKER_URL}'")
     log(f"[DEBUG] STOP_CHECK_INTERVAL = {STOP_CHECK_INTERVAL}s")
     
     browser = await playwright.chromium.launch(
@@ -529,7 +523,7 @@ async def run_recording(playwright):
         await asyncio.sleep(1)
         elapsed = time.monotonic() - start_rec
         
-        # CRITICAL: Check for stop request every STOP_CHECK_INTERVAL seconds
+        # CRITICAL: Check for stop request via Worker API
         if time.monotonic() - last_stop_check >= STOP_CHECK_INTERVAL:
             last_stop_check = time.monotonic()
             try:
@@ -649,7 +643,7 @@ async def run_recording(playwright):
     return mp4_files
 
 async def main():
-    log_section("SUPERLIVE RECORDER (CONTINUOUS MODE + TELEGRAM UPLOAD)")
+    log_section("SUPERLIVE RECORDER (CONTINUOUS MODE + WORKER API)")
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         return await asyncio.wait_for(run_recording(p), timeout=GLOBAL_WATCHDOG_SECONDS)
