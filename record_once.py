@@ -11,8 +11,8 @@ from pathlib import Path
 # ============================================================
 # TELEGRAM UPLOAD SETTINGS
 # ============================================================
-TELEGRAM_MAX_SIZE_MB = 44.9  # Safe margin below 50 MB limit
-TELEGRAM_TARGET_SIZE_MB = 42  # Target size for merged files
+TELEGRAM_MAX_SIZE_MB = 44.9
+TELEGRAM_TARGET_SIZE_MB = 42
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -26,7 +26,6 @@ WORKER_URL = os.environ.get("WORKER_URL", "")
 # ============================================================
 
 def kv_get_state(stream_id):
-    """Read recording state via Worker API"""
     if not stream_id or not WORKER_URL:
         return None
     
@@ -43,7 +42,6 @@ def kv_get_state(stream_id):
 
 
 def kv_delete_state(stream_id):
-    """Delete recording state from KV after completion"""
     account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
     namespace_id = os.environ.get("CF_KV_NAMESPACE_ID", "")
     api_token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
@@ -61,12 +59,11 @@ def kv_delete_state(stream_id):
             log(f"[KV] ✓ Deleted state for {stream_id}")
             return True
     except Exception as e:
-        log(f"[KV] Delete failed (will retry): {type(e).__name__}: {e}")
+        log(f"[KV] Delete failed: {type(e).__name__}: {e}")
         return False
 
 
 def kv_update_state(stream_id, status, file_size_mb=0, error=None, telegram_sent=False):
-    """Update recording state in Cloudflare KV"""
     account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
     namespace_id = os.environ.get("CF_KV_NAMESPACE_ID", "")
     api_token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
@@ -78,7 +75,6 @@ def kv_update_state(stream_id, status, file_size_mb=0, error=None, telegram_sent
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/storage/kv/namespaces/{namespace_id}/values/recording:{stream_id}"
     
     try:
-        # Try to read existing state
         state = {}
         try:
             req = urllib.request.Request(url)
@@ -108,7 +104,6 @@ def kv_update_state(stream_id, status, file_size_mb=0, error=None, telegram_sent
 
 
 def check_stop_requested(stream_id):
-    """Check if stop was requested via Worker API"""
     if not stream_id or not WORKER_URL:
         return False
     
@@ -133,11 +128,10 @@ def check_stop_requested(stream_id):
 
 
 # ============================================================
-# TELEGRAM UPLOAD FUNCTIONS (With Smart Merging)
+# TELEGRAM UPLOAD FUNCTIONS
 # ============================================================
 
 def merge_segments_to_target(segments, target_size_bytes, stream_id, output_dir):
-    """Merge small segments into larger files (~42 MB each) without re-encoding"""
     merged_files = []
     current_batch = []
     current_size = 0
@@ -150,22 +144,17 @@ def merge_segments_to_target(segments, target_size_bytes, stream_id, output_dir)
         current_batch.append(segment)
         current_size += seg_size
         
-        # If adding this segment would exceed target AND we have at least one segment, flush
         if current_size >= target_size_bytes and len(current_batch) > 0:
-            # Create merged file
             merged_name = f"stream_{stream_id}_part{batch_number:02d}.mp4"
             merged_path = output_dir / merged_name
             
             if len(current_batch) == 1:
-                # Just rename the single segment
                 current_batch[0].rename(merged_path)
                 log(f"[MERGE] ✓ Part {batch_number}: Single segment → {merged_path.name} ({current_size/1024/1024:.2f} MB)")
             else:
-                # Concatenate multiple segments using FFmpeg
                 concat_list = output_dir / f"concat_list_{batch_number}.txt"
                 with open(concat_list, 'w') as f:
                     for seg in current_batch:
-                        # Use absolute path and escape for ffmpeg
                         abs_path = seg.resolve().as_posix()
                         f.write(f"file '{abs_path}'\n")
                 
@@ -173,7 +162,7 @@ def merge_segments_to_target(segments, target_size_bytes, stream_id, output_dir)
                     "ffmpeg", "-hide_banner", "-loglevel", "error",
                     "-f", "concat", "-safe", "0",
                     "-i", str(concat_list),
-                    "-c", "copy",  # CRITICAL: No re-encoding!
+                    "-c", "copy",
                     "-movflags", "+faststart",
                     str(merged_path)
                 ]
@@ -181,14 +170,12 @@ def merge_segments_to_target(segments, target_size_bytes, stream_id, output_dir)
                 result = subprocess.run(cmd, capture_output=True, text=True)
                 
                 if result.returncode == 0:
-                    # Delete the individual segments
                     for seg in current_batch:
                         seg.unlink()
                     concat_list.unlink()
                     log(f"[MERGE] ✓ Part {batch_number}: Merged {len(current_batch)} segments → {merged_path.name} ({current_size/1024/1024:.2f} MB)")
                 else:
                     log(f"[MERGE] ✗ Merge failed: {result.stderr[:200]}")
-                    # Keep segments as fallback
                     merged_files.extend(current_batch)
                     current_batch = []
                     current_size = 0
@@ -199,7 +186,6 @@ def merge_segments_to_target(segments, target_size_bytes, stream_id, output_dir)
             current_batch = []
             current_size = 0
     
-    # Handle remaining segments
     if current_batch:
         merged_name = f"stream_{stream_id}_part{batch_number:02d}.mp4"
         merged_path = output_dir / merged_name
@@ -241,7 +227,6 @@ def merge_segments_to_target(segments, target_size_bytes, stream_id, output_dir)
 
 
 def split_oversized_files(files):
-    """Split any file that still exceeds TELEGRAM_MAX_SIZE_MB"""
     final_files = []
     max_size_bytes = int(TELEGRAM_MAX_SIZE_MB * 1024 * 1024)
     
@@ -346,16 +331,15 @@ def send_to_telegram(file_path, stream_id, part_number, total_parts):
 
 def upload_all_to_telegram(mp4_files, stream_id):
     if not mp4_files:
+        log("[TG] ✗ No files to upload!")
         return False
     
     total_original_size = sum(f.stat().st_size for f in mp4_files) / 1024 / 1024
     log(f"[TG] Processing {len(mp4_files)} files (total {total_original_size:.2f} MB)...")
     
-    # STEP 1: Smart merge to ~42 MB
     target_size_bytes = int(TELEGRAM_TARGET_SIZE_MB * 1024 * 1024)
     merged_files = merge_segments_to_target(mp4_files, target_size_bytes, stream_id, mp4_files[0].parent)
     
-    # STEP 2: Split any remaining oversized files
     final_files = split_oversized_files(merged_files)
     
     total_final_size = sum(f.stat().st_size for f in final_files) / 1024 / 1024
@@ -368,7 +352,7 @@ def upload_all_to_telegram(mp4_files, stream_id):
         log(f"[TG] Uploading {i}/{total_parts}: {file_path.name}")
         if send_to_telegram(file_path, stream_id, i, total_parts):
             success_count += 1
-        time.sleep(2)  # Rate limiting
+        time.sleep(2)
     
     log(f"[TG] Upload result: {success_count}/{total_parts} files sent")
     return success_count > 0
@@ -381,8 +365,8 @@ URL = os.environ.get("RECORD_URL", "https://superlivetv.com/fr/livestream/150596
 RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "recordings")).resolve()
 TEMP_DIR = Path(os.environ.get("TEMP_DIR", str(RECORDINGS_DIR / "_temp"))).resolve()
 SEGMENT_SECONDS = int(os.environ.get("SEGMENT_SECONDS", "60"))
-VIDEO_BITRATE = int(os.environ.get("VIDEO_BITRATE", "4000000"))
-AUDIO_BITRATE = int(os.environ.get("AUDIO_BITRATE", "128000"))
+VIDEO_BITRATE = int(os.environ.get("VIDEO_BITRATE", "8000000"))  # Increased from 4M to 8M
+AUDIO_BITRATE = int(os.environ.get("AUDIO_BITRATE", "192000"))
 VIDEO_WAIT_SECONDS = int(os.environ.get("VIDEO_WAIT_SECONDS", "120"))
 PAGE_TIMEOUT_MS = int(os.environ.get("PAGE_TIMEOUT_MS", "60000"))
 FIRST_CHUNK_TIMEOUT_SECONDS = int(os.environ.get("FIRST_CHUNK_TIMEOUT_SECONDS", "20"))
@@ -391,6 +375,7 @@ STREAM_ID = os.environ.get("STREAM_ID", "")
 
 STOP_CHECK_INTERVAL = 3
 STREAM_IDLE_TIMEOUT = 30
+MIN_CHUNK_SIZE = 1000  # Minimum chunk size in bytes (1 KB)
 MAX_RECORDING_SECONDS = 6 * 3600
 
 GLOBAL_WATCHDOG_SECONDS = int(MAX_RECORDING_SECONDS + 3600)
@@ -410,7 +395,7 @@ def log(msg=""):
 def log_section(t): log("\n" + "="*70 + f"\n{t}\n" + "="*70)
 
 # ============================================================
-# WEBRTC HOOK (UNCHANGED)
+# WEBRTC HOOK (IMPROVED: Track chunk sizes)
 # ============================================================
 WEBRTC_HOOK = r"""
 (() => {
@@ -422,6 +407,7 @@ WEBRTC_HOOK = r"""
     window.__superlive_streams = [];
     let recorder = null, recorderError = null, isRecording = false, chunkCount = 0;
     let lastChunkTime = Date.now();
+    let lastChunkSize = 0;  // NEW: Track last chunk size
     let uploadQueue = [];
     let isUploading = false;
     let uploadErrors = 0;
@@ -526,6 +512,7 @@ WEBRTC_HOOK = r"""
         recorder.ondataavailable = (e) => {
             if (e.data.size > 0 && isRecording) {
                 chunkCount++;
+                lastChunkSize = e.data.size;  // NEW: Track chunk size
                 lastChunkTime = Date.now();
                 if (chunkCount % 10 === 0) console.log(`[JS] Chunk #${chunkCount} | size: ${e.data.size} bytes | queue: ${uploadQueue.length} | errors: ${uploadErrors}`);
                 e.data.arrayBuffer().then(buf => {
@@ -554,6 +541,7 @@ WEBRTC_HOOK = r"""
         uploadErrors,
         recorderState: recorder ? recorder.state : 'none',
         idleTimeMs: Date.now() - lastChunkTime,
+        lastChunkSize: lastChunkSize,  // NEW: Return last chunk size
         videoReadyState: (() => {
             const v = document.querySelector('video');
             return v ? v.readyState : 0;
@@ -650,6 +638,7 @@ async def run_recording(playwright):
         webm_file.close()
         await page.screenshot(path=str(TEMP_DIR / "timeout_error.png"))
         kv_update_state(STREAM_ID, 'failed', error='Timed out waiting for WebRTC stream')
+        kv_delete_state(STREAM_ID)
         raise RuntimeError("Timed out waiting for WebRTC stream.")
 
     log("[3/6] Preparing MediaStream & Starting Recorder...")
@@ -665,6 +654,7 @@ async def run_recording(playwright):
         await page.unroute("**/__slr_chunk")
         webm_file.close()
         kv_update_state(STREAM_ID, 'failed', error=f"Recorder failed: {wait_res.get('error')}")
+        kv_delete_state(STREAM_ID)
         raise RuntimeError(f"Recorder failed: {wait_res.get('error')}")
     log("[✓] MediaRecorder is generating data!")
 
@@ -678,6 +668,7 @@ async def run_recording(playwright):
         await asyncio.sleep(1)
         elapsed = time.monotonic() - start_rec
         
+        # Check for manual stop request
         if time.monotonic() - last_stop_check >= STOP_CHECK_INTERVAL:
             last_stop_check = time.monotonic()
             try:
@@ -688,28 +679,44 @@ async def run_recording(playwright):
             except Exception as e:
                 log(f"[WARN] Stop check error: {e}")
         
+        # Log progress every 15 seconds
         if time.monotonic() - last_log_time >= 15:
             last_log_time = time.monotonic()
             size_mb = total_bytes / 1024 / 1024
             log(f"[*] Progress: {int(elapsed)}s | Chunks: {chunk_count} | Size: {size_mb:.2f} MB | Errors: {write_errors}")
         
+        # IMPROVED: Check stream health with multiple conditions
         try:
             status = await safe_eval(page, "window.__superliveGetStatus()")
             idle_ms = status.get('idleTimeMs', 0)
             video_state = status.get('videoReadyState', 0)
+            last_chunk_size = status.get('lastChunkSize', 0)
             
+            # Condition 1: No chunks for 30 seconds
             if idle_ms > STREAM_IDLE_TIMEOUT * 1000:
-                log(f"[!] Stream idle for {idle_ms/1000:.1f}s (video readyState: {video_state})")
-                if video_state < 2 or chunk_count > 10:
-                    log("[!] Stream has ended")
-                    stop_reason = "stream_ended"
-                    break
+                log(f"[!] Stream ended: No chunks for {idle_ms/1000:.1f}s")
+                stop_reason = "stream_ended_idle"
+                break
+            
+            # Condition 2: Video stopped (readyState < 2) after recording started
+            if video_state < 2 and chunk_count > 5:
+                log(f"[!] Stream ended: Video stopped (readyState={video_state})")
+                stop_reason = "stream_ended_video"
+                break
+            
+            # Condition 3: Last chunk too small (< 1KB) after recording started
+            if last_chunk_size < MIN_CHUNK_SIZE and chunk_count > 5:
+                log(f"[!] Stream ended: Last chunk too small ({last_chunk_size} bytes)")
+                stop_reason = "stream_ended_small_chunk"
+                break
+                
         except Exception as e:
             log(f"[WARN] Status check failed: {e}")
 
     log(f"[*] Stopping recording (reason: {stop_reason})...")
     await safe_eval(page, "window.__superliveStopRec()")
     
+    # Wait for queue to flush
     for i in range(60):
         try:
             status = await safe_eval(page, "window.__superliveGetStatus()")
@@ -736,7 +743,7 @@ async def run_recording(playwright):
     await browser.close()
     
     # ============================================================
-    # POST-PROCESSING (FFmpeg) - HIGH QUALITY
+    # POST-PROCESSING (FFmpeg)
     # ============================================================
     log("[5/6] Converting WebM to MP4 (HIGH QUALITY)...")
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -748,7 +755,6 @@ async def run_recording(playwright):
         "-map", "0:v:0", "-map", "0:a:0?",
         "-vf", "fps=30,pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2:color=black",
         "-vsync", "cfr", "-r", "30",
-        # HIGH QUALITY SETTINGS
         "-c:v", "libx264", "-preset", "medium", "-crf", "18", 
         "-pix_fmt", "yuv420p", "-threads", "0",
         "-tune", "film",
@@ -786,7 +792,7 @@ async def run_recording(playwright):
     log(f"[✓] Created {len(mp4_files)} raw segments (total {total_raw_size:.2f} MB)")
     
     # ============================================================
-    # UPLOAD TO TELEGRAM (With Smart Merging)
+    # UPLOAD TO TELEGRAM
     # ============================================================
     log("[6/6] Uploading to Telegram (Smart Merge)...")
     kv_update_state(STREAM_ID, 'uploading', file_size_mb=total_raw_size)
@@ -795,7 +801,6 @@ async def run_recording(playwright):
     
     kv_update_state(STREAM_ID, 'finished', file_size_mb=total_raw_size, telegram_sent=upload_success)
     
-    # CRITICAL: Clean up KV after successful upload
     if upload_success:
         kv_delete_state(STREAM_ID)
         
@@ -803,7 +808,7 @@ async def run_recording(playwright):
     return mp4_files
 
 async def main():
-    log_section("SUPERLIVE RECORDER (HIGH QUALITY + SMART MERGE)")
+    log_section("SUPERLIVE RECORDER (IMPROVED STREAM DETECTION)")
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         return await asyncio.wait_for(run_recording(p), timeout=GLOBAL_WATCHDOG_SECONDS)
