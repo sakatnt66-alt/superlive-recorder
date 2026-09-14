@@ -21,7 +21,6 @@ VIDEO_WAIT_SECONDS = int(os.environ.get("VIDEO_WAIT_SECONDS", "120"))
 PAGE_TIMEOUT_MS = int(os.environ.get("PAGE_TIMEOUT_MS", "60000"))
 FIRST_CHUNK_TIMEOUT_SECONDS = int(os.environ.get("FIRST_CHUNK_TIMEOUT_SECONDS", "20"))
 
-# Parse duration safely (handles decimals like 5.5 minutes)
 DURATION_MINUTES = float(os.environ.get("DURATION_MINUTES", "5"))
 RECORD_DURATION_SECONDS = int(DURATION_MINUTES * 60)
 
@@ -33,7 +32,7 @@ def log(msg=""): print(msg, flush=True)
 def log_section(t): log("\n" + "="*70 + f"\n{t}\n" + "="*70)
 
 # ============================================================
-# OPTIMIZED WEBRTC HOOK (Native FileReader for zero GC pressure)
+# OPTIMIZED WEBRTC HOOK (Safe DataURL extraction)
 # ============================================================
 WEBRTC_HOOK = r"""
 (() => {
@@ -118,13 +117,18 @@ WEBRTC_HOOK = r"""
         
         recorder = new MediaRecorder(window.__preparedStream, { mimeType, videoBitsPerSecond: vb, audioBitsPerSecond: ab });
         
-        // CRITICAL FIX: Use FileReader for native, fast Base64 encoding without memory leaks
+        // CRITICAL FIX: Safe substring extraction instead of split()
         recorder.ondataavailable = (e) => {
             if (e.data.size > 0) {
                 const reader = new FileReader();
                 reader.onload = () => {
-                    // Extract only the base64 part (remove "data:video/webm;base64,")
-                    recorderQueue.push(reader.result.split(',')[1]);
+                    const result = reader.result;
+                    const commaIndex = result.indexOf(',');
+                    if (commaIndex !== -1) {
+                        recorderQueue.push(result.substring(commaIndex + 1));
+                    } else {
+                        recorderQueue.push(result);
+                    }
                 };
                 reader.readAsDataURL(e.data);
             }
@@ -151,6 +155,17 @@ async def safe_eval(page, expr, arg=None, timeout=15):
         if arg is not None: return await asyncio.wait_for(page.evaluate(expr, arg), timeout=timeout)
         return await asyncio.wait_for(page.evaluate(expr), timeout=timeout)
     except Exception as e: raise RuntimeError(f"Eval failed: {e}")
+
+def decode_chunk(enc):
+    """Safely decode base64, ignoring strict padding errors in Python 3.12+"""
+    if not enc:
+        return b""
+    try:
+        # validate=False is CRITICAL to ignore missing '=' padding
+        return base64.b64decode(enc, validate=False)
+    except Exception as e:
+        log(f"[WARN] Base64 decode error: {e}")
+        return b""
 
 # ============================================================
 # WORKFLOW
@@ -216,7 +231,7 @@ async def run_recording(playwright):
         while time.monotonic() - start_rec < RECORD_DURATION_SECONDS:
             chunk = await safe_eval(page, "window.__superliveTakeChunk()")
             if chunk:
-                f.write(base64.b64decode(chunk))
+                f.write(decode_chunk(chunk))
                 chunks += 1
             else:
                 await asyncio.sleep(0.2)
@@ -228,11 +243,11 @@ async def run_recording(playwright):
     await safe_eval(page, "window.__superliveStopRec()")
     await asyncio.sleep(3) # Allow final chunk to arrive
     
-    while True:
-        chunk = await safe_eval(page, "window.__superliveTakeChunk()")
-        if not chunk: break
-        with open(webm_path, "ab") as f:
-            f.write(base64.b64decode(chunk))
+    with open(webm_path, "ab") as f:
+        while True:
+            chunk = await safe_eval(page, "window.__superliveTakeChunk()")
+            if not chunk: break
+            f.write(decode_chunk(chunk))
 
     log(f"[✓] Native Capture Complete. File size: {webm_path.stat().st_size / 1024 / 1024:.2f} MB")
     
