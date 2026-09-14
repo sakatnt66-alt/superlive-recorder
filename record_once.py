@@ -11,18 +11,59 @@ from pathlib import Path
 # ============================================================
 # TELEGRAM UPLOAD SETTINGS
 # ============================================================
-TELEGRAM_MAX_SIZE_MB = 44.9
+TELEGRAM_MAX_SIZE_MB = 44.9  # Safe margin below 50 MB limit
+TELEGRAM_TARGET_SIZE_MB = 42  # Target size for merged files
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # ============================================================
-# WORKER API SETTINGS (NEW: Use Worker instead of direct KV access)
+# WORKER API SETTINGS
 # ============================================================
-WORKER_URL = os.environ.get("WORKER_URL", "")  # e.g., https://superlive-recorder.username.workers.dev
+WORKER_URL = os.environ.get("WORKER_URL", "")
 
 # ============================================================
-# CLOUDFLARE KV STATE MANAGEMENT (Only for writing, not reading)
+# CLOUDFLARE KV STATE MANAGEMENT
 # ============================================================
+
+def kv_get_state(stream_id):
+    """Read recording state via Worker API"""
+    if not stream_id or not WORKER_URL:
+        return None
+    
+    try:
+        url = f"{WORKER_URL.rstrip('/')}/api/check-stop/{stream_id}"
+        req = urllib.request.Request(url)
+        req.add_header('User-Agent', 'SuperLive-Recorder-Python')
+        
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return json.loads(response.read().decode())
+    except Exception as e:
+        log(f"[KV] Read error: {type(e).__name__}: {e}")
+        return None
+
+
+def kv_delete_state(stream_id):
+    """Delete recording state from KV after completion"""
+    account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+    namespace_id = os.environ.get("CF_KV_NAMESPACE_ID", "")
+    api_token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+    
+    if not stream_id or not all([account_id, namespace_id, api_token]):
+        log("[KV] Missing credentials for cleanup")
+        return False
+    
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/storage/kv/namespaces/{namespace_id}/values/recording:{stream_id}"
+    
+    try:
+        req = urllib.request.Request(url, method='DELETE')
+        req.add_header('Authorization', f'Bearer {api_token}')
+        with urllib.request.urlopen(req, timeout=10) as response:
+            log(f"[KV] ✓ Deleted state for {stream_id}")
+            return True
+    except Exception as e:
+        log(f"[KV] Delete failed (will retry): {type(e).__name__}: {e}")
+        return False
+
 
 def kv_update_state(stream_id, status, file_size_mb=0, error=None, telegram_sent=False):
     """Update recording state in Cloudflare KV"""
@@ -37,7 +78,7 @@ def kv_update_state(stream_id, status, file_size_mb=0, error=None, telegram_sent
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/storage/kv/namespaces/{namespace_id}/values/recording:{stream_id}"
     
     try:
-        # Try to read existing state (optional, may fail due to 401)
+        # Try to read existing state
         state = {}
         try:
             req = urllib.request.Request(url)
@@ -45,7 +86,7 @@ def kv_update_state(stream_id, status, file_size_mb=0, error=None, telegram_sent
             with urllib.request.urlopen(req, timeout=10) as response:
                 state = json.loads(response.read().decode())
         except Exception as e:
-            log(f"[KV] Could not read existing state (will create new): {type(e).__name__}")
+            log(f"[KV] Could not read existing state: {type(e).__name__}")
         
         state['status'] = status
         if file_size_mb > 0:
@@ -67,12 +108,8 @@ def kv_update_state(stream_id, status, file_size_mb=0, error=None, telegram_sent
 
 
 def check_stop_requested(stream_id):
-    """Check if stop was requested via Worker API (not direct KV access)"""
-    if not stream_id:
-        return False
-    
-    if not WORKER_URL:
-        log("[STOP-CHECK] ✗ WORKER_URL not set!")
+    """Check if stop was requested via Worker API"""
+    if not stream_id or not WORKER_URL:
         return False
     
     try:
@@ -85,28 +122,130 @@ def check_stop_requested(stream_id):
             should_stop = data.get('should_stop', False)
             status = data.get('status', 'unknown')
             
-            log(f"[STOP-CHECK] Stream {stream_id} status = '{status}', should_stop = {should_stop}")
-            
             if should_stop:
-                log(f"[STOP-CHECK] ✓✓✓ STOP DETECTED for {stream_id}!")
+                log(f"[STOP-CHECK] ✓✓✓ STOP DETECTED! Status = '{status}'")
                 return True
             return False
             
     except Exception as e:
-        log(f"[STOP-CHECK] ✗ API error: {type(e).__name__}: {e}")
+        log(f"[STOP-CHECK] API error: {type(e).__name__}: {e}")
         return False
 
 
 # ============================================================
-# TELEGRAM UPLOAD FUNCTIONS
+# TELEGRAM UPLOAD FUNCTIONS (With Smart Merging)
 # ============================================================
 
-def split_large_files(mp4_files):
-    """Split files larger than TELEGRAM_MAX_SIZE_MB"""
+def merge_segments_to_target(segments, target_size_bytes, stream_id, output_dir):
+    """Merge small segments into larger files (~42 MB each) without re-encoding"""
+    merged_files = []
+    current_batch = []
+    current_size = 0
+    batch_number = 1
+    
+    log(f"[MERGE] Starting smart merge: {len(segments)} segments → ~{TELEGRAM_TARGET_SIZE_MB} MB each")
+    
+    for segment in segments:
+        seg_size = segment.stat().st_size
+        current_batch.append(segment)
+        current_size += seg_size
+        
+        # If adding this segment would exceed target AND we have at least one segment, flush
+        if current_size >= target_size_bytes and len(current_batch) > 0:
+            # Create merged file
+            merged_name = f"stream_{stream_id}_part{batch_number:02d}.mp4"
+            merged_path = output_dir / merged_name
+            
+            if len(current_batch) == 1:
+                # Just rename the single segment
+                current_batch[0].rename(merged_path)
+                log(f"[MERGE] ✓ Part {batch_number}: Single segment → {merged_path.name} ({current_size/1024/1024:.2f} MB)")
+            else:
+                # Concatenate multiple segments using FFmpeg
+                concat_list = output_dir / f"concat_list_{batch_number}.txt"
+                with open(concat_list, 'w') as f:
+                    for seg in current_batch:
+                        # Use absolute path and escape for ffmpeg
+                        abs_path = seg.resolve().as_posix()
+                        f.write(f"file '{abs_path}'\n")
+                
+                cmd = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-f", "concat", "-safe", "0",
+                    "-i", str(concat_list),
+                    "-c", "copy",  # CRITICAL: No re-encoding!
+                    "-movflags", "+faststart",
+                    str(merged_path)
+                ]
+                
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                
+                if result.returncode == 0:
+                    # Delete the individual segments
+                    for seg in current_batch:
+                        seg.unlink()
+                    concat_list.unlink()
+                    log(f"[MERGE] ✓ Part {batch_number}: Merged {len(current_batch)} segments → {merged_path.name} ({current_size/1024/1024:.2f} MB)")
+                else:
+                    log(f"[MERGE] ✗ Merge failed: {result.stderr[:200]}")
+                    # Keep segments as fallback
+                    merged_files.extend(current_batch)
+                    current_batch = []
+                    current_size = 0
+                    continue
+            
+            merged_files.append(merged_path)
+            batch_number += 1
+            current_batch = []
+            current_size = 0
+    
+    # Handle remaining segments
+    if current_batch:
+        merged_name = f"stream_{stream_id}_part{batch_number:02d}.mp4"
+        merged_path = output_dir / merged_name
+        
+        if len(current_batch) == 1:
+            current_batch[0].rename(merged_path)
+            log(f"[MERGE] ✓ Part {batch_number}: Single segment → {merged_path.name} ({current_size/1024/1024:.2f} MB)")
+            merged_files.append(merged_path)
+        else:
+            concat_list = output_dir / f"concat_list_{batch_number}.txt"
+            with open(concat_list, 'w') as f:
+                for seg in current_batch:
+                    abs_path = seg.resolve().as_posix()
+                    f.write(f"file '{abs_path}'\n")
+            
+            cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "concat", "-safe", "0",
+                "-i", str(concat_list),
+                "-c", "copy",
+                "-movflags", "+faststart",
+                str(merged_path)
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                for seg in current_batch:
+                    seg.unlink()
+                concat_list.unlink()
+                log(f"[MERGE] ✓ Part {batch_number}: Merged {len(current_batch)} segments → {merged_path.name} ({current_size/1024/1024:.2f} MB)")
+                merged_files.append(merged_path)
+            else:
+                log(f"[MERGE] ✗ Final merge failed, keeping segments")
+                merged_files.extend(current_batch)
+    
+    log(f"[MERGE] Complete: {len(segments)} segments → {len(merged_files)} files")
+    return merged_files
+
+
+def split_oversized_files(files):
+    """Split any file that still exceeds TELEGRAM_MAX_SIZE_MB"""
     final_files = []
     max_size_bytes = int(TELEGRAM_MAX_SIZE_MB * 1024 * 1024)
     
-    for file_path in mp4_files:
+    for file_path in files:
         file_size = file_path.stat().st_size
         
         if file_size <= max_size_bytes:
@@ -116,7 +255,7 @@ def split_large_files(mp4_files):
             
             stem = file_path.stem
             parent = file_path.parent
-            output_pattern = str(parent / f"{stem}_part%02d.mp4")
+            output_pattern = str(parent / f"{stem}_sub%02d.mp4")
             
             cmd = [
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -132,15 +271,15 @@ def split_large_files(mp4_files):
             result = subprocess.run(cmd, capture_output=True, text=True)
             
             if result.returncode == 0:
-                parts = sorted(parent.glob(f"{stem}_part*.mp4"))
+                parts = sorted(parent.glob(f"{stem}_sub*.mp4"))
                 if parts:
                     final_files.extend(parts)
                     file_path.unlink()
-                    log(f"[SPLIT] ✓ Created {len(parts)} parts")
+                    log(f"[SPLIT] ✓ Created {len(parts)} sub-parts")
                 else:
                     final_files.append(file_path)
             else:
-                log(f"[SPLIT] ✗ Failed: {result.stderr[:200]}")
+                log(f"[SPLIT] ✗ Failed, keeping original")
                 final_files.append(file_path)
     
     return final_files
@@ -152,7 +291,11 @@ def send_to_telegram(file_path, stream_id, part_number, total_parts):
         return False
     
     file_size_mb = file_path.stat().st_size / (1024 * 1024)
-    caption = f"📺 البث: {stream_id}\n📦 الجزء: {part_number}/{total_parts}\n📊 الحجم: {file_size_mb:.2f} MB"
+    caption = (
+        f"📺 <b>البث:</b> <code>{stream_id}</code>\n"
+        f"📦 <b>الجزء:</b> {part_number}/{total_parts}\n"
+        f"📊 <b>الحجم:</b> {file_size_mb:.2f} MB"
+    )
     
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
     
@@ -170,7 +313,11 @@ def send_to_telegram(file_path, stream_id, part_number, total_parts):
         body.append(f"--{boundary}".encode())
         body.append(b'Content-Disposition: form-data; name="caption"')
         body.append(b'')
-        body.append(caption.encode())
+        body.append(caption.encode('utf-8'))
+        body.append(f"--{boundary}".encode())
+        body.append(b'Content-Disposition: form-data; name="parse_mode"')
+        body.append(b'')
+        body.append(b'HTML')
         body.append(f"--{boundary}".encode())
         body.append(f'Content-Disposition: form-data; name="video"; filename="{file_path.name}"'.encode())
         body.append(b'Content-Type: video/mp4')
@@ -201,9 +348,18 @@ def upload_all_to_telegram(mp4_files, stream_id):
     if not mp4_files:
         return False
     
-    log(f"[TG] Processing {len(mp4_files)} files...")
-    final_files = split_large_files(mp4_files)
-    log(f"[TG] Final count after splitting: {len(final_files)}")
+    total_original_size = sum(f.stat().st_size for f in mp4_files) / 1024 / 1024
+    log(f"[TG] Processing {len(mp4_files)} files (total {total_original_size:.2f} MB)...")
+    
+    # STEP 1: Smart merge to ~42 MB
+    target_size_bytes = int(TELEGRAM_TARGET_SIZE_MB * 1024 * 1024)
+    merged_files = merge_segments_to_target(mp4_files, target_size_bytes, stream_id, mp4_files[0].parent)
+    
+    # STEP 2: Split any remaining oversized files
+    final_files = split_oversized_files(merged_files)
+    
+    total_final_size = sum(f.stat().st_size for f in final_files) / 1024 / 1024
+    log(f"[TG] Final: {len(final_files)} files (total {total_final_size:.2f} MB)")
     
     success_count = 0
     total_parts = len(final_files)
@@ -212,7 +368,7 @@ def upload_all_to_telegram(mp4_files, stream_id):
         log(f"[TG] Uploading {i}/{total_parts}: {file_path.name}")
         if send_to_telegram(file_path, stream_id, i, total_parts):
             success_count += 1
-        time.sleep(1)
+        time.sleep(2)  # Rate limiting
     
     log(f"[TG] Upload result: {success_count}/{total_parts} files sent")
     return success_count > 0
@@ -254,7 +410,7 @@ def log(msg=""):
 def log_section(t): log("\n" + "="*70 + f"\n{t}\n" + "="*70)
 
 # ============================================================
-# WEBRTC HOOK
+# WEBRTC HOOK (UNCHANGED)
 # ============================================================
 WEBRTC_HOOK = r"""
 (() => {
@@ -427,7 +583,6 @@ async def run_recording(playwright):
     log("[1/6] Launching Chromium (headless=False via Xvfb)...")
     log(f"[DEBUG] STREAM_ID = '{STREAM_ID}'")
     log(f"[DEBUG] WORKER_URL = '{WORKER_URL}'")
-    log(f"[DEBUG] STOP_CHECK_INTERVAL = {STOP_CHECK_INTERVAL}s")
     
     browser = await playwright.chromium.launch(
         headless=False, 
@@ -523,24 +678,21 @@ async def run_recording(playwright):
         await asyncio.sleep(1)
         elapsed = time.monotonic() - start_rec
         
-        # CRITICAL: Check for stop request via Worker API
         if time.monotonic() - last_stop_check >= STOP_CHECK_INTERVAL:
             last_stop_check = time.monotonic()
             try:
                 if check_stop_requested(STREAM_ID):
-                    log(f"[!] ✓✓✓ STOP REQUESTED via Telegram at {int(elapsed)}s")
+                    log(f"[!] ✓✓✓ STOP REQUESTED at {int(elapsed)}s")
                     stop_reason = "stop_requested"
                     break
             except Exception as e:
                 log(f"[WARN] Stop check error: {e}")
         
-        # Log progress every 15 seconds
         if time.monotonic() - last_log_time >= 15:
             last_log_time = time.monotonic()
             size_mb = total_bytes / 1024 / 1024
             log(f"[*] Progress: {int(elapsed)}s | Chunks: {chunk_count} | Size: {size_mb:.2f} MB | Errors: {write_errors}")
         
-        # Check stream health
         try:
             status = await safe_eval(page, "window.__superliveGetStatus()")
             idle_ms = status.get('idleTimeMs', 0)
@@ -576,6 +728,7 @@ async def run_recording(playwright):
     
     if final_size < 1024:
         kv_update_state(STREAM_ID, 'failed', error=f"WebM too small ({final_size} bytes)")
+        kv_delete_state(STREAM_ID)
         raise RuntimeError(f"WebM too small ({final_size} bytes).")
     
     log("[*] Closing browser...")
@@ -583,11 +736,11 @@ async def run_recording(playwright):
     await browser.close()
     
     # ============================================================
-    # POST-PROCESSING (FFmpeg)
+    # POST-PROCESSING (FFmpeg) - HIGH QUALITY
     # ============================================================
-    log("[5/6] Converting WebM to MP4...")
+    log("[5/6] Converting WebM to MP4 (HIGH QUALITY)...")
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
-    out_pattern = str(RECORDINGS_DIR / f"rec_{timestamp}_%03d.mp4")
+    out_pattern = str(RECORDINGS_DIR / f"seg_{timestamp}_%03d.mp4")
     
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning", "-stats",
@@ -595,8 +748,11 @@ async def run_recording(playwright):
         "-map", "0:v:0", "-map", "0:a:0?",
         "-vf", "fps=30,pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2:color=black",
         "-vsync", "cfr", "-r", "30",
-        "-c:v", "libx264", "-preset", "superfast", "-crf", "23", "-pix_fmt", "yuv420p", "-threads", "0",
-        "-c:a", "aac", "-b:a", str(AUDIO_BITRATE), "-ar", "44100",
+        # HIGH QUALITY SETTINGS
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18", 
+        "-pix_fmt", "yuv420p", "-threads", "0",
+        "-tune", "film",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-f", "segment", "-segment_time", str(SEGMENT_SECONDS), "-segment_format", "mp4",
         "-reset_timestamps", "1", "-movflags", "+faststart",
         out_pattern
@@ -610,40 +766,44 @@ async def run_recording(playwright):
             if line.strip():
                 log(f"[FFmpeg] {line}")
                 
-    mp4_files = list(sorted(RECORDINGS_DIR.glob(f"rec_{timestamp}_*.mp4")))
+    mp4_files = list(sorted(RECORDINGS_DIR.glob(f"seg_{timestamp}_*.mp4")))
     
     if result.returncode != 0 and len(mp4_files) == 0:
         log(f"[ERROR] FFmpeg failed: {result.returncode}")
         webm_path.unlink(missing_ok=True)
         kv_update_state(STREAM_ID, 'failed', error=f"FFmpeg failed")
+        kv_delete_state(STREAM_ID)
         raise RuntimeError("FFmpeg failed")
         
     webm_path.unlink(missing_ok=True)
     
     if not mp4_files:
         kv_update_state(STREAM_ID, 'failed', error="No MP4 files")
+        kv_delete_state(STREAM_ID)
         raise RuntimeError("No MP4 files")
     
-    for f in mp4_files:
-        log(f"[✓] Saved: {f.name} ({f.stat().st_size / 1024 / 1024:.2f} MB)")
+    total_raw_size = sum(f.stat().st_size for f in mp4_files) / 1024 / 1024
+    log(f"[✓] Created {len(mp4_files)} raw segments (total {total_raw_size:.2f} MB)")
     
     # ============================================================
-    # UPLOAD TO TELEGRAM
+    # UPLOAD TO TELEGRAM (With Smart Merging)
     # ============================================================
-    log("[6/6] Uploading to Telegram...")
-    kv_update_state(STREAM_ID, 'uploading', file_size_mb=total_bytes / 1024 / 1024)
+    log("[6/6] Uploading to Telegram (Smart Merge)...")
+    kv_update_state(STREAM_ID, 'uploading', file_size_mb=total_raw_size)
     
-    total_size = sum(f.stat().st_size for f in mp4_files) / 1024 / 1024
     upload_success = upload_all_to_telegram(mp4_files, STREAM_ID)
     
-    kv_update_state(STREAM_ID, 'finished', file_size_mb=total_size, telegram_sent=upload_success)
+    kv_update_state(STREAM_ID, 'finished', file_size_mb=total_raw_size, telegram_sent=upload_success)
+    
+    # CRITICAL: Clean up KV after successful upload
+    if upload_success:
+        kv_delete_state(STREAM_ID)
         
-    log(f"\n[✓✓✓] SUCCESS! {len(mp4_files)} MP4 file(s).")
-    log(f"[✓✓✓] Telegram upload: {'SUCCESS' if upload_success else 'FAILED'}")
+    log(f"\n[✓✓✓] SUCCESS! Telegram upload: {'SUCCESS' if upload_success else 'FAILED'}")
     return mp4_files
 
 async def main():
-    log_section("SUPERLIVE RECORDER (CONTINUOUS MODE + WORKER API)")
+    log_section("SUPERLIVE RECORDER (HIGH QUALITY + SMART MERGE)")
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         return await asyncio.wait_for(run_recording(p), timeout=GLOBAL_WATCHDOG_SECONDS)
@@ -655,4 +815,5 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         kv_update_state(STREAM_ID, 'failed', error=str(e))
+        kv_delete_state(STREAM_ID)
         sys.exit(1)
