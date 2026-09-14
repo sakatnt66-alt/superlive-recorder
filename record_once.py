@@ -26,7 +26,18 @@ GLOBAL_WATCHDOG_SECONDS = int(max(RECORD_DURATION_SECONDS + 300, 600))
 
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-def log(msg=""): print(msg, flush=True)
+def log(msg=""):
+    """Safe logging that handles BlockingIOError gracefully"""
+    try:
+        print(msg, flush=True)
+    except BlockingIOError:
+        # If stdout is non-blocking and full, wait a bit and retry
+        time.sleep(0.1)
+        try:
+            print(msg, flush=True)
+        except:
+            pass  # Give up if still failing
+
 def log_section(t): log("\n" + "="*70 + f"\n{t}\n" + "="*70)
 
 # ============================================================
@@ -42,7 +53,6 @@ WEBRTC_HOOK = r"""
     window.__superlive_streams = [];
     let recorder = null, recorderError = null, isRecording = false, chunkCount = 0;
     
-    // Sequential upload queue to guarantee chunk ordering
     let uploadQueue = [];
     let isUploading = false;
     let uploadErrors = 0;
@@ -144,7 +154,6 @@ WEBRTC_HOOK = r"""
         recorder = new MediaRecorder(window.__preparedStream, { mimeType, videoBitsPerSecond: vb, audioBitsPerSecond: ab });
         isRecording = true;
         
-        // ZERO-ENCODING: Send raw ArrayBuffer via fetch, intercepted by Playwright route
         recorder.ondataavailable = (e) => {
             if (e.data.size > 0 && isRecording) {
                 chunkCount++;
@@ -323,32 +332,42 @@ async def run_recording(playwright):
         out_pattern
     ]
     
-    log(f"[*] FFmpeg command: {' '.join(cmd)}")
+    log(f"[*] Running FFmpeg conversion...")
     ffmpeg = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     stdout, stderr = await ffmpeg.communicate()
     
-    stderr_text = stderr.decode()
+    stderr_text = stderr.decode('utf-8', errors='replace')
     if stderr_text.strip():
-        log(f"[FFmpeg] {stderr_text.strip()}")
+        # Log stderr in smaller chunks to avoid BlockingIOError
+        lines = stderr_text.strip().split('\n')
+        for line in lines[-10:]:  # Only log last 10 lines to avoid spam
+            if line.strip():
+                log(f"[FFmpeg] {line}")
     
-    if ffmpeg.returncode != 0:
-        log(f"[ERROR] FFmpeg exit code: {ffmpeg.returncode}")
+    # Check if FFmpeg succeeded OR if MP4 files were created
+    mp4_files = list(sorted(RECORDINGS_DIR.glob(f"rec_{timestamp}_*.mp4")))
+    
+    if ffmpeg.returncode != 0 and len(mp4_files) == 0:
+        log(f"[ERROR] FFmpeg failed with exit code {ffmpeg.returncode} and no MP4 files created")
+        webm_path.unlink(missing_ok=True)
         raise RuntimeError("FFmpeg post-processing failed")
-        
+    elif ffmpeg.returncode != 0:
+        log(f"[WARN] FFmpeg exited with code {ffmpeg.returncode} but {len(mp4_files)} MP4 file(s) were created")
+    
     webm_path.unlink(missing_ok=True)
     
-    moved = []
-    for f in sorted(RECORDINGS_DIR.glob(f"rec_{timestamp}_*.mp4")):
-        moved.append(f)
+    if not mp4_files:
+        raise RuntimeError("No MP4 files produced.")
+    
+    for f in mp4_files:
         log(f"[✓] Saved: {f.name} ({f.stat().st_size / 1024 / 1024:.2f} MB)")
         
     await page.unroute("**/__slr_chunk")
     await context.close()
     await browser.close()
     
-    if not moved: raise RuntimeError("No MP4 files produced.")
-    log(f"\n[✓✓✓] SUCCESS! {len(moved)} MP4 file(s) created.")
-    return moved
+    log(f"\n[✓✓✓] SUCCESS! {len(mp4_files)} MP4 file(s) created.")
+    return mp4_files
 
 async def main():
     log_section("SUPERLIVE RECORDER (DIRECT BINARY TRANSFER)")
