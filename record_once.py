@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+import base64
 import os
 import shutil
 import subprocess
@@ -31,7 +32,7 @@ def log(msg=""): print(msg, flush=True)
 def log_section(t): log("\n" + "="*70 + f"\n{t}\n" + "="*70)
 
 # ============================================================
-# WEBRTC HOOK (Optimized for Direct Binary Transfer)
+# WEBRTC HOOK (Optimized for Stable String Transfer via FileReader)
 # ============================================================
 WEBRTC_HOOK = r"""
 (() => {
@@ -41,7 +42,7 @@ WEBRTC_HOOK = r"""
     window.__superlive_video_tracks = [];
     window.__superlive_track_links = [];
     window.__superlive_streams = [];
-    let recorder = null, recorderError = null, isRecording = false;
+    let recorder = null, recorderError = null, isRecording = false, chunkCount = 0;
 
     function addUnique(arr, value) { if (value && !arr.includes(value)) arr.push(value); }
     function rememberStream(stream) {
@@ -117,17 +118,27 @@ WEBRTC_HOOK = r"""
         recorder = new MediaRecorder(window.__preparedStream, { mimeType, videoBitsPerSecond: vb, audioBitsPerSecond: ab });
         isRecording = true;
         
-        // CRITICAL FIX: Direct Binary Transfer via exposed function
-        recorder.ondataavailable = async (e) => {
+        // CRITICAL FIX: Use FileReader for stable Base64 string transfer
+        recorder.ondataavailable = (e) => {
             if (e.data.size > 0 && isRecording) {
-                try {
-                    const buffer = await e.data.arrayBuffer();
-                    const bytes = new Uint8Array(buffer);
-                    // Call Python function directly with binary data
-                    window.__uploadChunk(bytes);
-                } catch (err) {
-                    console.error("Chunk upload error:", err);
-                }
+                chunkCount++;
+                if (chunkCount % 10 === 0) console.log(`[JS] Generated chunk #${chunkCount}`);
+                
+                const reader = new FileReader();
+                reader.onload = () => {
+                    try {
+                        const result = reader.result;
+                        const commaIndex = result.indexOf(',');
+                        if (commaIndex !== -1) {
+                            const base64 = result.substring(commaIndex + 1);
+                            // Call Python function with plain string (highly stable in Playwright)
+                            window.uploadVideoChunk(base64);
+                        }
+                    } catch (err) {
+                        console.error("[JS] Upload error:", err);
+                    }
+                };
+                reader.readAsDataURL(e.data);
             }
         };
         recorder.onerror = (e) => { recorderError = e.error ? String(e.error) : "Error"; };
@@ -179,15 +190,19 @@ async def run_recording(playwright):
     webm_path = TEMP_DIR / f"rec_{timestamp}.webm"
     webm_file = open(webm_path, "wb")
     
-    # Expose binary upload function to JavaScript
-    async def upload_chunk(chunk_bytes):
-        webm_file.write(chunk_bytes)
-        
-    await context.expose_function("__uploadChunk", upload_chunk)
+    # Expose stable string upload function to JavaScript
+    async def upload_chunk(base64_str):
+        try:
+            # validate=False is CRITICAL to ignore missing '=' padding in Python 3.12+
+            webm_file.write(base64.b64decode(base64_str, validate=False))
+        except Exception as e:
+            log(f"[WARN] Decode error: {e}")
+            
+    await context.expose_function("uploadVideoChunk", upload_chunk)
     await context.add_init_script(WEBRTC_HOOK)
     
     page = await context.new_page()
-    page.on("console", lambda m: log(f"[CONSOLE:{m.type}] {m.text}") if m.type in ["error", "warning"] else None)
+    page.on("console", lambda m: log(f"[CONSOLE:{m.type}] {m.text}") if m.type in ["error", "warning", "log"] else None)
     
     log(f"[2/5] Navigating to {URL}")
     await page.goto(URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
@@ -223,9 +238,9 @@ async def run_recording(playwright):
     if not wait_res.get('ok'): 
         webm_file.close()
         raise RuntimeError(f"Recorder failed to produce data: {wait_res.get('error')}")
-    log("[✓] MediaRecorder is generating data! (Binary Transfer Active)")
+    log("[✓] MediaRecorder is generating data! (Stable String Transfer Active)")
 
-    log(f"[4/5] Capturing Native WebM for {RECORD_DURATION_SECONDS}s (Zero CPU Overhead)...")
+    log(f"[4/5] Capturing Native WebM for {RECORD_DURATION_SECONDS}s...")
     start_rec = time.monotonic()
     
     # Main recording loop - just wait, data is written asynchronously via expose_function
@@ -283,7 +298,7 @@ async def run_recording(playwright):
     return moved
 
 async def main():
-    log_section("SUPERLIVE ULTIMATE RECORDER (BINARY TRANSFER EDITION)")
+    log_section("SUPERLIVE ULTIMATE RECORDER (STABLE STRING EDITION)")
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         return await asyncio.wait_for(run_recording(p), timeout=GLOBAL_WATCHDOG_SECONDS)
