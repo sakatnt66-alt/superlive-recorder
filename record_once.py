@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import base64
-import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -17,22 +15,25 @@ URL = os.environ.get("RECORD_URL", "https://superlivetv.com/fr/livestream/150596
 RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "recordings")).resolve()
 TEMP_DIR = Path(os.environ.get("TEMP_DIR", str(RECORDINGS_DIR / "_temp"))).resolve()
 SEGMENT_SECONDS = int(os.environ.get("SEGMENT_SECONDS", "60"))
-RECORD_DURATION_SECONDS = int(os.environ.get("RECORD_DURATION_SECONDS", "300"))
 VIDEO_BITRATE = int(os.environ.get("VIDEO_BITRATE", "4000000"))
 AUDIO_BITRATE = int(os.environ.get("AUDIO_BITRATE", "128000"))
 VIDEO_WAIT_SECONDS = int(os.environ.get("VIDEO_WAIT_SECONDS", "120"))
 PAGE_TIMEOUT_MS = int(os.environ.get("PAGE_TIMEOUT_MS", "60000"))
 FIRST_CHUNK_TIMEOUT_SECONDS = int(os.environ.get("FIRST_CHUNK_TIMEOUT_SECONDS", "20"))
-GLOBAL_WATCHDOG_SECONDS = int(os.environ.get("GLOBAL_WATCHDOG_SECONDS", str(max(RECORD_DURATION_SECONDS + 180, 420))))
 
-CHUNK_TIMESLICE_MS = 1000
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+# Parse duration safely (handles decimals like 5.5 minutes)
+DURATION_MINUTES = float(os.environ.get("DURATION_MINUTES", "5"))
+RECORD_DURATION_SECONDS = int(DURATION_MINUTES * 60)
+
+GLOBAL_WATCHDOG_SECONDS = int(max(RECORD_DURATION_SECONDS + 300, 600))
+
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 def log(msg=""): print(msg, flush=True)
 def log_section(t): log("\n" + "="*70 + f"\n{t}\n" + "="*70)
 
 # ============================================================
-# THE ULTIMATE WEBRTC HOOK (Merged from your local code)
+# OPTIMIZED WEBRTC HOOK (Native FileReader for zero GC pressure)
 # ============================================================
 WEBRTC_HOOK = r"""
 (() => {
@@ -109,13 +110,23 @@ WEBRTC_HOOK = r"""
     };
 
     window.__superliveStartRec = (vb, ab, ts) => {
-        recorder = new MediaRecorder(window.__preparedStream, { mimeType: "video/webm;codecs=vp9,opus", videoBitsPerSecond: vb, audioBitsPerSecond: ab });
-        recorder.ondataavailable = async (e) => {
+        let mimeType = "video/webm;codecs=vp9,opus";
+        if (!MediaRecorder.isTypeSupported(mimeType)) {
+            mimeType = "video/webm;codecs=vp8,opus";
+            if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = "video/webm";
+        }
+        
+        recorder = new MediaRecorder(window.__preparedStream, { mimeType, videoBitsPerSecond: vb, audioBitsPerSecond: ab });
+        
+        // CRITICAL FIX: Use FileReader for native, fast Base64 encoding without memory leaks
+        recorder.ondataavailable = (e) => {
             if (e.data.size > 0) {
-                const buf = await e.data.arrayBuffer();
-                const bytes = new Uint8Array(buf); let bin = ""; const S = 0x8000;
-                for (let i = 0; i < bytes.length; i += S) bin += String.fromCharCode(...bytes.subarray(i, Math.min(i + S, bytes.length)));
-                recorderQueue.push(btoa(bin));
+                const reader = new FileReader();
+                reader.onload = () => {
+                    // Extract only the base64 part (remove "data:video/webm;base64,")
+                    recorderQueue.push(reader.result.split(',')[1]);
+                };
+                reader.readAsDataURL(e.data);
             }
         };
         recorder.onerror = (e) => { recorderError = e.error ? String(e.error) : "Error"; };
@@ -141,23 +152,13 @@ async def safe_eval(page, expr, arg=None, timeout=15):
         return await asyncio.wait_for(page.evaluate(expr), timeout=timeout)
     except Exception as e: raise RuntimeError(f"Eval failed: {e}")
 
-def decode_chunk(enc): return base64.b64decode(enc, validate=False) if enc else b""
-
-def build_ffmpeg_cmd(prefix):
-    out = str(prefix) + "_%03d.mp4"
-    return ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-i", "pipe:0",
-            "-map", "0:v:0", "-map", "0:a:0?", "-vf", "pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2:color=black",
-            "-c:v", "libx264", "-preset", "veryfast", "-b:v", str(VIDEO_BITRATE), "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", str(AUDIO_BITRATE), "-reset_timestamps", "1",
-            "-segment_time", str(SEGMENT_SECONDS), "-segment_format", "mp4", "-f", "segment", out]
-
 # ============================================================
 # WORKFLOW
 # ============================================================
 async def run_recording(playwright):
-    log("[1/4] Launching Chromium (headless=False via Xvfb)...")
+    log("[1/5] Launching Chromium (headless=False via Xvfb)...")
     browser = await playwright.chromium.launch(
-        headless=False, # CRITICAL: Xvfb will handle the display
+        headless=False, 
         args=[
             "--no-sandbox", "--disable-setuid-sandbox", "--autoplay-policy=no-user-gesture-required",
             "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
@@ -170,7 +171,7 @@ async def run_recording(playwright):
     
     page.on("console", lambda m: log(f"[CONSOLE:{m.type}] {m.text}") if m.type in ["error", "warning"] else None)
     
-    log(f"[2/4] Navigating to {URL}")
+    log(f"[2/5] Navigating to {URL}")
     await page.goto(URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
     
     log("[*] Waiting for WebRTC Video & Audio...")
@@ -190,59 +191,84 @@ async def run_recording(playwright):
         except: pass
         await asyncio.sleep(2)
     else:
+        await page.screenshot(path=str(TEMP_DIR / "timeout_error.png"))
         raise RuntimeError("Timed out waiting for WebRTC stream.")
 
-    log("[3/4] Preparing MediaStream & Starting Recorder...")
+    log("[3/5] Preparing MediaStream & Starting Recorder...")
     prep = await safe_eval(page, "window.__superlivePrepare()")
     log(f"[✓] Linked Video: {prep['video']} | Linked Audio: {prep['audio']}")
     
-    await safe_eval(page, f"window.__superliveStartRec({VIDEO_BITRATE}, {AUDIO_BITRATE}, {CHUNK_TIMESLICE_MS})")
+    await safe_eval(page, f"window.__superliveStartRec({VIDEO_BITRATE}, {AUDIO_BITRATE}, 1000)")
     
     wait_res = await safe_eval(page, f"window.__superliveWaitChunk({FIRST_CHUNK_TIMEOUT_SECONDS * 1000})")
     if not wait_res.get('ok'): raise RuntimeError(f"Recorder failed to produce data: {wait_res.get('error')}")
     log("[✓] MediaRecorder is generating data!")
 
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    prefix = TEMP_DIR / f"rec_{time.strftime('%Y%m%d_%H%M%S')}"
-    cmd = build_ffmpeg_cmd(prefix)
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    webm_path = TEMP_DIR / f"rec_{timestamp}.webm"
     
-    ffmpeg = await asyncio.create_subprocess_exec(*cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    log(f"[4/4] Recording for {RECORD_DURATION_SECONDS}s via FFmpeg...")
-    
+    log(f"[4/5] Capturing Native WebM for {RECORD_DURATION_SECONDS}s (Zero CPU Overhead)...")
     start_rec = time.monotonic()
     chunks = 0
-    while time.monotonic() - start_rec < RECORD_DURATION_SECONDS:
-        chunk = await safe_eval(page, "window.__superliveTakeChunk()")
-        if chunk:
-            ffmpeg.stdin.write(decode_chunk(chunk))
-            await ffmpeg.stdin.drain()
-            chunks += 1
-        else:
-            await asyncio.sleep(0.2)
-            
-        if chunks % 50 == 0 and chunks > 0:
-            log(f"[*] Progress: {int(time.monotonic() - start_rec)}s | Chunks: {chunks}")
+    
+    with open(webm_path, "wb") as f:
+        while time.monotonic() - start_rec < RECORD_DURATION_SECONDS:
+            chunk = await safe_eval(page, "window.__superliveTakeChunk()")
+            if chunk:
+                f.write(base64.b64decode(chunk))
+                chunks += 1
+            else:
+                await asyncio.sleep(0.2)
+                
+            if chunks % 30 == 0 and chunks > 0:
+                log(f"[*] Progress: {int(time.monotonic() - start_rec)}s | Chunks: {chunks}")
 
-    log("[*] Stopping Recorder & Draining...")
+    log("[*] Stopping Recorder & Draining final chunks...")
     await safe_eval(page, "window.__superliveStopRec()")
-    await asyncio.sleep(2)
+    await asyncio.sleep(3) # Allow final chunk to arrive
     
     while True:
         chunk = await safe_eval(page, "window.__superliveTakeChunk()")
         if not chunk: break
-        ffmpeg.stdin.write(decode_chunk(chunk))
-        await ffmpeg.stdin.drain()
+        with open(webm_path, "ab") as f:
+            f.write(base64.b64decode(chunk))
 
-    ffmpeg.stdin.close()
-    await ffmpeg.wait()
+    log(f"[✓] Native Capture Complete. File size: {webm_path.stat().st_size / 1024 / 1024:.2f} MB")
     
+    # ============================================================
+    # POST-PROCESSING (FFmpeg)
+    # ============================================================
+    log("[5/5] Post-Processing: Converting WebM to MP4 Segments...")
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+    out_pattern = str(RECORDINGS_DIR / f"rec_{timestamp}_%03d.mp4")
+    
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-stats",
+        "-i", str(webm_path),
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-vf", "pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2:color=black",
+        "-c:v", "libx264", "-preset", "veryfast", "-b:v", str(VIDEO_BITRATE), "-maxrate", f"{int(VIDEO_BITRATE*1.5)}", "-bufsize", f"{VIDEO_BITRATE*2}", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", str(AUDIO_BITRATE),
+        "-f", "segment", "-segment_time", str(SEGMENT_SECONDS), "-segment_format", "mp4",
+        "-reset_timestamps", "1", "-movflags", "+faststart",
+        out_pattern
+    ]
+    
+    ffmpeg = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    stdout, stderr = await ffmpeg.communicate()
+    
+    if ffmpeg.returncode != 0:
+        log(f"[ERROR] FFmpeg failed:\n{stderr.decode()}")
+        raise RuntimeError("FFmpeg post-processing failed")
+        
+    # Cleanup temp webm file to save space
+    webm_path.unlink(missing_ok=True)
+    
     moved = []
-    for f in TEMP_DIR.glob("*.mp4"):
-        dest = RECORDINGS_DIR / f.name
-        shutil.move(str(f), str(dest))
-        moved.append(dest)
-        log(f"[✓] Saved: {dest.name} ({dest.stat().st_size / 1024 / 1024:.2f} MB)")
+    for f in RECORDINGS_DIR.glob(f"rec_{timestamp}_*.mp4"):
+        moved.append(f)
+        log(f"[✓] Saved: {f.name} ({f.stat().st_size / 1024 / 1024:.2f} MB)")
         
     await context.close()
     await browser.close()
@@ -251,7 +277,7 @@ async def run_recording(playwright):
     return moved
 
 async def main():
-    log_section("SUPERLIVE ULTIMATE RECORDER (XVFB)")
+    log_section("SUPERLIVE ULTIMATE RECORDER (NATIVE CAPTURE EDITION)")
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         return await asyncio.wait_for(run_recording(p), timeout=GLOBAL_WATCHDOG_SECONDS)
@@ -260,4 +286,6 @@ if __name__ == "__main__":
     try: asyncio.run(main())
     except Exception as e:
         log(f"\n[FATAL] {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
