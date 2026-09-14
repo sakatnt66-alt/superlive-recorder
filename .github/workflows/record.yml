@@ -94,46 +94,6 @@ jobs:
               print(f'Failed to update state: {e}')
           "
 
-      - name: Test KV Read (Debug)
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
-          STREAM_ID: ${{ github.event.client_payload.stream_id || inputs.stream_id }}
-        run: |
-          python -c "
-          import os, json, urllib.request
-          
-          stream_id = os.environ.get('STREAM_ID', '')
-          account_id = os.environ.get('CLOUDFLARE_ACCOUNT_ID', '')
-          namespace_id = os.environ.get('CF_KV_NAMESPACE_ID', '')
-          api_token = os.environ.get('CLOUDFLARE_API_TOKEN', '')
-          
-          print('========== KV READ TEST ==========')
-          print(f'STREAM_ID: {stream_id}')
-          print(f'Account ID: {account_id[:10]}...' if account_id else 'Account ID: EMPTY')
-          print(f'Namespace ID: {namespace_id[:10]}...' if namespace_id else 'Namespace ID: EMPTY')
-          print(f'API Token: {api_token[:10]}...' if api_token else 'API Token: EMPTY')
-          
-          if not all([stream_id, account_id, namespace_id, api_token]):
-              print('ERROR: Missing credentials!')
-              exit(1)
-          
-          url = f'https://api.cloudflare.com/client/v4/accounts/{account_id}/storage/kv/namespaces/{namespace_id}/values/recording:{stream_id}'
-          print(f'Fetching: {url}')
-          
-          try:
-              req = urllib.request.Request(url)
-              req.add_header('Authorization', f'Bearer {api_token}')
-              with urllib.request.urlopen(req) as response:
-                  data = json.loads(response.read().decode())
-                  print(f'SUCCESS - Status in KV: {data.get(\"status\", \"N/A\")}')
-                  print(f'Full data: {json.dumps(data, indent=2)}')
-          except Exception as e:
-              print(f'ERROR: {type(e).__name__}: {e}')
-          print('==================================')
-          "
-
       - name: Start recording (Continuous Mode + Telegram Upload)
         env:
           RECORD_URL: ${{ github.event.client_payload.stream_url || inputs.test_url }}
@@ -151,12 +111,15 @@ jobs:
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # CRITICAL: Worker URL for stop checking
+          WORKER_URL: ${{ secrets.WORKER_URL }}
         run: |
           echo "========================================"
           echo "SUPERLIVE RECORDER (CONTINUOUS MODE)"
           echo "========================================"
           echo "URL: ${RECORD_URL}"
           echo "Stream ID: ${STREAM_ID}"
+          echo "Worker URL: ${WORKER_URL}"
           echo "Mode: Continuous + Telegram Upload"
           echo "========================================"
           
