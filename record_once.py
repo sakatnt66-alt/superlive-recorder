@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import asyncio
-import base64
 import os
 import shutil
 import subprocess
@@ -32,7 +31,7 @@ def log(msg=""): print(msg, flush=True)
 def log_section(t): log("\n" + "="*70 + f"\n{t}\n" + "="*70)
 
 # ============================================================
-# OPTIMIZED WEBRTC HOOK (Safe DataURL extraction)
+# WEBRTC HOOK (Optimized for Direct Binary Transfer)
 # ============================================================
 WEBRTC_HOOK = r"""
 (() => {
@@ -42,7 +41,7 @@ WEBRTC_HOOK = r"""
     window.__superlive_video_tracks = [];
     window.__superlive_track_links = [];
     window.__superlive_streams = [];
-    let recorder = null, recorderQueue = [], recorderError = null;
+    let recorder = null, recorderError = null, isRecording = false;
 
     function addUnique(arr, value) { if (value && !arr.includes(value)) arr.push(value); }
     function rememberStream(stream) {
@@ -116,21 +115,19 @@ WEBRTC_HOOK = r"""
         }
         
         recorder = new MediaRecorder(window.__preparedStream, { mimeType, videoBitsPerSecond: vb, audioBitsPerSecond: ab });
+        isRecording = true;
         
-        // CRITICAL FIX: Safe substring extraction instead of split()
-        recorder.ondataavailable = (e) => {
-            if (e.data.size > 0) {
-                const reader = new FileReader();
-                reader.onload = () => {
-                    const result = reader.result;
-                    const commaIndex = result.indexOf(',');
-                    if (commaIndex !== -1) {
-                        recorderQueue.push(result.substring(commaIndex + 1));
-                    } else {
-                        recorderQueue.push(result);
-                    }
-                };
-                reader.readAsDataURL(e.data);
+        // CRITICAL FIX: Direct Binary Transfer via exposed function
+        recorder.ondataavailable = async (e) => {
+            if (e.data.size > 0 && isRecording) {
+                try {
+                    const buffer = await e.data.arrayBuffer();
+                    const bytes = new Uint8Array(buffer);
+                    // Call Python function directly with binary data
+                    window.__uploadChunk(bytes);
+                } catch (err) {
+                    console.error("Chunk upload error:", err);
+                }
             }
         };
         recorder.onerror = (e) => { recorderError = e.error ? String(e.error) : "Error"; };
@@ -139,11 +136,17 @@ WEBRTC_HOOK = r"""
     };
 
     window.__superliveWaitChunk = async (ms) => {
-        const s = Date.now(); while (Date.now() - s < ms) { if (recorderQueue.length > 0) return { ok: true }; await new Promise(r => setTimeout(r, 200)); }
+        const s = Date.now(); while (Date.now() - s < ms) { 
+            if (recorder && recorder.state === "recording") return { ok: true }; 
+            await new Promise(r => setTimeout(r, 200)); 
+        }
         return { ok: false, error: recorderError || "Timeout" };
     };
-    window.__superliveTakeChunk = () => recorderQueue.shift();
-    window.__superliveStopRec = () => { if (recorder && recorder.state !== "inactive") recorder.stop(); };
+    
+    window.__superliveStopRec = () => { 
+        isRecording = false;
+        if (recorder && recorder.state !== "inactive") recorder.stop(); 
+    };
 })();
 """
 
@@ -155,17 +158,6 @@ async def safe_eval(page, expr, arg=None, timeout=15):
         if arg is not None: return await asyncio.wait_for(page.evaluate(expr, arg), timeout=timeout)
         return await asyncio.wait_for(page.evaluate(expr), timeout=timeout)
     except Exception as e: raise RuntimeError(f"Eval failed: {e}")
-
-def decode_chunk(enc):
-    """Safely decode base64, ignoring strict padding errors in Python 3.12+"""
-    if not enc:
-        return b""
-    try:
-        # validate=False is CRITICAL to ignore missing '=' padding
-        return base64.b64decode(enc, validate=False)
-    except Exception as e:
-        log(f"[WARN] Base64 decode error: {e}")
-        return b""
 
 # ============================================================
 # WORKFLOW
@@ -181,9 +173,20 @@ async def run_recording(playwright):
         ]
     )
     context = await browser.new_context(viewport={"width": 1920, "height": 1080}, locale="fr-FR", user_agent=USER_AGENT)
-    await context.add_init_script(WEBRTC_HOOK)
-    page = await context.new_page()
     
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    webm_path = TEMP_DIR / f"rec_{timestamp}.webm"
+    webm_file = open(webm_path, "wb")
+    
+    # Expose binary upload function to JavaScript
+    async def upload_chunk(chunk_bytes):
+        webm_file.write(chunk_bytes)
+        
+    await context.expose_function("__uploadChunk", upload_chunk)
+    await context.add_init_script(WEBRTC_HOOK)
+    
+    page = await context.new_page()
     page.on("console", lambda m: log(f"[CONSOLE:{m.type}] {m.text}") if m.type in ["error", "warning"] else None)
     
     log(f"[2/5] Navigating to {URL}")
@@ -206,6 +209,7 @@ async def run_recording(playwright):
         except: pass
         await asyncio.sleep(2)
     else:
+        webm_file.close()
         await page.screenshot(path=str(TEMP_DIR / "timeout_error.png"))
         raise RuntimeError("Timed out waiting for WebRTC stream.")
 
@@ -216,40 +220,27 @@ async def run_recording(playwright):
     await safe_eval(page, f"window.__superliveStartRec({VIDEO_BITRATE}, {AUDIO_BITRATE}, 1000)")
     
     wait_res = await safe_eval(page, f"window.__superliveWaitChunk({FIRST_CHUNK_TIMEOUT_SECONDS * 1000})")
-    if not wait_res.get('ok'): raise RuntimeError(f"Recorder failed to produce data: {wait_res.get('error')}")
-    log("[✓] MediaRecorder is generating data!")
+    if not wait_res.get('ok'): 
+        webm_file.close()
+        raise RuntimeError(f"Recorder failed to produce data: {wait_res.get('error')}")
+    log("[✓] MediaRecorder is generating data! (Binary Transfer Active)")
 
-    TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = time.strftime('%Y%m%d_%H%M%S')
-    webm_path = TEMP_DIR / f"rec_{timestamp}.webm"
-    
     log(f"[4/5] Capturing Native WebM for {RECORD_DURATION_SECONDS}s (Zero CPU Overhead)...")
     start_rec = time.monotonic()
-    chunks = 0
     
-    with open(webm_path, "wb") as f:
-        while time.monotonic() - start_rec < RECORD_DURATION_SECONDS:
-            chunk = await safe_eval(page, "window.__superliveTakeChunk()")
-            if chunk:
-                f.write(decode_chunk(chunk))
-                chunks += 1
-            else:
-                await asyncio.sleep(0.2)
-                
-            if chunks % 30 == 0 and chunks > 0:
-                log(f"[*] Progress: {int(time.monotonic() - start_rec)}s | Chunks: {chunks}")
+    # Main recording loop - just wait, data is written asynchronously via expose_function
+    while time.monotonic() - start_rec < RECORD_DURATION_SECONDS:
+        await asyncio.sleep(1)
+        if (time.monotonic() - start_rec) % 30 < 1:
+            size_mb = webm_path.stat().st_size / 1024 / 1024
+            log(f"[*] Progress: {int(time.monotonic() - start_rec)}s | File Size: {size_mb:.2f} MB")
 
-    log("[*] Stopping Recorder & Draining final chunks...")
+    log("[*] Stopping Recorder & Flushing...")
     await safe_eval(page, "window.__superliveStopRec()")
-    await asyncio.sleep(3) # Allow final chunk to arrive
+    await asyncio.sleep(3) # Allow final chunks to arrive and write
     
-    with open(webm_path, "ab") as f:
-        while True:
-            chunk = await safe_eval(page, "window.__superliveTakeChunk()")
-            if not chunk: break
-            f.write(decode_chunk(chunk))
-
-    log(f"[✓] Native Capture Complete. File size: {webm_path.stat().st_size / 1024 / 1024:.2f} MB")
+    webm_file.close()
+    log(f"[✓] Native Capture Complete. Final File size: {webm_path.stat().st_size / 1024 / 1024:.2f} MB")
     
     # ============================================================
     # POST-PROCESSING (FFmpeg)
@@ -292,7 +283,7 @@ async def run_recording(playwright):
     return moved
 
 async def main():
-    log_section("SUPERLIVE ULTIMATE RECORDER (NATIVE CAPTURE EDITION)")
+    log_section("SUPERLIVE ULTIMATE RECORDER (BINARY TRANSFER EDITION)")
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         return await asyncio.wait_for(run_recording(p), timeout=GLOBAL_WATCHDOG_SECONDS)
