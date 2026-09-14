@@ -42,24 +42,27 @@ def kv_get_state(stream_id):
 
 
 def kv_delete_state(stream_id):
-    account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
-    namespace_id = os.environ.get("CF_KV_NAMESPACE_ID", "")
-    api_token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
-    
-    if not stream_id or not all([account_id, namespace_id, api_token]):
-        log("[KV] Missing credentials for cleanup")
+    """Delete recording state via Worker API (not direct Cloudflare API)"""
+    if not stream_id or not WORKER_URL:
+        log("[KV] Missing stream_id or WORKER_URL for cleanup")
         return False
     
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/storage/kv/namespaces/{namespace_id}/values/recording:{stream_id}"
+    url = f"{WORKER_URL.rstrip('/')}/api/delete-recording/{stream_id}"
     
     try:
         req = urllib.request.Request(url, method='DELETE')
-        req.add_header('Authorization', f'Bearer {api_token}')
+        req.add_header('User-Agent', 'SuperLive-Recorder-Python')
+        
         with urllib.request.urlopen(req, timeout=10) as response:
-            log(f"[KV] ✓ Deleted state for {stream_id}")
-            return True
+            result = json.loads(response.read().decode())
+            if result.get('success'):
+                log(f"[KV] ✓ Deleted state for {stream_id} via Worker API")
+                return True
+            else:
+                log(f"[KV] ✗ Delete failed: {result}")
+                return False
     except Exception as e:
-        log(f"[KV] Delete failed: {type(e).__name__}: {e}")
+        log(f"[KV] ✗ Delete error: {type(e).__name__}: {e}")
         return False
 
 
@@ -365,7 +368,7 @@ URL = os.environ.get("RECORD_URL", "https://superlivetv.com/fr/livestream/150596
 RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "recordings")).resolve()
 TEMP_DIR = Path(os.environ.get("TEMP_DIR", str(RECORDINGS_DIR / "_temp"))).resolve()
 SEGMENT_SECONDS = int(os.environ.get("SEGMENT_SECONDS", "60"))
-VIDEO_BITRATE = int(os.environ.get("VIDEO_BITRATE", "8000000"))  # Increased from 4M to 8M
+VIDEO_BITRATE = int(os.environ.get("VIDEO_BITRATE", "8000000"))
 AUDIO_BITRATE = int(os.environ.get("AUDIO_BITRATE", "192000"))
 VIDEO_WAIT_SECONDS = int(os.environ.get("VIDEO_WAIT_SECONDS", "120"))
 PAGE_TIMEOUT_MS = int(os.environ.get("PAGE_TIMEOUT_MS", "60000"))
@@ -375,7 +378,7 @@ STREAM_ID = os.environ.get("STREAM_ID", "")
 
 STOP_CHECK_INTERVAL = 3
 STREAM_IDLE_TIMEOUT = 30
-MIN_CHUNK_SIZE = 1000  # Minimum chunk size in bytes (1 KB)
+MIN_CHUNK_SIZE = 1000
 MAX_RECORDING_SECONDS = 6 * 3600
 
 GLOBAL_WATCHDOG_SECONDS = int(MAX_RECORDING_SECONDS + 3600)
@@ -395,7 +398,7 @@ def log(msg=""):
 def log_section(t): log("\n" + "="*70 + f"\n{t}\n" + "="*70)
 
 # ============================================================
-# WEBRTC HOOK (IMPROVED: Track chunk sizes)
+# WEBRTC HOOK
 # ============================================================
 WEBRTC_HOOK = r"""
 (() => {
@@ -407,7 +410,7 @@ WEBRTC_HOOK = r"""
     window.__superlive_streams = [];
     let recorder = null, recorderError = null, isRecording = false, chunkCount = 0;
     let lastChunkTime = Date.now();
-    let lastChunkSize = 0;  // NEW: Track last chunk size
+    let lastChunkSize = 0;
     let uploadQueue = [];
     let isUploading = false;
     let uploadErrors = 0;
@@ -512,7 +515,7 @@ WEBRTC_HOOK = r"""
         recorder.ondataavailable = (e) => {
             if (e.data.size > 0 && isRecording) {
                 chunkCount++;
-                lastChunkSize = e.data.size;  // NEW: Track chunk size
+                lastChunkSize = e.data.size;
                 lastChunkTime = Date.now();
                 if (chunkCount % 10 === 0) console.log(`[JS] Chunk #${chunkCount} | size: ${e.data.size} bytes | queue: ${uploadQueue.length} | errors: ${uploadErrors}`);
                 e.data.arrayBuffer().then(buf => {
@@ -541,7 +544,7 @@ WEBRTC_HOOK = r"""
         uploadErrors,
         recorderState: recorder ? recorder.state : 'none',
         idleTimeMs: Date.now() - lastChunkTime,
-        lastChunkSize: lastChunkSize,  // NEW: Return last chunk size
+        lastChunkSize: lastChunkSize,
         videoReadyState: (() => {
             const v = document.querySelector('video');
             return v ? v.readyState : 0;
@@ -716,7 +719,6 @@ async def run_recording(playwright):
     log(f"[*] Stopping recording (reason: {stop_reason})...")
     await safe_eval(page, "window.__superliveStopRec()")
     
-    # Wait for queue to flush
     for i in range(60):
         try:
             status = await safe_eval(page, "window.__superliveGetStatus()")
@@ -801,6 +803,7 @@ async def run_recording(playwright):
     
     kv_update_state(STREAM_ID, 'finished', file_size_mb=total_raw_size, telegram_sent=upload_success)
     
+    # CRITICAL: Clean up KV after successful upload via Worker API
     if upload_success:
         kv_delete_state(STREAM_ID)
         
@@ -808,7 +811,7 @@ async def run_recording(playwright):
     return mp4_files
 
 async def main():
-    log_section("SUPERLIVE RECORDER (IMPROVED STREAM DETECTION)")
+    log_section("SUPERLIVE RECORDER (WORKER API CLEANUP)")
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         return await asyncio.wait_for(run_recording(p), timeout=GLOBAL_WATCHDOG_SECONDS)
