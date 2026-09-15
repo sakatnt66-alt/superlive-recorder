@@ -82,7 +82,7 @@ def check_stop_requested(stream_id):
 
 
 # ============================================================
-# TELEGRAM UPLOAD
+# TELEGRAM UPLOAD (IMPROVED WITH BETTER ERROR HANDLING)
 # ============================================================
 
 def send_to_telegram(file_path, stream_id, part_number, total_parts):
@@ -109,16 +109,16 @@ def send_to_telegram(file_path, stream_id, part_number, total_parts):
         
         body = []
         body.append(f"--{boundary}".encode())
-        body.append(b'Content-Disposition: form-data; name="chat_id"\r\n')
+        body.append(b'Content-Disposition: form-data; name="chat_id"\r\n\r\n')
         body.append(TELEGRAM_CHAT_ID.encode())
         body.append(f"\r\n--{boundary}".encode())
-        body.append(b'Content-Disposition: form-data; name="caption"\r\n')
+        body.append(b'Content-Disposition: form-data; name="caption"\r\n\r\n')
         body.append(caption.encode('utf-8'))
         body.append(f"\r\n--{boundary}".encode())
-        body.append(b'Content-Disposition: form-data; name="parse_mode"\r\n')
+        body.append(b'Content-Disposition: form-data; name="parse_mode"\r\n\r\n')
         body.append(b'HTML')
         body.append(f"\r\n--{boundary}".encode())
-        body.append(b'Content-Disposition: form-data; name="supports_streaming"\r\n')
+        body.append(b'Content-Disposition: form-data; name="supports_streaming"\r\n\r\n')
         body.append(b'true')
         body.append(f"\r\n--{boundary}".encode())
         body.append(f'Content-Disposition: form-data; name="video"; filename="{file_path.name}"\r\n'.encode())
@@ -131,26 +131,31 @@ def send_to_telegram(file_path, stream_id, part_number, total_parts):
         req = urllib.request.Request(url, data=body_bytes)
         req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
         
-        with urllib.request.urlopen(req, timeout=300) as response:
-            result = json.loads(response.read().decode())
-            if result.get('ok'):
-                log(f"[TG] ✓ {file_path.name} ({file_size_mb:.2f} MB) [STREAMING]")
-                return True
-    except Exception as e:
-        log(f"[TG] ✗ Error: {type(e).__name__}: {e}")
+        try:
+            with urllib.request.urlopen(req, timeout=300) as response:
+                result = json.loads(response.read().decode())
+                if result.get('ok'):
+                    log(f"[TG] ✓ {file_path.name} ({file_size_mb:.2f} MB) [STREAMING]")
+                    return True
+                else:
+                    log(f"[TG] ✗ Telegram API error: {result}")
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8', errors='replace')
+            log(f"[TG] ✗ HTTP {e.code}: {error_body[:300]}")
+        except Exception as e:
+            log(f"[TG] ✗ Error: {type(e).__name__}: {e}")
     
     return False
 
 
 # ============================================================
-# CONFIGURATION (OPTIMIZED FOR SPEED)
+# CONFIGURATION (OPTIMIZED FOR SPEED + COMPATIBILITY)
 # ============================================================
 URL = os.environ.get("RECORD_URL", "https://superlivetv.com/fr/livestream/150596097")
 RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "recordings")).resolve()
 TEMP_DIR = Path(os.environ.get("TEMP_DIR", str(RECORDINGS_DIR / "_temp"))).resolve()
 VIDEO_BITRATE = int(os.environ.get("VIDEO_BITRATE", "8000000"))
 AUDIO_BITRATE = int(os.environ.get("AUDIO_BITRATE", "192000"))
-# SPEED OPTIMIZED timeouts
 VIDEO_WAIT_SECONDS = int(os.environ.get("VIDEO_WAIT_SECONDS", "60"))
 PAGE_TIMEOUT_MS = int(os.environ.get("PAGE_TIMEOUT_MS", "30000"))
 FIRST_CHUNK_TIMEOUT_SECONDS = int(os.environ.get("FIRST_CHUNK_TIMEOUT_SECONDS", "10"))
@@ -161,9 +166,6 @@ STOP_CHECK_INTERVAL = 3
 STREAM_IDLE_TIMEOUT = 20
 MIN_CHUNK_SIZE = 500
 MAX_RECORDING_SECONDS = 6 * 3600
-
-# Segment length: shorter = faster upload but more parts
-SEGMENT_SECONDS = 120
 
 GLOBAL_WATCHDOG_SECONDS = int(MAX_RECORDING_SECONDS + 1800)
 
@@ -346,25 +348,33 @@ async def safe_eval(page, expr, arg=None, timeout=15):
     except Exception as e: raise RuntimeError(f"Eval failed: {e}")
 
 
-def convert_webm_segment(webm_path, mp4_path, is_final=False):
-    """Convert a WebM segment to MP4 using veryfast preset"""
+def convert_webm_to_mp4(webm_path, mp4_path):
+    """Convert WebM to MP4 with Telegram-compatible settings"""
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-fflags", "+genpts", "-i", str(webm_path),
         "-map", "0:v:0", "-map", "0:a:0?",
         "-vf", "fps=30,pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2:color=black",
         "-vsync", "cfr", "-r", "30",
-        # SPEED OPTIMIZED: veryfast preset (70% faster than medium)
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-        "-pix_fmt", "yuv420p", "-threads", "0",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        # TELEGRAM-COMPATIBLE SETTINGS:
+        "-c:v", "libx264", 
+        "-preset", "fast",           # fast instead of veryfast (better compatibility)
+        "-crf", "20", 
+        "-profile:v", "main",        # Telegram-compatible profile
+        "-level", "3.1",             # Standard level
+        "-pix_fmt", "yuv420p", 
+        "-threads", "0",
+        "-bf", "0",                  # No B-frames (Telegram doesn't like them)
+        "-g", "60",                  # GOP size = 2 seconds (good for streaming)
+        "-keyint_min", "30",         # Minimum keyframe interval
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
         "-movflags", "+faststart",
         str(mp4_path)
     ]
     
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        log(f"[FFmpeg] ✗ Conversion failed: {result.stderr[:200]}")
+        log(f"[FFmpeg] ✗ Error: {result.stderr[:300]}")
         return False
     return True
 
@@ -466,14 +476,12 @@ async def run_recording(playwright):
     last_progress_log = time.monotonic()
     stop_reason = "unknown"
     
-    # Send quick notification to user
     kv_update_state(STREAM_ID, 'recording')
     
     while time.monotonic() - total_start < MAX_RECORDING_SECONDS:
         await asyncio.sleep(1)
         elapsed = time.monotonic() - total_start
         
-        # Check for stop request
         if time.monotonic() - last_stop_check >= STOP_CHECK_INTERVAL:
             last_stop_check = time.monotonic()
             try:
@@ -483,12 +491,10 @@ async def run_recording(playwright):
                     break
             except: pass
         
-        # Progress log every 30s
         if time.monotonic() - last_progress_log >= 30:
             last_progress_log = time.monotonic()
             log(f"[*] Progress: {int(elapsed)}s | {chunk_count} chunks | {total_bytes/1024/1024:.2f} MB")
         
-        # Check stream health
         try:
             status = await safe_eval(page, "window.__superliveGetStatus()")
             idle_ms = status.get('idleTimeMs', 0)
@@ -508,7 +514,6 @@ async def run_recording(playwright):
     log(f"[*] Stopping (reason: {stop_reason})...")
     await safe_eval(page, "window.__superliveStopRec()")
     
-    # Wait for queue to flush
     for _ in range(30):
         try:
             status = await safe_eval(page, "window.__superliveGetStatus()")
@@ -534,16 +539,15 @@ async def run_recording(playwright):
     await browser.close()
     
     # ============================================================
-    # FAST POST-PROCESSING
+    # FAST POST-PROCESSING WITH TELEGRAM-COMPATIBLE ENCODING
     # ============================================================
-    log("[4/4] Converting + Uploading (FAST MODE)...")
+    log("[4/4] Converting + Uploading (FAST MODE + TELEGRAM COMPATIBLE)...")
     
-    # Convert full file to MP4 using veryfast preset
     full_mp4_path = RECORDINGS_DIR / f"full_{timestamp}.mp4"
     
-    log("[*] FFmpeg converting (veryfast preset)...")
+    log("[*] FFmpeg converting (fast preset, Telegram-compatible)...")
     convert_start = time.monotonic()
-    success = convert_webm_segment(webm_path, full_mp4_path, is_final=True)
+    success = convert_webm_to_mp4(webm_path, full_mp4_path)
     convert_time = time.monotonic() - convert_start
     
     webm_path.unlink(missing_ok=True)
@@ -556,15 +560,15 @@ async def run_recording(playwright):
     total_size = full_mp4_path.stat().st_size / 1024 / 1024
     log(f"[✓] Converted in {convert_time:.1f}s: {total_size:.2f} MB")
     
-    # Split into Telegram-sized chunks
-    log("[*] Splitting for Telegram...")
+    # Split if needed
+    log("[*] Checking if split is needed...")
     target_size_bytes = int(TELEGRAM_TARGET_SIZE_MB * 1024 * 1024)
     
     if full_mp4_path.stat().st_size <= int(TELEGRAM_MAX_SIZE_MB * 1024 * 1024):
-        # Small enough, just upload as-is
         final_files = [full_mp4_path]
+        log(f"[✓] No split needed (under 45 MB)")
     else:
-        # Need to split
+        log("[*] Splitting for Telegram...")
         split_start = time.monotonic()
         duration_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
                        "-of", "default=noprint_wrappers=1:nokey=1", str(full_mp4_path)]
@@ -605,7 +609,6 @@ async def run_recording(playwright):
     for i, file_path in enumerate(final_files, 1):
         if send_to_telegram(file_path, STREAM_ID, i, total_parts):
             success_count += 1
-            # Clean up after upload to free space
             try:
                 file_path.unlink()
             except: pass
@@ -625,7 +628,7 @@ async def run_recording(playwright):
 
 
 async def main():
-    log_section("SUPERLIVE RECORDER (FAST MODE)")
+    log_section("SUPERLIVE RECORDER (FAST + TELEGRAM COMPATIBLE)")
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         return await asyncio.wait_for(run_recording(p), timeout=GLOBAL_WATCHDOG_SECONDS)
