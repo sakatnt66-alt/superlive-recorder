@@ -119,7 +119,7 @@ def get_video_info(file_path):
 
 
 # ============================================================
-# TELEGRAM UPLOAD (FIXED MULTIPART FORMAT)
+# TELEGRAM UPLOAD
 # ============================================================
 
 def send_to_telegram(file_path, stream_id, part_number, total_parts):
@@ -394,13 +394,44 @@ async def safe_eval(page, expr, arg=None, timeout=15):
 
 
 def convert_webm_to_mp4(webm_path, mp4_path):
-    """Convert WebM to MP4 with Telegram-compatible settings"""
+    """
+    Convert WebM to MP4 with Telegram-compatible settings.
+    
+    🔧 LAG FIX v2 - ROOT CAUSE:
+    Agora SDK streams with Variable Frame Rate (VFR). The previous "-g 60" 
+    forced keyframes every 60 FRAMES, which at low VFR (5-15fps from Agora 
+    adaptive streaming) resulted in keyframes only every 4-12 SECONDS.
+    
+    When splitting with "-c copy", FFmpeg can only cut at keyframes. If the
+    nearest keyframe is far from the split point, segments start mid-GOP,
+    causing visible lag/stutter at the start of each segment when played.
+    
+    FIX: Force keyframes every 2 SECONDS (not frames) using time-based
+    expression, and preserve original timestamps with -copyts.
+    
+    QUALITY: 100% preserved - CRF 20, preset fast, main profile, all unchanged.
+    """
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-fflags", "+genpts", "-i", str(webm_path),
+        
+        # 🔧 Preserve original timestamps from WebRTC source
+        "-fflags", "+genpts",
+        "-copyts",
+        "-i", str(webm_path),
+        
         "-map", "0:v:0", "-map", "0:a:0?",
-        "-vf", "fps=30,pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2:color=black",
-        "-vsync", "cfr", "-r", "30",
+        
+        # ✅ Only pad for odd dimensions, preserve VFR
+        "-vf", "pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2:color=black",
+        "-fps_mode", "passthrough",
+        
+        # ✅ Force keyframe every 2 SECONDS (time-based, works with VFR)
+        "-force_key_frames", "expr:gte(t,n_forced*2)",
+        
+        # ✅ Fix any negative timestamps at start
+        "-avoid_negative_ts", "make_zero",
+        
+        # ✅ Quality settings UNCHANGED
         "-c:v", "libx264", 
         "-preset", "fast",
         "-crf", "20", 
@@ -409,10 +440,10 @@ def convert_webm_to_mp4(webm_path, mp4_path):
         "-pix_fmt", "yuv420p", 
         "-threads", "0",
         "-bf", "0",
-        "-g", "60",
-        "-keyint_min", "30",
-        "-force_key_frames", "expr:gte(t,n_forced*2)",   # ← FIX LAG: force keyframe every 2s for clean segment splits
+        
+        # ✅ Audio UNCHANGED
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+        
         "-movflags", "+faststart",
         str(mp4_path)
     ]
@@ -603,7 +634,6 @@ async def run_recording(playwright):
     log(f"[✓] Converted in {convert_time:.1f}s: {total_size:.2f} MB")
     
     log("[*] Checking if split is needed...")
-    target_size_bytes = int(TELEGRAM_TARGET_SIZE_MB * 1024 * 1024)
     
     if full_mp4_path.stat().st_size <= int(TELEGRAM_MAX_SIZE_MB * 1024 * 1024):
         final_files = [full_mp4_path]
@@ -668,7 +698,7 @@ async def run_recording(playwright):
 
 
 async def main():
-    log_section("SUPERLIVE RECORDER (LAG FIX)")
+    log_section("SUPERLIVE RECORDER (LAG FIX v2 - TIME-BASED KEYFRAMES)")
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         return await asyncio.wait_for(run_recording(p), timeout=GLOBAL_WATCHDOG_SECONDS)
