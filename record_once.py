@@ -82,7 +82,7 @@ def check_stop_requested(stream_id):
 
 
 # ============================================================
-# TELEGRAM UPLOAD (IMPROVED WITH BETTER ERROR HANDLING)
+# TELEGRAM UPLOAD (FIXED SYNTAX ERROR)
 # ============================================================
 
 def send_to_telegram(file_path, stream_id, part_number, total_parts):
@@ -102,54 +102,53 @@ def send_to_telegram(file_path, stream_id, part_number, total_parts):
     
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
     
+    boundary = f"----WebKitFormBoundary{int(time.time() * 1000)}"
+    with open(file_path, 'rb') as f:
+        file_data = f.read()
+    
+    body = []
+    body.append(f"--{boundary}".encode())
+    body.append(b'Content-Disposition: form-data; name="chat_id"\r\n\r\n')
+    body.append(TELEGRAM_CHAT_ID.encode())
+    body.append(f"\r\n--{boundary}".encode())
+    body.append(b'Content-Disposition: form-data; name="caption"\r\n\r\n')
+    body.append(caption.encode('utf-8'))
+    body.append(f"\r\n--{boundary}".encode())
+    body.append(b'Content-Disposition: form-data; name="parse_mode"\r\n\r\n')
+    body.append(b'HTML')
+    body.append(f"\r\n--{boundary}".encode())
+    body.append(b'Content-Disposition: form-data; name="supports_streaming"\r\n\r\n')
+    body.append(b'true')
+    body.append(f"\r\n--{boundary}".encode())
+    body.append(f'Content-Disposition: form-data; name="video"; filename="{file_path.name}"\r\n'.encode())
+    body.append(b'Content-Type: video/mp4\r\n\r\n')
+    body.append(file_data)
+    body.append(f"\r\n--{boundary}--".encode())
+    
+    body_bytes = b''.join(body)
+    
+    req = urllib.request.Request(url, data=body_bytes)
+    req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+    
     try:
-        boundary = f"----WebKitFormBoundary{int(time.time() * 1000)}"
-        with open(file_path, 'rb') as f:
-            file_data = f.read()
-        
-        body = []
-        body.append(f"--{boundary}".encode())
-        body.append(b'Content-Disposition: form-data; name="chat_id"\r\n\r\n')
-        body.append(TELEGRAM_CHAT_ID.encode())
-        body.append(f"\r\n--{boundary}".encode())
-        body.append(b'Content-Disposition: form-data; name="caption"\r\n\r\n')
-        body.append(caption.encode('utf-8'))
-        body.append(f"\r\n--{boundary}".encode())
-        body.append(b'Content-Disposition: form-data; name="parse_mode"\r\n\r\n')
-        body.append(b'HTML')
-        body.append(f"\r\n--{boundary}".encode())
-        body.append(b'Content-Disposition: form-data; name="supports_streaming"\r\n\r\n')
-        body.append(b'true')
-        body.append(f"\r\n--{boundary}".encode())
-        body.append(f'Content-Disposition: form-data; name="video"; filename="{file_path.name}"\r\n'.encode())
-        body.append(b'Content-Type: video/mp4\r\n\r\n')
-        body.append(file_data)
-        body.append(f"\r\n--{boundary}--".encode())
-        
-        body_bytes = b''.join(body)
-        
-        req = urllib.request.Request(url, data=body_bytes)
-        req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
-        
-        try:
-            with urllib.request.urlopen(req, timeout=300) as response:
-                result = json.loads(response.read().decode())
-                if result.get('ok'):
-                    log(f"[TG] ✓ {file_path.name} ({file_size_mb:.2f} MB) [STREAMING]")
-                    return True
-                else:
-                    log(f"[TG] ✗ Telegram API error: {result}")
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode('utf-8', errors='replace')
-            log(f"[TG] ✗ HTTP {e.code}: {error_body[:300]}")
-        except Exception as e:
-            log(f"[TG] ✗ Error: {type(e).__name__}: {e}")
+        with urllib.request.urlopen(req, timeout=300) as response:
+            result = json.loads(response.read().decode())
+            if result.get('ok'):
+                log(f"[TG] ✓ {file_path.name} ({file_size_mb:.2f} MB) [STREAMING]")
+                return True
+            else:
+                log(f"[TG] ✗ Telegram API error: {result}")
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8', errors='replace')
+        log(f"[TG] ✗ HTTP {e.code}: {error_body[:300]}")
+    except Exception as e:
+        log(f"[TG] ✗ Error: {type(e).__name__}: {e}")
     
     return False
 
 
 # ============================================================
-# CONFIGURATION (OPTIMIZED FOR SPEED + COMPATIBILITY)
+# CONFIGURATION
 # ============================================================
 URL = os.environ.get("RECORD_URL", "https://superlivetv.com/fr/livestream/150596097")
 RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "recordings")).resolve()
@@ -356,17 +355,16 @@ def convert_webm_to_mp4(webm_path, mp4_path):
         "-map", "0:v:0", "-map", "0:a:0?",
         "-vf", "fps=30,pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2:color=black",
         "-vsync", "cfr", "-r", "30",
-        # TELEGRAM-COMPATIBLE SETTINGS:
         "-c:v", "libx264", 
-        "-preset", "fast",           # fast instead of veryfast (better compatibility)
+        "-preset", "fast",
         "-crf", "20", 
-        "-profile:v", "main",        # Telegram-compatible profile
-        "-level", "3.1",             # Standard level
+        "-profile:v", "main",
+        "-level", "3.1",
         "-pix_fmt", "yuv420p", 
         "-threads", "0",
-        "-bf", "0",                  # No B-frames (Telegram doesn't like them)
-        "-g", "60",                  # GOP size = 2 seconds (good for streaming)
-        "-keyint_min", "30",         # Minimum keyframe interval
+        "-bf", "0",
+        "-g", "60",
+        "-keyint_min", "30",
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
         "-movflags", "+faststart",
         str(mp4_path)
@@ -538,9 +536,6 @@ async def run_recording(playwright):
     await context.close()
     await browser.close()
     
-    # ============================================================
-    # FAST POST-PROCESSING WITH TELEGRAM-COMPATIBLE ENCODING
-    # ============================================================
     log("[4/4] Converting + Uploading (FAST MODE + TELEGRAM COMPATIBLE)...")
     
     full_mp4_path = RECORDINGS_DIR / f"full_{timestamp}.mp4"
@@ -560,7 +555,6 @@ async def run_recording(playwright):
     total_size = full_mp4_path.stat().st_size / 1024 / 1024
     log(f"[✓] Converted in {convert_time:.1f}s: {total_size:.2f} MB")
     
-    # Split if needed
     log("[*] Checking if split is needed...")
     target_size_bytes = int(TELEGRAM_TARGET_SIZE_MB * 1024 * 1024)
     
@@ -598,7 +592,6 @@ async def run_recording(playwright):
         split_time = time.monotonic() - split_start
         log(f"[✓] Split into {len(final_files)} parts in {split_time:.1f}s")
     
-    # Upload to Telegram
     log(f"[*] Uploading {len(final_files)} files to Telegram...")
     kv_update_state(STREAM_ID, 'uploading', file_size_mb=total_size)
     
