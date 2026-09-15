@@ -34,7 +34,7 @@ def kv_get_state(stream_id):
         req.add_header('User-Agent', 'SuperLive-Recorder-Python')
         with urllib.request.urlopen(req, timeout=5) as response:
             return json.loads(response.read().decode())
-    except Exception as e:
+    except:
         return None
 
 
@@ -82,7 +82,45 @@ def check_stop_requested(stream_id):
 
 
 # ============================================================
-# TELEGRAM UPLOAD (FIXED SYNTAX ERROR)
+# VIDEO INFO HELPER
+# ============================================================
+
+def get_video_info(file_path):
+    """Get video duration, width, and height using ffprobe"""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,duration",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            str(file_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        data = json.loads(result.stdout)
+        
+        width = 1920
+        height = 1080
+        duration = 60
+        
+        if 'streams' in data and len(data['streams']) > 0:
+            stream = data['streams'][0]
+            width = stream.get('width', 1920)
+            height = stream.get('height', 1080)
+            if 'duration' in stream:
+                duration = int(float(stream['duration']))
+        
+        if 'format' in data and 'duration' in data['format']:
+            duration = int(float(data['format']['duration']))
+        
+        return {'width': width, 'height': height, 'duration': duration}
+    except Exception as e:
+        log(f"[PROBE] Could not get video info: {e}")
+        return {'width': 1920, 'height': 1080, 'duration': 60}
+
+
+# ============================================================
+# TELEGRAM UPLOAD (FIXED MULTIPART FORMAT)
 # ============================================================
 
 def send_to_telegram(file_path, stream_id, part_number, total_parts):
@@ -94,57 +132,75 @@ def send_to_telegram(file_path, stream_id, part_number, total_parts):
         log(f"[TG] ✗ File too large: {file_size_mb:.2f} MB")
         return False
     
+    # Get video metadata
+    video_info = get_video_info(file_path)
+    
     caption = (
         f"📺 <b>البث:</b> <code>{stream_id}</code>\n"
         f"📦 <b>الجزء:</b> {part_number}/{total_parts}\n"
-        f"📊 <b>الحجم:</b> {file_size_mb:.2f} MB"
+        f"📊 <b>الحجم:</b> {file_size_mb:.2f} MB\n"
+        f"⏱️ <b>المدة:</b> {video_info['duration']} ثانية"
     )
     
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
     
-    boundary = f"----WebKitFormBoundary{int(time.time() * 1000)}"
+    # Generate boundary
+    boundary = f"----PythonBoundary{int(time.time() * 1000000)}"
+    
+    # Build multipart body with CORRECT format
+    body_parts = []
+    
+    # Helper function to add field
+    def add_field(name, value):
+        body_parts.append(f"--{boundary}\r\n".encode())
+        body_parts.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+        body_parts.append(str(value).encode('utf-8'))
+        body_parts.append(b'\r\n')
+    
+    # Add text fields
+    add_field('chat_id', TELEGRAM_CHAT_ID)
+    add_field('caption', caption)
+    add_field('parse_mode', 'HTML')
+    add_field('supports_streaming', 'true')
+    add_field('duration', video_info['duration'])
+    add_field('width', video_info['width'])
+    add_field('height', video_info['height'])
+    
+    # Add file field
+    body_parts.append(f"--{boundary}\r\n".encode())
+    body_parts.append(f'Content-Disposition: form-data; name="video"; filename="{file_path.name}"\r\n'.encode())
+    body_parts.append(b'Content-Type: video/mp4\r\n\r\n')
+    
+    # Read file
     with open(file_path, 'rb') as f:
         file_data = f.read()
     
-    body = []
-    body.append(f"--{boundary}".encode())
-    body.append(b'Content-Disposition: form-data; name="chat_id"\r\n\r\n')
-    body.append(TELEGRAM_CHAT_ID.encode())
-    body.append(f"\r\n--{boundary}".encode())
-    body.append(b'Content-Disposition: form-data; name="caption"\r\n\r\n')
-    body.append(caption.encode('utf-8'))
-    body.append(f"\r\n--{boundary}".encode())
-    body.append(b'Content-Disposition: form-data; name="parse_mode"\r\n\r\n')
-    body.append(b'HTML')
-    body.append(f"\r\n--{boundary}".encode())
-    body.append(b'Content-Disposition: form-data; name="supports_streaming"\r\n\r\n')
-    body.append(b'true')
-    body.append(f"\r\n--{boundary}".encode())
-    body.append(f'Content-Disposition: form-data; name="video"; filename="{file_path.name}"\r\n'.encode())
-    body.append(b'Content-Type: video/mp4\r\n\r\n')
-    body.append(file_data)
-    body.append(f"\r\n--{boundary}--".encode())
+    body_parts.append(file_data)
+    body_parts.append(f"\r\n--{boundary}--\r\n".encode())
     
-    body_bytes = b''.join(body)
+    # Join all parts
+    body = b''.join(body_parts)
     
-    req = urllib.request.Request(url, data=body_bytes)
+    # Create request
+    req = urllib.request.Request(url, data=body, method='POST')
     req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
     
     try:
-        with urllib.request.urlopen(req, timeout=300) as response:
+        with urllib.request.urlopen(req, timeout=600) as response:
             result = json.loads(response.read().decode())
             if result.get('ok'):
-                log(f"[TG] ✓ {file_path.name} ({file_size_mb:.2f} MB) [STREAMING]")
+                log(f"[TG] ✓ {file_path.name} ({file_size_mb:.2f} MB) [{video_info['duration']}s] [STREAMING]")
                 return True
             else:
-                log(f"[TG] ✗ Telegram API error: {result}")
+                log(f"[TG] ✗ API error: {result}")
+                return False
     except urllib.error.HTTPError as e:
         error_body = e.read().decode('utf-8', errors='replace')
-        log(f"[TG] ✗ HTTP {e.code}: {error_body[:300]}")
+        log(f"[TG] ✗ HTTP {e.code}: {error_body[:500]}")
+        return False
     except Exception as e:
         log(f"[TG] ✗ Error: {type(e).__name__}: {e}")
-    
-    return False
+        return False
 
 
 # ============================================================
@@ -536,11 +592,11 @@ async def run_recording(playwright):
     await context.close()
     await browser.close()
     
-    log("[4/4] Converting + Uploading (FAST MODE + TELEGRAM COMPATIBLE)...")
+    log("[4/4] Converting + Uploading...")
     
     full_mp4_path = RECORDINGS_DIR / f"full_{timestamp}.mp4"
     
-    log("[*] FFmpeg converting (fast preset, Telegram-compatible)...")
+    log("[*] FFmpeg converting...")
     convert_start = time.monotonic()
     success = convert_webm_to_mp4(webm_path, full_mp4_path)
     convert_time = time.monotonic() - convert_start
@@ -621,7 +677,7 @@ async def run_recording(playwright):
 
 
 async def main():
-    log_section("SUPERLIVE RECORDER (FAST + TELEGRAM COMPATIBLE)")
+    log_section("SUPERLIVE RECORDER (FIXED MULTIPART + VIDEO METADATA)")
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         return await asyncio.wait_for(run_recording(p), timeout=GLOBAL_WATCHDOG_SECONDS)
