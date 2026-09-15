@@ -17,6 +17,12 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # ============================================================
+# IMPROVEMENT SETTINGS
+# ============================================================
+UPLOAD_MAX_RETRIES = 3
+UPLOAD_RETRY_DELAY_SECONDS = 5
+
+# ============================================================
 # WORKER API SETTINGS
 # ============================================================
 WORKER_URL = os.environ.get("WORKER_URL", "")
@@ -79,6 +85,77 @@ def check_stop_requested(stream_id):
     if data and data.get('should_stop'):
         return True
     return False
+
+
+# ============================================================
+# IMPROVEMENT #2: TELEGRAM NOTIFICATIONS
+# ============================================================
+
+def send_telegram_notification(text):
+    """
+    Send a simple text notification to Telegram.
+    Independent function - does not affect any existing functionality.
+    Silently fails if credentials are missing or request fails.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        data = json.dumps({
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': text,
+            'parse_mode': 'HTML'
+        }).encode()
+        req = urllib.request.Request(url, data=data)
+        req.add_header('Content-Type', 'application/json')
+        urllib.request.urlopen(req, timeout=30)
+    except Exception as e:
+        log(f"[NOTIFY] Could not send notification: {type(e).__name__}")
+
+
+# ============================================================
+# IMPROVEMENT #3: VIDEO FILE VERIFICATION
+# ============================================================
+
+def verify_video_file(file_path):
+    """
+    Verify video file is valid before upload using ffprobe.
+    Checks that the file is not corrupted, has valid duration, and has actual content.
+    Independent function - does not affect any existing functionality.
+    """
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration,size",
+            "-of", "json",
+            str(file_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            log(f"[VERIFY] ✗ {file_path.name}: ffprobe failed")
+            return False
+        
+        data = json.loads(result.stdout)
+        if 'format' not in data:
+            log(f"[VERIFY] ✗ {file_path.name}: no format info")
+            return False
+        
+        duration = float(data['format'].get('duration', 0))
+        size = int(data['format'].get('size', 0))
+        
+        if duration < 1:
+            log(f"[VERIFY] ✗ {file_path.name}: duration too short ({duration:.2f}s)")
+            return False
+        
+        if size < 10000:
+            log(f"[VERIFY] ✗ {file_path.name}: file too small ({size} bytes)")
+            return False
+        
+        log(f"[VERIFY] ✓ {file_path.name}: valid ({duration:.1f}s, {size/1024/1024:.2f} MB)")
+        return True
+    except Exception as e:
+        log(f"[VERIFY] ✗ {file_path.name}: {type(e).__name__}: {e}")
+        return False
 
 
 # ============================================================
@@ -191,6 +268,31 @@ def send_to_telegram(file_path, stream_id, part_number, total_parts):
     except Exception as e:
         log(f"[TG] ✗ Error: {type(e).__name__}: {e}")
         return False
+
+
+# ============================================================
+# IMPROVEMENT #1: UPLOAD WITH RETRY
+# ============================================================
+
+def send_to_telegram_with_retry(file_path, stream_id, part_number, total_parts):
+    """
+    Wrapper around send_to_telegram with automatic retry logic.
+    If upload fails, retries up to UPLOAD_MAX_RETRIES times with delay between attempts.
+    Does not modify the existing send_to_telegram function.
+    """
+    for attempt in range(1, UPLOAD_MAX_RETRIES + 1):
+        if attempt > 1:
+            log(f"[TG] Retry attempt {attempt}/{UPLOAD_MAX_RETRIES} for {file_path.name}")
+        
+        if send_to_telegram(file_path, stream_id, part_number, total_parts):
+            return True
+        
+        if attempt < UPLOAD_MAX_RETRIES:
+            log(f"[TG] Upload failed, retrying in {UPLOAD_RETRY_DELAY_SECONDS}s...")
+            time.sleep(UPLOAD_RETRY_DELAY_SECONDS)
+    
+    log(f"[TG] ✗ Failed after {UPLOAD_MAX_RETRIES} attempts: {file_path.name}")
+    return False
 
 
 # ============================================================
@@ -397,41 +499,24 @@ def convert_webm_to_mp4(webm_path, mp4_path):
     """
     Convert WebM to MP4 with Telegram-compatible settings.
     
-    🔧 LAG FIX v2 - ROOT CAUSE:
-    Agora SDK streams with Variable Frame Rate (VFR). The previous "-g 60" 
-    forced keyframes every 60 FRAMES, which at low VFR (5-15fps from Agora 
-    adaptive streaming) resulted in keyframes only every 4-12 SECONDS.
-    
-    When splitting with "-c copy", FFmpeg can only cut at keyframes. If the
-    nearest keyframe is far from the split point, segments start mid-GOP,
-    causing visible lag/stutter at the start of each segment when played.
-    
-    FIX: Force keyframes every 2 SECONDS (not frames) using time-based
-    expression, and preserve original timestamps with -copyts.
-    
-    QUALITY: 100% preserved - CRF 20, preset fast, main profile, all unchanged.
+    Uses time-based forced keyframes to prevent stuttering with VFR sources
+    from Agora SDK. Quality settings preserved (CRF 20, preset fast, main profile).
     """
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         
-        # 🔧 Preserve original timestamps from WebRTC source
         "-fflags", "+genpts",
         "-copyts",
         "-i", str(webm_path),
         
         "-map", "0:v:0", "-map", "0:a:0?",
         
-        # ✅ Only pad for odd dimensions, preserve VFR
         "-vf", "pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2:color=black",
         "-fps_mode", "passthrough",
         
-        # ✅ Force keyframe every 2 SECONDS (time-based, works with VFR)
         "-force_key_frames", "expr:gte(t,n_forced*2)",
-        
-        # ✅ Fix any negative timestamps at start
         "-avoid_negative_ts", "make_zero",
         
-        # ✅ Quality settings UNCHANGED
         "-c:v", "libx264", 
         "-preset", "fast",
         "-crf", "20", 
@@ -441,7 +526,6 @@ def convert_webm_to_mp4(webm_path, mp4_path):
         "-threads", "0",
         "-bf", "0",
         
-        # ✅ Audio UNCHANGED
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
         
         "-movflags", "+faststart",
@@ -547,6 +631,14 @@ async def run_recording(playwright):
         raise RuntimeError("No data from recorder")
     
     log("[✓] Recording active!")
+    
+    # IMPROVEMENT #2: Notify user that recording has started
+    send_telegram_notification(
+        f"🔴 <b>بدأ تسجيل البث</b>\n"
+        f"📺 <code>{STREAM_ID}</code>\n"
+        f"🔗 <a href=\"{URL}\">افتح البث</a>"
+    )
+    
     total_start = time.monotonic()
     last_stop_check = time.monotonic()
     last_progress_log = time.monotonic()
@@ -669,28 +761,69 @@ async def run_recording(playwright):
         split_time = time.monotonic() - split_start
         log(f"[✓] Split into {len(final_files)} parts in {split_time:.1f}s")
     
+    # IMPROVEMENT #2: Notify user that upload is starting
+    send_telegram_notification(
+        f"📤 <b>جاري رفع الفيديو...</b>\n"
+        f"📺 <code>{STREAM_ID}</code>\n"
+        f"📊 الحجم: {total_size:.2f} MB\n"
+        f"📦 الأجزاء: {len(final_files)}"
+    )
+    
     log(f"[*] Uploading {len(final_files)} files to Telegram...")
     kv_update_state(STREAM_ID, 'uploading', file_size_mb=total_size)
     
     upload_start = time.monotonic()
     success_count = 0
+    failed_count = 0
     total_parts = len(final_files)
     
     for i, file_path in enumerate(final_files, 1):
-        if send_to_telegram(file_path, STREAM_ID, i, total_parts):
+        # IMPROVEMENT #3: Verify file before upload
+        if not verify_video_file(file_path):
+            log(f"[TG] ⚠ Skipping invalid file: {file_path.name}")
+            failed_count += 1
+            continue
+        
+        # IMPROVEMENT #1: Upload with retry
+        if send_to_telegram_with_retry(file_path, STREAM_ID, i, total_parts):
             success_count += 1
             try:
                 file_path.unlink()
             except: pass
+        else:
+            failed_count += 1
+        
         time.sleep(1)
     
     upload_time = time.monotonic() - upload_start
-    log(f"[✓] Uploaded in {upload_time:.1f}s: {success_count}/{total_parts}")
+    log(f"[✓] Uploaded in {upload_time:.1f}s: {success_count}/{total_parts} (failed: {failed_count})")
     
     kv_update_state(STREAM_ID, 'finished', file_size_mb=total_size, telegram_sent=(success_count > 0))
     
     if success_count > 0:
         kv_delete_state(STREAM_ID)
+    
+    # IMPROVEMENT #2: Notify user of final result
+    if success_count == total_parts:
+        send_telegram_notification(
+            f"✅ <b>تم رفع الفيديو بنجاح</b>\n"
+            f"📺 <code>{STREAM_ID}</code>\n"
+            f"📦 الأجزاء: {success_count}/{total_parts}\n"
+            f"📊 الحجم: {total_size:.2f} MB"
+        )
+    elif success_count > 0:
+        send_telegram_notification(
+            f"⚠️ <b>تم رفع الفيديو جزئياً</b>\n"
+            f"📺 <code>{STREAM_ID}</code>\n"
+            f"📦 الأجزاء: {success_count}/{total_parts}\n"
+            f"❌ فشل: {failed_count}"
+        )
+    else:
+        send_telegram_notification(
+            f"❌ <b>فشل رفع الفيديو</b>\n"
+            f"📺 <code>{STREAM_ID}</code>\n"
+            f"📊 الحجم: {total_size:.2f} MB"
+        )
     
     total_time = time.monotonic() - total_start
     log(f"\n[✓✓✓] DONE! Total: {total_time:.1f}s | Convert: {convert_time:.1f}s | Upload: {upload_time:.1f}s")
@@ -698,7 +831,7 @@ async def run_recording(playwright):
 
 
 async def main():
-    log_section("SUPERLIVE RECORDER (LAG FIX v2 - TIME-BASED KEYFRAMES)")
+    log_section("SUPERLIVE RECORDER (STABLE + IMPROVEMENTS)")
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         return await asyncio.wait_for(run_recording(p), timeout=GLOBAL_WATCHDOG_SECONDS)
