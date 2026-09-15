@@ -22,7 +22,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 WORKER_URL = os.environ.get("WORKER_URL", "")
 
 # ============================================================
-# CLOUDFLARE KV STATE MANAGEMENT
+# CLOUDFLARE KV STATE MANAGEMENT (ALL via Worker API)
 # ============================================================
 
 def kv_get_state(stream_id):
@@ -50,48 +50,51 @@ def kv_delete_state(stream_id):
         with urllib.request.urlopen(req, timeout=10) as response:
             result = json.loads(response.read().decode())
             if result.get('success'):
-                log(f"[KV] ✓ Deleted state for {stream_id} via Worker API")
+                log(f"[KV] ✓ Deleted state for {stream_id}")
                 return True
-            else:
-                log(f"[KV] ✗ Delete failed: {result}")
-                return False
+            return False
     except Exception as e:
         log(f"[KV] ✗ Delete error: {type(e).__name__}: {e}")
         return False
 
 
 def kv_update_state(stream_id, status, file_size_mb=0, error=None, telegram_sent=False):
-    account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
-    namespace_id = os.environ.get("CF_KV_NAMESPACE_ID", "")
-    api_token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
-    if not stream_id or not all([account_id, namespace_id, api_token]):
-        log("[KV] Missing credentials, skipping state update")
+    """Update state via Worker API (not Cloudflare API directly)"""
+    if not stream_id or not WORKER_URL:
+        log("[KV] Missing stream_id or WORKER_URL")
         return False
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/storage/kv/namespaces/{namespace_id}/values/recording:{stream_id}"
+    
+    url = f"{WORKER_URL.rstrip('/')}/api/update-state/{stream_id}"
+    
+    # Build state update
+    state = {}
+    existing = kv_get_state(stream_id)
+    if existing:
+        state = existing
+    
+    state['status'] = status
+    if file_size_mb > 0:
+        state['file_size_mb'] = file_size_mb
+    if error:
+        state['error'] = error
+    state['telegram_sent'] = telegram_sent
+    state['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    
     try:
-        state = {}
-        try:
-            req = urllib.request.Request(url)
-            req.add_header('Authorization', f'Bearer {api_token}')
-            with urllib.request.urlopen(req, timeout=10) as response:
-                state = json.loads(response.read().decode())
-        except Exception:
-            pass
-        state['status'] = status
-        if file_size_mb > 0:
-            state['file_size_mb'] = file_size_mb
-        if error:
-            state['error'] = error
-        state['telegram_sent'] = telegram_sent
-        state['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-        req = urllib.request.Request(url, method='PUT')
-        req.add_header('Authorization', f'Bearer {api_token}')
+        req = urllib.request.Request(url, method='POST', data=json.dumps(state).encode())
         req.add_header('Content-Type', 'application/json')
-        with urllib.request.urlopen(req, data=json.dumps(state).encode(), timeout=10) as response:
-            log(f"[KV] ✓ State updated: {stream_id} -> {status}")
-        return True
+        req.add_header('User-Agent', 'SuperLive-Recorder-Python')
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode())
+            if result.get('success'):
+                log(f"[KV] ✓ State updated: {stream_id} -> {status}")
+                return True
+            else:
+                log(f"[KV] ✗ Update failed: {result}")
+                return False
     except Exception as e:
-        log(f"[KV] ✗ Update failed: {type(e).__name__}: {e}")
+        log(f"[KV] ✗ Update error: {type(e).__name__}: {e}")
         return False
 
 
@@ -115,11 +118,25 @@ def check_stop_requested(stream_id):
 
 
 # ============================================================
-# TELEGRAM UPLOAD FUNCTIONS (WITH STREAMING SUPPORT)
+# TELEGRAM UPLOAD FUNCTIONS (IMPROVED SPLITTING)
 # ============================================================
 
+def get_video_duration(file_path):
+    """Get video duration in seconds using ffprobe"""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return float(result.stdout.strip())
+    except Exception as e:
+        log(f"[PROBE] Could not get duration: {e}")
+        return 0
+
+
 def split_for_telegram(full_mp4_path, stream_id):
-    """Split ONE encoded file into ~42MB chunks for Telegram"""
+    """Split ONE encoded file into ~42MB chunks using segment_time"""
     output_dir = full_mp4_path.parent
     target_size_bytes = int(TELEGRAM_TARGET_SIZE_MB * 1024 * 1024)
     max_size_bytes = int(TELEGRAM_MAX_SIZE_MB * 1024 * 1024)
@@ -128,13 +145,26 @@ def split_for_telegram(full_mp4_path, stream_id):
     log(f"[SPLIT] Full file: {file_size/1024/1024:.2f} MB")
     
     if file_size <= max_size_bytes:
-        # File is small enough, just rename
         final_path = output_dir / f"stream_{stream_id}_part01.mp4"
         full_mp4_path.rename(final_path)
         log(f"[SPLIT] ✓ Single file, no split needed")
         return [final_path]
     
-    # Split using segment
+    # Get duration
+    duration_seconds = get_video_duration(full_mp4_path)
+    
+    if duration_seconds <= 0:
+        log("[SPLIT] ✗ Could not get duration, cannot split")
+        final_path = output_dir / f"stream_{stream_id}_part01.mp4"
+        full_mp4_path.rename(final_path)
+        return [final_path]
+    
+    # Calculate segment time based on size ratio
+    num_parts = max(2, (file_size // target_size_bytes) + 1)
+    segment_time = max(30, int(duration_seconds / num_parts))
+    
+    log(f"[SPLIT] Duration: {duration_seconds:.1f}s, Target parts: {num_parts}, Segment time: {segment_time}s")
+    
     output_pattern = str(output_dir / f"stream_{stream_id}_part%02d.mp4")
     
     cmd = [
@@ -142,7 +172,7 @@ def split_for_telegram(full_mp4_path, stream_id):
         "-i", str(full_mp4_path),
         "-c", "copy", "-map", "0",
         "-f", "segment",
-        "-segment_size", str(target_size_bytes),
+        "-segment_time", str(segment_time),
         "-reset_timestamps", "1",
         "-movflags", "+faststart",
         output_pattern
@@ -159,26 +189,37 @@ def split_for_telegram(full_mp4_path, stream_id):
     parts = sorted(output_dir.glob(f"stream_{stream_id}_part*.mp4"))
     full_mp4_path.unlink()
     
-    # Verify all parts are under limit
+    # Verify all parts are under limit and re-split if needed
     final_parts = []
     for part in parts:
-        if part.stat().st_size > max_size_bytes:
-            log(f"[SPLIT] ⚠ {part.name} exceeds limit, re-splitting...")
-            sub_pattern = str(output_dir / f"{part.stem}_sub%02d.mp4")
-            cmd2 = [
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
-                "-i", str(part),
-                "-c", "copy", "-map", "0",
-                "-f", "segment",
-                "-segment_size", str(max_size_bytes - 500000),
-                "-reset_timestamps", "1",
-                "-movflags", "+faststart",
-                sub_pattern
-            ]
-            subprocess.run(cmd2, capture_output=True, text=True)
-            sub_parts = sorted(output_dir.glob(f"{part.stem}_sub*.mp4"))
-            final_parts.extend(sub_parts)
-            part.unlink()
+        part_size = part.stat().st_size
+        if part_size > max_size_bytes:
+            log(f"[SPLIT] ⚠ {part.name} ({part_size/1024/1024:.2f} MB) exceeds limit, re-splitting...")
+            
+            # Get this part's duration
+            part_duration = get_video_duration(part)
+            if part_duration > 0:
+                # Split into 2 halves
+                half_time = int(part_duration / 2)
+                sub_pattern = str(output_dir / f"{part.stem}_sub%02d.mp4")
+                
+                cmd2 = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-i", str(part),
+                    "-c", "copy", "-map", "0",
+                    "-f", "segment",
+                    "-segment_time", str(half_time),
+                    "-reset_timestamps", "1",
+                    "-movflags", "+faststart",
+                    sub_pattern
+                ]
+                
+                subprocess.run(cmd2, capture_output=True, text=True)
+                sub_parts = sorted(output_dir.glob(f"{part.stem}_sub*.mp4"))
+                final_parts.extend(sub_parts)
+                part.unlink()
+            else:
+                final_parts.append(part)
         else:
             final_parts.append(part)
     
@@ -192,6 +233,12 @@ def send_to_telegram(file_path, stream_id, part_number, total_parts):
         return False
     
     file_size_mb = file_path.stat().st_size / (1024 * 1024)
+    
+    # Check size limit
+    if file_size_mb > TELEGRAM_MAX_SIZE_MB:
+        log(f"[TG] ✗ File too large: {file_size_mb:.2f} MB > {TELEGRAM_MAX_SIZE_MB} MB")
+        return False
+    
     caption = (
         f"📺 <b>البث:</b> <code>{stream_id}</code>\n"
         f"📦 <b>الجزء:</b> {part_number}/{total_parts}\n"
@@ -220,7 +267,6 @@ def send_to_telegram(file_path, stream_id, part_number, total_parts):
         body.append(b'')
         body.append(b'HTML')
         body.append(f"--{boundary}".encode())
-        # CRITICAL FIX: Enable streaming playback
         body.append(b'Content-Disposition: form-data; name="supports_streaming"')
         body.append(b'')
         body.append(b'true')
@@ -257,7 +303,6 @@ def upload_all_to_telegram(full_mp4_path, stream_id):
     
     log(f"[TG] Processing file for Telegram upload...")
     
-    # Split into Telegram-friendly chunks
     final_files = split_for_telegram(full_mp4_path, stream_id)
     
     total_final_size = sum(f.stat().st_size for f in final_files) / 1024 / 1024
@@ -312,7 +357,7 @@ def log(msg=""):
 def log_section(t): log("\n" + "="*70 + f"\n{t}\n" + "="*70)
 
 # ============================================================
-# WEBRTC HOOK (IMPROVED: Track video track state)
+# WEBRTC HOOK
 # ============================================================
 WEBRTC_HOOK = r"""
 (() => {
@@ -597,7 +642,6 @@ async def run_recording(playwright):
         await asyncio.sleep(1)
         elapsed = time.monotonic() - start_rec
         
-        # Check for manual stop request
         if time.monotonic() - last_stop_check >= STOP_CHECK_INTERVAL:
             last_stop_check = time.monotonic()
             try:
@@ -608,40 +652,33 @@ async def run_recording(playwright):
             except Exception as e:
                 log(f"[WARN] Stop check error: {e}")
         
-        # Log progress every 15 seconds
         if time.monotonic() - last_log_time >= 15:
             last_log_time = time.monotonic()
             size_mb = total_bytes / 1024 / 1024
             log(f"[*] Progress: {int(elapsed)}s | Chunks: {chunk_count} | Size: {size_mb:.2f} MB | Errors: {write_errors}")
         
-        # IMPROVED: Check stream health with multiple conditions
         try:
             status = await safe_eval(page, "window.__superliveGetStatus()")
             idle_ms = status.get('idleTimeMs', 0)
             video_state = status.get('videoReadyState', 0)
             last_chunk_size = status.get('lastChunkSize', 0)
             video_track_state = status.get('videoTrackState', 'unknown')
-            audio_track_state = status.get('audioTrackState', 'unknown')
             
-            # Condition 1: Video track ended (most reliable!)
             if video_track_state == 'ended' and chunk_count > 5:
                 log(f"[!] Stream ended: Video track state = '{video_track_state}'")
                 stop_reason = "stream_ended_track"
                 break
             
-            # Condition 2: No chunks for 20 seconds
             if idle_ms > STREAM_IDLE_TIMEOUT * 1000:
                 log(f"[!] Stream ended: No chunks for {idle_ms/1000:.1f}s")
                 stop_reason = "stream_ended_idle"
                 break
             
-            # Condition 3: Video element stopped (readyState < 2)
             if video_state < 2 and chunk_count > 5:
                 log(f"[!] Stream ended: Video readyState={video_state}")
                 stop_reason = "stream_ended_video"
                 break
             
-            # Condition 4: Last chunk too small (< 500 bytes)
             if last_chunk_size < MIN_CHUNK_SIZE and chunk_count > 5:
                 log(f"[!] Stream ended: Last chunk too small ({last_chunk_size} bytes)")
                 stop_reason = "stream_ended_small_chunk"
@@ -678,9 +715,6 @@ async def run_recording(playwright):
     await context.close()
     await browser.close()
     
-    # ============================================================
-    # POST-PROCESSING: Encode as ONE file (no stuttering!)
-    # ============================================================
     log("[5/6] Converting WebM to MP4 (HIGH QUALITY, SINGLE FILE)...")
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
     full_mp4_path = RECORDINGS_DIR / f"full_{timestamp}.mp4"
@@ -718,9 +752,6 @@ async def run_recording(playwright):
     total_size = full_mp4_path.stat().st_size / 1024 / 1024
     log(f"[✓] Created single MP4: {full_mp4_path.name} ({total_size:.2f} MB)")
     
-    # ============================================================
-    # UPLOAD TO TELEGRAM (Split + Streaming)
-    # ============================================================
     log("[6/6] Uploading to Telegram (Split + Streaming)...")
     kv_update_state(STREAM_ID, 'uploading', file_size_mb=total_size)
     
@@ -735,7 +766,7 @@ async def run_recording(playwright):
     return []
 
 async def main():
-    log_section("SUPERLIVE RECORDER (SINGLE FILE + STREAMING)")
+    log_section("SUPERLIVE RECORDER (WORKER API + SMART SPLIT)")
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         return await asyncio.wait_for(run_recording(p), timeout=GLOBAL_WATCHDOG_SECONDS)
