@@ -120,7 +120,7 @@ def get_video_info(file_path):
 
 
 # ============================================================
-# TELEGRAM UPLOAD (FIXED MULTIPART FORMAT)
+# TELEGRAM UPLOAD
 # ============================================================
 
 def send_to_telegram(file_path, stream_id, part_number, total_parts):
@@ -132,7 +132,6 @@ def send_to_telegram(file_path, stream_id, part_number, total_parts):
         log(f"[TG] ✗ File too large: {file_size_mb:.2f} MB")
         return False
     
-    # Get video metadata
     video_info = get_video_info(file_path)
     
     caption = (
@@ -144,20 +143,16 @@ def send_to_telegram(file_path, stream_id, part_number, total_parts):
     
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
     
-    # Generate boundary
     boundary = f"----PythonBoundary{int(time.time() * 1000000)}"
     
-    # Build multipart body with CORRECT format
     body_parts = []
     
-    # Helper function to add field
     def add_field(name, value):
         body_parts.append(f"--{boundary}\r\n".encode())
         body_parts.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
         body_parts.append(str(value).encode('utf-8'))
         body_parts.append(b'\r\n')
     
-    # Add text fields
     add_field('chat_id', TELEGRAM_CHAT_ID)
     add_field('caption', caption)
     add_field('parse_mode', 'HTML')
@@ -166,22 +161,18 @@ def send_to_telegram(file_path, stream_id, part_number, total_parts):
     add_field('width', video_info['width'])
     add_field('height', video_info['height'])
     
-    # Add file field
     body_parts.append(f"--{boundary}\r\n".encode())
     body_parts.append(f'Content-Disposition: form-data; name="video"; filename="{file_path.name}"\r\n'.encode())
     body_parts.append(b'Content-Type: video/mp4\r\n\r\n')
     
-    # Read file
     with open(file_path, 'rb') as f:
         file_data = f.read()
     
     body_parts.append(file_data)
     body_parts.append(f"\r\n--{boundary}--\r\n".encode())
     
-    # Join all parts
     body = b''.join(body_parts)
     
-    # Create request
     req = urllib.request.Request(url, data=body, method='POST')
     req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
     
@@ -404,13 +395,24 @@ async def safe_eval(page, expr, arg=None, timeout=15):
 
 
 def convert_webm_to_mp4(webm_path, mp4_path):
-    """Convert WebM to MP4 with Telegram-compatible settings"""
+    """
+    Convert WebM to MP4 with Telegram-compatible settings.
+    
+    🔧 LAG FIX APPLIED HERE:
+    - Removed "-vf fps=30" (was forcing 30fps and causing stutter)
+    - Removed "-vsync cfr" and "-r 30" (were conflicting with VFR source)
+    - Added "-fps_mode passthrough" (preserves original frame rate perfectly)
+    - Kept "-fflags +genpts" to fix timestamps without altering framerate
+    - All quality settings remain identical (CRF 20, fast, main profile, etc.)
+    """
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-fflags", "+genpts", "-i", str(webm_path),
         "-map", "0:v:0", "-map", "0:a:0?",
-        "-vf", "fps=30,pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2:color=black",
-        "-vsync", "cfr", "-r", "30",
+        # ✅ LAG FIX: Only pad (for odd dimensions), preserve original framerate
+        "-vf", "pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2:color=black",
+        "-fps_mode", "passthrough",
+        # ✅ Quality settings unchanged
         "-c:v", "libx264", 
         "-preset", "fast",
         "-crf", "20", 
@@ -677,7 +679,7 @@ async def run_recording(playwright):
 
 
 async def main():
-    log_section("SUPERLIVE RECORDER (FIXED MULTIPART + VIDEO METADATA)")
+    log_section("SUPERLIVE RECORDER (LAG FIX APPLIED)")
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         return await asyncio.wait_for(run_recording(p), timeout=GLOBAL_WATCHDOG_SECONDS)
