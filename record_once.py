@@ -86,7 +86,6 @@ def check_stop_requested(stream_id):
 # ============================================================
 
 def get_video_info(file_path):
-    """Get video duration, width, and height using ffprobe"""
     try:
         cmd = [
             "ffprobe", "-v", "error",
@@ -120,7 +119,7 @@ def get_video_info(file_path):
 
 
 # ============================================================
-# TELEGRAM UPLOAD
+# TELEGRAM UPLOAD (FIXED MULTIPART FORMAT)
 # ============================================================
 
 def send_to_telegram(file_path, stream_id, part_number, total_parts):
@@ -395,24 +394,13 @@ async def safe_eval(page, expr, arg=None, timeout=15):
 
 
 def convert_webm_to_mp4(webm_path, mp4_path):
-    """
-    Convert WebM to MP4 with Telegram-compatible settings.
-    
-    🔧 LAG FIX APPLIED HERE:
-    - Removed "-vf fps=30" (was forcing 30fps and causing stutter)
-    - Removed "-vsync cfr" and "-r 30" (were conflicting with VFR source)
-    - Added "-fps_mode passthrough" (preserves original frame rate perfectly)
-    - Kept "-fflags +genpts" to fix timestamps without altering framerate
-    - All quality settings remain identical (CRF 20, fast, main profile, etc.)
-    """
+    """Convert WebM to MP4 with Telegram-compatible settings"""
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-fflags", "+genpts", "-i", str(webm_path),
         "-map", "0:v:0", "-map", "0:a:0?",
-        # ✅ LAG FIX: Only pad (for odd dimensions), preserve original framerate
-        "-vf", "pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2:color=black",
-        "-fps_mode", "passthrough",
-        # ✅ Quality settings unchanged
+        "-vf", "fps=30,pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2:color=black",
+        "-vsync", "cfr", "-r", "30",
         "-c:v", "libx264", 
         "-preset", "fast",
         "-crf", "20", 
@@ -423,6 +411,7 @@ def convert_webm_to_mp4(webm_path, mp4_path):
         "-bf", "0",
         "-g", "60",
         "-keyint_min", "30",
+        "-force_key_frames", "expr:gte(t,n_forced*2)",   # ← FIX LAG: force keyframe every 2s for clean segment splits
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
         "-movflags", "+faststart",
         str(mp4_path)
@@ -679,7 +668,7 @@ async def run_recording(playwright):
 
 
 async def main():
-    log_section("SUPERLIVE RECORDER (LAG FIX APPLIED)")
+    log_section("SUPERLIVE RECORDER (LAG FIX)")
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         return await asyncio.wait_for(run_recording(p), timeout=GLOBAL_WATCHDOG_SECONDS)
