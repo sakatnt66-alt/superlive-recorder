@@ -14,7 +14,7 @@ from pathlib import Path
 # ============================================================
 
 TELEGRAM_MAX_SIZE_MB = 44.9
-TELEGRAM_TARGET_SIZE_MB = 42.0
+TELEGRAM_TARGET_SIZE_MB = 36.0
 
 UPLOAD_MAX_RETRIES = 3
 UPLOAD_RETRY_DELAY_SECONDS = 5
@@ -397,16 +397,6 @@ def verify_video_file(path, allow_zero_duration=False):
             )
             return False
 
-        # ----------------------------------------------------
-        # MediaRecorder WebM files can legitimately report
-        # format.duration=0 through ffprobe even though the
-        # actual WebM contains valid playable video packets.
-        #
-        # For the original WebM we therefore validate the
-        # actual video stream and packet count instead of
-        # requiring a non-zero container duration.
-        # ----------------------------------------------------
-
         if duration <= 1:
             if allow_zero_duration:
                 log(
@@ -487,7 +477,8 @@ def get_duration(info):
 
     try:
         return float(
-            info.get("format", {}).get("duration") or 0
+            info.get("format", {}).get("duration")
+            or 0
         )
     except Exception:
         return 0.0
@@ -561,8 +552,13 @@ def send_to_telegram(path, caption=""):
         )
         return False
 
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log("Telegram credentials are missing")
+    if (
+        not TELEGRAM_BOT_TOKEN
+        or not TELEGRAM_CHAT_ID
+    ):
+        log(
+            "Telegram credentials are missing"
+        )
         return False
 
     info = get_video_info(path)
@@ -586,9 +582,11 @@ def send_to_telegram(path, caption=""):
                 width = int(
                     stream.get("width") or 0
                 )
+
                 height = int(
                     stream.get("height") or 0
                 )
+
                 break
 
     url = (
@@ -645,7 +643,9 @@ def send_to_telegram(path, caption=""):
         return False
 
     body.extend(
-        f"\r\n--{boundary}--\r\n".encode("utf-8")
+        f"\r\n--{boundary}--\r\n".encode(
+            "utf-8"
+        )
     )
 
     try:
@@ -658,7 +658,8 @@ def send_to_telegram(path, caption=""):
                     f"multipart/form-data; "
                     f"boundary={boundary}"
                 ),
-                "User-Agent": "SuperLiveRecorder/1.0",
+                "User-Agent":
+                    "SuperLiveRecorder/1.0",
             },
         )
 
@@ -666,13 +667,18 @@ def send_to_telegram(path, caption=""):
             req,
             timeout=600,
         ) as response:
-            response_body = response.read().decode(
-                "utf-8",
-                errors="replace",
+            response_body = (
+                response.read()
+                .decode(
+                    "utf-8",
+                    errors="replace",
+                )
             )
 
         try:
-            result = json.loads(response_body)
+            result = json.loads(
+                response_body
+            )
 
             if result.get("ok"):
                 log(
@@ -694,9 +700,12 @@ def send_to_telegram(path, caption=""):
 
     except urllib.error.HTTPError as e:
         try:
-            error_body = e.read().decode(
-                "utf-8",
-                errors="replace",
+            error_body = (
+                e.read()
+                .decode(
+                    "utf-8",
+                    errors="replace",
+                )
             )
         except Exception:
             error_body = str(e)
@@ -714,18 +723,25 @@ def send_to_telegram(path, caption=""):
     return False
 
 
-def send_to_telegram_with_retry(path, caption=""):
+def send_to_telegram_with_retry(
+    path,
+    caption="",
+):
     for attempt in range(
         1,
         UPLOAD_MAX_RETRIES + 1,
     ):
         log(
             f"Telegram upload attempt "
-            f"{attempt}/{UPLOAD_MAX_RETRIES}: "
+            f"{attempt}/"
+            f"{UPLOAD_MAX_RETRIES}: "
             f"{path}"
         )
 
-        if send_to_telegram(path, caption):
+        if send_to_telegram(
+            path,
+            caption,
+        ):
             return True
 
         if attempt < UPLOAD_MAX_RETRIES:
@@ -746,27 +762,56 @@ def send_to_telegram_with_retry(path, caption=""):
 # FFMPEG CONVERSION
 # ============================================================
 
-def convert_webm_to_mp4(webm_path, mp4_path):
+def convert_webm_to_mp4(
+    webm_path,
+    mp4_path,
+):
     """
-    Convert WebM to H.264/AAC MP4 while preserving the
-    original frame timestamps as much as possible.
+    Convert WebM to H.264/AAC MP4.
+
+    The source WebM produced by MediaRecorder is already
+    smooth, so this function deliberately avoids forcing
+    a synthetic CFR frame stream.
+
+    Timestamp strategy:
+
+        -fflags +genpts
+            Ask FFmpeg to generate timestamps where needed
+            instead of blindly carrying broken/missing input
+            timestamps.
+
+        no -copyts
+            Do not blindly preserve the WebM container's
+            problematic timestamp interpretation.
+
+        setpts=PTS-STARTPTS
+            Normalize the beginning of the video timeline
+            while preserving the relative frame timing.
+
+        -fps_mode vfr
+            Allow FFmpeg to retain variable frame timing
+            instead of duplicating/dropping frames to CFR.
+
+        -video_track_timescale 90000
+            Use a conventional MP4 video timestamp scale.
 
     IMPORTANT:
-    - No fps filter.
-    - No CFR.
-    - No forced keyframes.
-    - Preserve source timing.
-    - Use VFR output mode.
-    - Use a stable MP4 video timestamp timescale.
+        No fps=30.
+        No fps_mode=cfr.
+        No forced keyframes.
     """
 
     webm_path = Path(webm_path)
     mp4_path = Path(mp4_path)
 
     if not webm_path.exists():
-        raise FileNotFoundError(webm_path)
+        raise FileNotFoundError(
+            webm_path
+        )
 
-    log_section("WEBM SOURCE ANALYSIS")
+    log_section(
+        "WEBM SOURCE ANALYSIS"
+    )
 
     webm_info = log_video_info(
         "WEBM BEFORE CONVERSION",
@@ -782,41 +827,9 @@ def convert_webm_to_mp4(webm_path, mp4_path):
         f"{webm_duration:.3f}s"
     )
 
-    log_section("FFMPEG WEBM -> MP4")
-
-    # --------------------------------------------------------
-    # TIMESTAMP STRATEGY
-    # --------------------------------------------------------
-    #
-    # The original WebM recording is already smooth.
-    #
-    # Therefore we deliberately DO NOT force the video to
-    # 30 FPS or another constant frame rate.
-    #
-    # Previous CFR conversion caused worse stuttering.
-    #
-    # -copyts:
-    #   Preserve input timestamps.
-    #
-    # -start_at_zero:
-    #   Shift the preserved timeline so output starts at zero.
-    #
-    # -fps_mode:v vfr:
-    #   Keep variable frame timing instead of forcing CFR.
-    #
-    # -video_track_timescale 90000:
-    #   Give the MP4 video track a stable, fine-grained
-    #   timestamp clock.
-    #
-    # We intentionally do NOT use:
-    #
-    #   -vf fps=...
-    #   -fps_mode cfr
-    #   -vsync ...
-    #   -force_key_frames ...
-    #   -avoid_negative_ts make_zero
-    #
-    # --------------------------------------------------------
+    log_section(
+        "FFMPEG WEBM -> MP4"
+    )
 
     command = [
         "ffmpeg",
@@ -825,10 +838,19 @@ def convert_webm_to_mp4(webm_path, mp4_path):
         "warning",
         "-y",
 
-        "-copyts",
+        # ----------------------------------------------------
+        # Timestamp handling
+        # ----------------------------------------------------
+
+        "-fflags",
+        "+genpts",
 
         "-i",
         str(webm_path),
+
+        # ----------------------------------------------------
+        # Streams
+        # ----------------------------------------------------
 
         "-map",
         "0:v:0",
@@ -836,15 +858,31 @@ def convert_webm_to_mp4(webm_path, mp4_path):
         "-map",
         "0:a:0?",
 
+        # ----------------------------------------------------
+        # Normalize dimensions only if required.
+        #
+        # This does NOT change frame timing.
+        # ----------------------------------------------------
+
         "-vf",
         "pad=width=ceil(iw/2)*2:"
         "height=ceil(ih/2)*2:"
-        "color=black",
+        "color=black,"
+        "setpts=PTS-STARTPTS",
+
+        # ----------------------------------------------------
+        # Preserve variable timing.
+        #
+        # IMPORTANT:
+        # Do NOT replace this with CFR.
+        # ----------------------------------------------------
 
         "-fps_mode:v",
         "vfr",
 
-        "-start_at_zero",
+        # ----------------------------------------------------
+        # Video encoding
+        # ----------------------------------------------------
 
         "-c:v",
         "libx264",
@@ -864,8 +902,14 @@ def convert_webm_to_mp4(webm_path, mp4_path):
         "-threads",
         "0",
 
+        # Disable B-frames for easier timestamp handling
+        # and broad MP4 compatibility.
         "-bf",
         "0",
+
+        # ----------------------------------------------------
+        # Audio encoding
+        # ----------------------------------------------------
 
         "-c:a",
         "aac",
@@ -879,8 +923,16 @@ def convert_webm_to_mp4(webm_path, mp4_path):
         "-ac",
         "2",
 
+        # ----------------------------------------------------
+        # MP4 timestamp scale
+        # ----------------------------------------------------
+
         "-video_track_timescale",
         "90000",
+
+        # ----------------------------------------------------
+        # Fast-start MP4
+        # ----------------------------------------------------
 
         "-movflags",
         "+faststart",
@@ -930,7 +982,9 @@ def convert_webm_to_mp4(webm_path, mp4_path):
             "Generated MP4 is unexpectedly small"
         )
 
-    log_section("MP4 OUTPUT ANALYSIS")
+    log_section(
+        "MP4 OUTPUT ANALYSIS"
+    )
 
     mp4_info = log_video_info(
         "MP4 AFTER CONVERSION",
@@ -978,6 +1032,10 @@ def convert_webm_to_mp4(webm_path, mp4_path):
                 f"difference={difference:.3f}s"
             )
 
+    # --------------------------------------------------------
+    # Verify generated MP4
+    # --------------------------------------------------------
+
     if not verify_video_file(
         mp4_path
     ):
@@ -1018,7 +1076,8 @@ def split_mp4_if_needed(mp4_path):
 
     if duration <= 1:
         raise RuntimeError(
-            "Cannot split MP4: invalid duration"
+            "Cannot split MP4: "
+            "invalid duration"
         )
 
     target_bytes = (
@@ -1041,7 +1100,8 @@ def split_mp4_if_needed(mp4_path):
 
     segment_time = max(
         30,
-        duration / estimated_parts,
+        duration
+        / estimated_parts,
     )
 
     log(
@@ -1139,8 +1199,9 @@ def split_mp4_if_needed(mp4_path):
             > TELEGRAM_MAX_SIZE_MB
         ):
             log(
-                f"WARNING: {part.name} is still "
-                f"larger than Telegram limit"
+                f"WARNING: {part.name} "
+                f"is still larger than "
+                f"Telegram limit"
             )
 
         if not verify_video_file(
@@ -1187,39 +1248,48 @@ WEBRTC_HOOK = r"""
 
         if (track.kind === "video") {
             if (
-                !window.__superliveVideoTracks
-                    .includes(track)
+                !window.__superliveVideoTracks.includes(
+                    track
+                )
             ) {
-                window.__superliveVideoTracks
-                    .push(track);
+                window.__superliveVideoTracks.push(
+                    track
+                );
             }
         }
 
         if (track.kind === "audio") {
             if (
-                !window.__superliveAudioTracks
-                    .includes(track)
+                !window.__superliveAudioTracks.includes(
+                    track
+                )
             ) {
-                window.__superliveAudioTracks
-                    .push(track);
+                window.__superliveAudioTracks.push(
+                    track
+                );
             }
         }
 
         if (stream) {
             if (
-                !window.__superliveStreams
-                    .includes(stream)
+                !window.__superliveStreams.includes(
+                    stream
+                )
             ) {
-                window.__superliveStreams
-                    .push(stream);
+                window.__superliveStreams.push(
+                    stream
+                );
             }
 
             if (
-                !window.__superliveTrackLinks
-                    .has(track)
+                !window.__superliveTrackLinks.has(
+                    track
+                )
             ) {
-                window.__superliveTrackLinks
-                    .set(track, stream);
+                window.__superliveTrackLinks.set(
+                    track,
+                    stream
+                );
             }
         }
     }
@@ -1272,7 +1342,9 @@ WEBRTC_HOOK = r"""
 
     window.__superlivePrepare = () => {
         const videos = Array.from(
-            document.querySelectorAll("video")
+            document.querySelectorAll(
+                "video"
+            )
         );
 
         let selectedVideoTrack = null;
@@ -1316,13 +1388,11 @@ WEBRTC_HOOK = r"""
 
         if (!selectedVideoTrack) {
             selectedVideoTrack =
-                window
-                    .__superliveVideoTracks
-                    .find(
-                        t =>
-                            t.readyState
-                            === "live"
-                    );
+                window.__superliveVideoTracks.find(
+                    t =>
+                        t.readyState
+                        === "live"
+                );
         }
 
         if (!selectedVideoTrack) {
@@ -1346,11 +1416,9 @@ WEBRTC_HOOK = r"""
 
         if (!selectedAudioTrack) {
             const linkedStream =
-                window
-                    .__superliveTrackLinks
-                    .get(
-                        selectedVideoTrack
-                    );
+                window.__superliveTrackLinks.get(
+                    selectedVideoTrack
+                );
 
             if (linkedStream) {
                 selectedAudioTrack =
@@ -1366,13 +1434,11 @@ WEBRTC_HOOK = r"""
 
         if (!selectedAudioTrack) {
             selectedAudioTrack =
-                window
-                    .__superliveAudioTracks
-                    .find(
-                        t =>
-                            t.readyState
-                            === "live"
-                    );
+                window.__superliveAudioTracks.find(
+                    t =>
+                        t.readyState
+                        === "live"
+                );
         }
 
         const tracks = [
@@ -1471,8 +1537,7 @@ WEBRTC_HOOK = r"""
         window.__superliveRecorder =
             recorder;
 
-        window.__superliveChunkCount =
-            0;
+        window.__superliveChunkCount = 0;
 
         window.__superliveLastChunkAt =
             performance.now();
@@ -1487,50 +1552,62 @@ WEBRTC_HOOK = r"""
             false;
 
         /*
-         * IMPORTANT FINAL-CHUNK SYNCHRONIZATION
+         * ----------------------------------------------------
+         * FINAL DATA SYNCHRONIZATION
+         * ----------------------------------------------------
          *
-         * MediaRecorder.stop() is asynchronous.
+         * The previous implementation had a scope bug:
          *
-         * The final dataavailable event may arrive shortly
-         * before or around the stop event, and its processing
-         * is asynchronous because arrayBuffer() is awaited.
+         *     maybeResolveFinalData is not defined
          *
-         * We therefore track:
+         * when __superliveStopRec() was called.
          *
-         *   1. recorderStopFired
-         *   2. pendingDataTasks
-         *
-         * Final readiness is declared only when both conditions
-         * are satisfied.
+         * The finalization state is now stored on window so
+         * the stop function and the recorder event handlers
+         * share exactly the same state.
          */
 
-        let pendingDataTasks = 0;
-        let recorderStopFired = false;
-        let finalDataResolve = null;
+        window.__superlivePendingDataTasks = 0;
+
+        window.__superliveRecorderStopFired =
+            false;
 
         window.__superliveFinalDataReady =
             false;
 
+        window.__superliveFinalDataResolve =
+            null;
+
         window.__superliveFinalDataPromise =
             new Promise((resolve) => {
-                finalDataResolve = resolve;
+                window.__superliveFinalDataResolve =
+                    resolve;
             });
 
-        function maybeResolveFinalData() {
-            if (
-                recorderStopFired &&
-                pendingDataTasks === 0 &&
-                !window.__superliveFinalDataReady
-            ) {
-                window.__superliveFinalDataReady =
-                    true;
+        window.__superliveMaybeResolveFinalData =
+            () => {
+                if (
+                    window.__superliveRecorderStopFired
+                    &&
+                    window.__superlivePendingDataTasks
+                        === 0
+                    &&
+                    !window.__superliveFinalDataReady
+                ) {
+                    window.__superliveFinalDataReady =
+                        true;
 
-                if (finalDataResolve) {
-                    finalDataResolve(true);
-                    finalDataResolve = null;
+                    const resolve =
+                        window.__superliveFinalDataResolve;
+
+                    window.__superliveFinalDataResolve =
+                        null;
+
+                    if (resolve) {
+                        resolve(true);
+                    }
                 }
-            }
-        }
+            };
 
         async function processQueue() {
             if (
@@ -1544,13 +1621,11 @@ WEBRTC_HOOK = r"""
 
             try {
                 while (
-                    window
-                        .__superliveUploadQueue
+                    window.__superliveUploadQueue
                         .length
                 ) {
                     const chunk =
-                        window
-                            .__superliveUploadQueue
+                        window.__superliveUploadQueue
                             .shift();
 
                     try {
@@ -1558,10 +1633,8 @@ WEBRTC_HOOK = r"""
                             await fetch(
                                 "/__slr_chunk",
                                 {
-                                    method:
-                                        "POST",
-                                    body:
-                                        chunk
+                                    method: "POST",
+                                    body: chunk
                                 }
                             );
 
@@ -1579,14 +1652,10 @@ WEBRTC_HOOK = r"""
                         );
 
                         /*
-                         * Put the failed chunk back into the
-                         * queue so a temporary network error
-                         * does not silently destroy recording
-                         * data.
+                         * Reinsert failed chunk at
+                         * the front of the queue.
                          */
-
-                        window
-                            .__superliveUploadQueue
+                        window.__superliveUploadQueue
                             .unshift(chunk);
 
                         break;
@@ -1598,8 +1667,7 @@ WEBRTC_HOOK = r"""
                     false;
 
                 if (
-                    window
-                        .__superliveUploadQueue
+                    window.__superliveUploadQueue
                         .length
                 ) {
                     processQueue();
@@ -1609,11 +1677,13 @@ WEBRTC_HOOK = r"""
 
         recorder.ondataavailable =
             async (event) => {
-                pendingDataTasks++;
+
+                window.__superlivePendingDataTasks++;
 
                 try {
                     if (
-                        !event.data ||
+                        !event.data
+                        ||
                         event.data.size < 1
                     ) {
                         return;
@@ -1630,10 +1700,11 @@ WEBRTC_HOOK = r"""
                     const buffer =
                         await event.data.arrayBuffer();
 
-                    window
-                        .__superliveUploadQueue
+                    window.__superliveUploadQueue
                         .push(
-                            new Uint8Array(buffer)
+                            new Uint8Array(
+                                buffer
+                            )
                         );
 
                 } catch (e) {
@@ -1643,37 +1714,26 @@ WEBRTC_HOOK = r"""
                     );
 
                 } finally {
-                    pendingDataTasks--;
+                    window.__superlivePendingDataTasks--;
 
                     /*
-                     * The final dataavailable buffer is now
-                     * safely inside the upload queue.
-                     *
-                     * This call is intentionally made from
-                     * the same closure where the function is
-                     * defined, eliminating the previous
-                     * ReferenceError.
+                     * Only after the asynchronous
+                     * arrayBuffer() operation has completed
+                     * can final data be considered ready.
                      */
-
-                    maybeResolveFinalData();
+                    window
+                        .__superliveMaybeResolveFinalData();
 
                     processQueue();
                 }
             };
 
         recorder.onstop = () => {
-            recorderStopFired = true;
+            window.__superliveRecorderStopFired =
+                true;
 
-            /*
-             * The dataavailable handler may still be processing
-             * its final ArrayBuffer asynchronously.
-             *
-             * maybeResolveFinalData() will therefore resolve
-             * immediately if everything is complete, or wait
-             * until pendingDataTasks reaches zero.
-             */
-
-            maybeResolveFinalData();
+            window
+                .__superliveMaybeResolveFinalData();
         };
 
         recorder.onerror = (event) => {
@@ -1696,9 +1756,7 @@ WEBRTC_HOOK = r"""
                         (resolve) => {
                             setTimeout(
                                 () =>
-                                    resolve(
-                                        false
-                                    ),
+                                    resolve(false),
                                 timeoutMs
                             );
                         }
@@ -1708,11 +1766,43 @@ WEBRTC_HOOK = r"""
                     await Promise.race([
                         window
                             .__superliveFinalDataPromise,
-
                         timeoutPromise
                     ]);
 
                 return result === true;
+            };
+
+        /*
+         * Stop function is created INSIDE the same
+         * initialization scope and uses window state.
+         *
+         * This completely removes the previous
+         * ReferenceError caused by local variables
+         * being accessed from outside their scope.
+         */
+        window.__superliveStopRec =
+            () => {
+                const activeRecorder =
+                    window.__superliveRecorder;
+
+                if (
+                    activeRecorder
+                    &&
+                    activeRecorder.state
+                        !== "inactive"
+                ) {
+                    activeRecorder.stop();
+                    return true;
+                }
+
+                window
+                    .__superliveRecorderStopFired =
+                    true;
+
+                window
+                    .__superliveMaybeResolveFinalData();
+
+                return false;
             };
 
         recorder.start(timeslice);
@@ -1729,9 +1819,7 @@ WEBRTC_HOOK = r"""
                 performance.now();
 
             while (
-                window
-                    .__superliveChunkCount
-                < 1
+                window.__superliveChunkCount < 1
             ) {
                 if (
                     performance.now()
@@ -1753,90 +1841,77 @@ WEBRTC_HOOK = r"""
             return true;
         };
 
-    window.__superliveGetStatus = () => {
-        const videoTrack =
-            window.__preparedVideoTrack;
-
-        return {
-            queueLength:
-                window
-                    .__superliveUploadQueue
-                    ? window
-                        .__superliveUploadQueue
-                        .length
-                    : 0,
-
-            isUploading:
-                !!window
-                    .__superliveIsUploading,
-
-            chunkCount:
-                window
-                    .__superliveChunkCount
-                || 0,
-
-            idleTimeMs:
-                window
-                    .__superliveLastChunkAt
-                    ? performance.now()
-                    - window
-                        .__superliveLastChunkAt
-                    : Infinity,
-
-            lastChunkSize:
-                window
-                    .__superliveLastChunkSize
-                || 0,
-
-            videoReadyState:
-                videoTrack
-                    ? videoTrack.readyState
-                    : null,
-
-            videoSettings:
-                videoTrack &&
-                videoTrack.getSettings
-                    ? videoTrack.getSettings()
-                    : null,
-
-            recorderState:
-                window
-                    .__superliveRecorder
-                    ? window
-                        .__superliveRecorder
-                        .state
-                    : null,
-
-            finalDataReady:
-                !!window
-                    .__superliveFinalDataReady
-        };
-    };
-
-    window.__superliveStopRec =
+    window.__superliveGetStatus =
         () => {
-            const recorder =
-                window
-                    .__superliveRecorder;
+            const videoTrack =
+                window.__preparedVideoTrack;
 
-            if (
-                recorder &&
-                recorder.state !== "inactive"
-            ) {
-                recorder.stop();
+            return {
+                queueLength:
+                    window
+                        .__superliveUploadQueue
+                        ?
+                        window
+                            .__superliveUploadQueue
+                            .length
+                        :
+                        0,
 
-            } else {
-                /*
-                 * If the recorder is already inactive,
-                 * there will be no future onstop event.
-                 * Mark the stop state here and allow the
-                 * final-data resolver to complete.
-                 */
+                isUploading:
+                    !!window
+                        .__superliveIsUploading,
 
-                recorderStopFired = true;
+                chunkCount:
+                    window
+                        .__superliveChunkCount
+                    || 0,
 
-                maybeResolveFinalData();
-            }
+                idleTimeMs:
+                    window
+                        .__superliveLastChunkAt
+                        ?
+                        performance.now()
+                        -
+                        window
+                            .__superliveLastChunkAt
+                        :
+                        Infinity,
+
+                lastChunkSize:
+                    window
+                        .__superliveLastChunkSize
+                    || 0,
+
+                videoReadyState:
+                    videoTrack
+                        ?
+                        videoTrack.readyState
+                        :
+                        null,
+
+                videoSettings:
+                    videoTrack
+                    &&
+                    videoTrack.getSettings
+                    ?
+                    videoTrack.getSettings()
+                    :
+                    null,
+
+                recorderState:
+                    window
+                        .__superliveRecorder
+                        ?
+                        window
+                            .__superliveRecorder
+                            .state
+                        :
+                        null,
+
+                finalDataReady:
+                    !!window
+                        .__superliveFinalDataReady
+            };
         };
 })();
 """
@@ -1980,7 +2055,8 @@ async def run_recording(playwright):
         )
 
         log(
-            "Page loaded. Waiting for live video..."
+            "Page loaded. "
+            "Waiting for live video..."
         )
 
         # ----------------------------------------------------
@@ -1989,7 +2065,9 @@ async def run_recording(playwright):
 
         video_ready = False
 
-        wait_started = time.monotonic()
+        wait_started = (
+            time.monotonic()
+        )
 
         while (
             time.monotonic()
@@ -2002,15 +2080,10 @@ async def run_recording(playwright):
                     () => {
                         const videos =
                             Array.from(
-                                document.querySelectorAll(
-                                    "video"
-                                )
+                                document.querySelectorAll("video")
                             );
 
-                        for (
-                            const video
-                            of videos
-                        ) {
+                        for (const video of videos) {
                             try {
                                 const stream =
                                     video.srcObject;
@@ -2020,12 +2093,10 @@ async def run_recording(playwright):
                                 }
 
                                 const videoTracks =
-                                    stream
-                                        .getVideoTracks();
+                                    stream.getVideoTracks();
 
                                 const audioTracks =
-                                    stream
-                                        .getAudioTracks();
+                                    stream.getAudioTracks();
 
                                 const liveVideo =
                                     videoTracks.some(
@@ -2056,7 +2127,6 @@ async def run_recording(playwright):
                                             liveAudio
                                     };
                                 }
-
                             } catch (e) {}
                         }
 
@@ -2117,9 +2187,7 @@ async def run_recording(playwright):
 
         start_result = await page.evaluate(
             """
-            ([videoBitrate,
-              audioBitrate,
-              timeslice]) =>
+            ([videoBitrate, audioBitrate, timeslice]) =>
                 window.__superliveStartRec(
                     videoBitrate,
                     audioBitrate,
@@ -2292,11 +2360,16 @@ async def run_recording(playwright):
         )
 
         try:
-            await page.evaluate(
+            stop_result = await page.evaluate(
                 """
                 () =>
                     window.__superliveStopRec()
                 """
+            )
+
+            log(
+                "MediaRecorder stop requested: "
+                f"{stop_result}"
             )
 
         except Exception as e:
@@ -2320,17 +2393,16 @@ async def run_recording(playwright):
                 await page.evaluate(
                     """
                     () =>
-                        window
-                            .__superliveWaitRecorderFinal(
-                                15000
-                            )
+                        window.__superliveWaitRecorderFinal(
+                            15000
+                        )
                     """
                 )
             )
 
         except Exception as e:
             log(
-                f"Final MediaRecorder wait error: "
+                "Final MediaRecorder wait error: "
                 f"{e}"
             )
 
@@ -2405,20 +2477,20 @@ async def run_recording(playwright):
             except Exception:
                 pass
 
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(
+                0.2
+            )
 
         # ----------------------------------------------------
         # Final status before closing WebM
         # ----------------------------------------------------
 
         try:
-            final_status = (
-                await page.evaluate(
-                    """
-                    () =>
-                        window.__superliveGetStatus()
-                    """
-                )
+            final_status = await page.evaluate(
+                """
+                () =>
+                    window.__superliveGetStatus()
+                """
             )
 
             log(
@@ -2443,7 +2515,12 @@ async def run_recording(playwright):
             handle_chunk,
         )
 
+        # ----------------------------------------------------
+        # Close WebM safely
+        # ----------------------------------------------------
+
         webm_file.flush()
+
         os.fsync(
             webm_file.fileno()
         )
@@ -2620,7 +2697,7 @@ async def run_recording(playwright):
 async def main():
     log_section(
         "SUPERLIVE RECORDER "
-        "(VFR TIMESTAMP-PRESERVING MP4 CONVERSION)"
+        "(STABLE TIMESTAMP MP4 CONVERSION)"
     )
 
     from playwright.async_api import (
