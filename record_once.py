@@ -883,11 +883,18 @@ def convert_webm_to_mp4(
         # ----------------------------------------------------
         # INPUT
         #
+        # Preserve the timestamps that are already present in
+        # the MediaRecorder WebM.
+        #
         # Do not use +genpts.
         #
-        # We want FFmpeg to consume the timestamps actually
-        # present in the MediaRecorder WebM.
+        # start_at_zero shifts the preserved timeline so that
+        # the resulting MP4 starts at zero without rebuilding
+        # the frame cadence.
         # ----------------------------------------------------
+
+        "-copyts",
+        "-start_at_zero",
 
         "-i",
         str(webm_path),
@@ -909,11 +916,10 @@ def convert_webm_to_mp4(
         "-vf",
         "pad=width=ceil(iw/2)*2:"
         "height=ceil(ih/2)*2:"
-        "color=black,"
-        "setpts=PTS-STARTPTS",
+        "color=black",
 
         "-fps_mode:v",
-        "vfr",
+        "passthrough",
 
         "-c:v",
         "libx264",
