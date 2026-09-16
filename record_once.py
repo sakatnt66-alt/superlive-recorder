@@ -2743,17 +2743,6 @@ async def run_recording(playwright):
                         f"{upload_error}"
                     )
 
-                /*
-                if (
-                    queue_length == 0
-                    and not uploading
-                    and pending_tasks == 0
-                    and uploaded_chunks == recorder_chunks
-                    and recorder_chunks > 0
-                ):
-                    break
-                */
-
                 if (
                     queue_length == 0
                     and not uploading
