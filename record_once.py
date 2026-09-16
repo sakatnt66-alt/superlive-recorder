@@ -1,616 +1,246 @@
-#!/usr/bin/env python3
-
 import asyncio
+import json
 import os
 import subprocess
 import sys
 import time
-import json
-import urllib.request
 import urllib.error
+import urllib.request
 from pathlib import Path
 
 
 # ============================================================
-# TELEGRAM UPLOAD SETTINGS
+# TELEGRAM
 # ============================================================
 
 TELEGRAM_MAX_SIZE_MB = 44.9
-TELEGRAM_TARGET_SIZE_MB = 42
+TELEGRAM_TARGET_SIZE_MB = 42.0
+
+UPLOAD_MAX_RETRIES = 3
+UPLOAD_RETRY_DELAY_SECONDS = 5
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
 # ============================================================
-# IMPROVEMENT SETTINGS
+# WORKER / KV
 # ============================================================
 
-UPLOAD_MAX_RETRIES = 3
-UPLOAD_RETRY_DELAY_SECONDS = 5
+WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
 
-
-# ============================================================
-# WORKER API SETTINGS
-# ============================================================
-
-WORKER_URL = os.environ.get("WORKER_URL", "")
-
-
-# ============================================================
-# CLOUDFLARE KV STATE MANAGEMENT
-# ============================================================
 
 def kv_get_state(stream_id):
-    if not stream_id or not WORKER_URL:
+    if not WORKER_URL or not stream_id:
         return None
 
-    try:
-        url = f"{WORKER_URL.rstrip('/')}/api/check-stop/{stream_id}"
-
-        req = urllib.request.Request(url)
-        req.add_header("User-Agent", "SuperLive-Recorder-Python")
-
-        with urllib.request.urlopen(req, timeout=5) as response:
-            return json.loads(response.read().decode())
-
-    except Exception:
-        return None
-
-
-def kv_delete_state(stream_id):
-    if not stream_id or not WORKER_URL:
-        return False
-
-    url = f"{WORKER_URL.rstrip('/')}/api/delete-recording/{stream_id}"
-
-    try:
-        req = urllib.request.Request(url, method="DELETE")
-        req.add_header("User-Agent", "SuperLive-Recorder-Python")
-
-        with urllib.request.urlopen(req, timeout=10) as response:
-            result = json.loads(response.read().decode())
-            return result.get("success", False)
-
-    except Exception:
-        return False
-
-
-def kv_update_state(
-    stream_id,
-    status,
-    file_size_mb=0,
-    error=None,
-    telegram_sent=False
-):
-    if not stream_id or not WORKER_URL:
-        return False
-
-    url = f"{WORKER_URL.rstrip('/')}/api/update-state/{stream_id}"
-
-    state = kv_get_state(stream_id) or {}
-
-    state["status"] = status
-
-    if file_size_mb > 0:
-        state["file_size_mb"] = file_size_mb
-
-    if error:
-        state["error"] = error
-
-    state["telegram_sent"] = telegram_sent
-    state["updated_at"] = time.strftime(
-        "%Y-%m-%dT%H:%M:%SZ",
-        time.gmtime()
-    )
+    url = f"{WORKER_URL}/api/check-stop/{stream_id}"
 
     try:
         req = urllib.request.Request(
             url,
-            method="POST",
-            data=json.dumps(state).encode()
+            method="GET",
+            headers={"User-Agent": "SuperLiveRecorder/1.0"},
         )
 
-        req.add_header("Content-Type", "application/json")
-        req.add_header("User-Agent", "SuperLive-Recorder-Python")
+        with urllib.request.urlopen(req, timeout=15) as response:
+            raw = response.read().decode("utf-8", errors="replace")
 
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return json.loads(
-                response.read().decode()
-            ).get("success", False)
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw
 
-    except Exception:
+    except Exception as e:
+        log(f"KV GET error: {e}")
+        return None
+
+
+def kv_delete_state(stream_id):
+    if not WORKER_URL or not stream_id:
+        return False
+
+    url = f"{WORKER_URL}/api/delete-recording/{stream_id}"
+
+    try:
+        req = urllib.request.Request(
+            url,
+            method="DELETE",
+            headers={"User-Agent": "SuperLiveRecorder/1.0"},
+        )
+
+        with urllib.request.urlopen(req, timeout=15) as response:
+            response.read()
+
+        return True
+
+    except Exception as e:
+        log(f"KV DELETE error: {e}")
+        return False
+
+
+def kv_update_state(stream_id, state, **extra):
+    if not WORKER_URL or not stream_id:
+        return False
+
+    url = f"{WORKER_URL}/api/update-state/{stream_id}"
+
+    payload = {
+        "state": state,
+        **extra,
+    }
+
+    try:
+        data = json.dumps(payload).encode("utf-8")
+
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "SuperLiveRecorder/1.0",
+            },
+        )
+
+        with urllib.request.urlopen(req, timeout=15) as response:
+            response.read()
+
+        return True
+
+    except Exception as e:
+        log(f"KV UPDATE error: {e}")
         return False
 
 
 def check_stop_requested(stream_id):
-    data = kv_get_state(stream_id)
+    state = kv_get_state(stream_id)
 
-    if data and data.get("should_stop"):
-        return True
+    if state is None:
+        return False
+
+    if isinstance(state, dict):
+        for key in (
+            "stop",
+            "stopRequested",
+            "stop_requested",
+            "shouldStop",
+            "should_stop",
+        ):
+            value = state.get(key)
+
+            if value is True:
+                return True
+
+            if isinstance(value, str) and value.lower() in (
+                "true",
+                "1",
+                "yes",
+                "stop",
+            ):
+                return True
+
+    elif isinstance(state, str):
+        value = state.lower()
+
+        if value in ("true", "1", "stop", "stopped"):
+            return True
 
     return False
 
 
 # ============================================================
-# TELEGRAM NOTIFICATIONS
+# TELEGRAM NOTIFICATION
 # ============================================================
 
 def send_telegram_notification(text):
-    """
-    Send a simple text notification to Telegram.
-
-    Silently fails if credentials are missing or request fails.
-    """
-
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+        return False
 
     url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
-    try:
-        data = json.dumps({
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML"
-        }).encode()
-
-        req = urllib.request.Request(url, data=data)
-        req.add_header("Content-Type", "application/json")
-
-        urllib.request.urlopen(req, timeout=30)
-
-    except Exception as e:
-        log(
-            f"[NOTIFY] Could not send notification: "
-            f"{type(e).__name__}: {e}"
-        )
-
-
-# ============================================================
-# VIDEO FILE VERIFICATION
-# ============================================================
-
-def verify_video_file(file_path):
-    """
-    Verify video file is valid before upload using ffprobe.
-    """
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+    }
 
     try:
-        cmd = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration,size",
-            "-of",
-            "json",
-            str(file_path)
-        ]
+        data = json.dumps(payload).encode("utf-8")
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "SuperLiveRecorder/1.0",
+            },
         )
 
-        if result.returncode != 0:
-            log(
-                f"[VERIFY] ✗ {file_path.name}: "
-                f"ffprobe failed"
-            )
-            return False
-
-        data = json.loads(result.stdout)
-
-        if "format" not in data:
-            log(
-                f"[VERIFY] ✗ {file_path.name}: "
-                f"no format info"
-            )
-            return False
-
-        duration = float(
-            data["format"].get("duration", 0)
-        )
-
-        size = int(
-            data["format"].get("size", 0)
-        )
-
-        if duration < 1:
-            log(
-                f"[VERIFY] ✗ {file_path.name}: "
-                f"duration too short ({duration:.2f}s)"
-            )
-            return False
-
-        if size < 10000:
-            log(
-                f"[VERIFY] ✗ {file_path.name}: "
-                f"file too small ({size} bytes)"
-            )
-            return False
-
-        log(
-            f"[VERIFY] ✓ {file_path.name}: "
-            f"valid ({duration:.1f}s, "
-            f"{size / 1024 / 1024:.2f} MB)"
-        )
+        with urllib.request.urlopen(req, timeout=20) as response:
+            response.read()
 
         return True
 
     except Exception as e:
-        log(
-            f"[VERIFY] ✗ {file_path.name}: "
-            f"{type(e).__name__}: {e}"
-        )
+        log(f"Telegram notification error: {e}")
         return False
 
 
 # ============================================================
-# VIDEO INFO HELPER
+# LOGGING
 # ============================================================
 
-def get_video_info(file_path):
-    try:
-        cmd = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height,duration",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "json",
-            str(file_path)
-        ]
+def log(message):
+    print(
+        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+        f"{message}",
+        flush=True,
+    )
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
 
-        data = json.loads(result.stdout)
-
-        width = 1920
-        height = 1080
-        duration = 60
-
-        if "streams" in data and len(data["streams"]) > 0:
-            stream = data["streams"][0]
-
-            width = stream.get("width", 1920)
-            height = stream.get("height", 1080)
-
-            if "duration" in stream:
-                duration = int(
-                    float(stream["duration"])
-                )
-
-        if "format" in data and "duration" in data["format"]:
-            duration = int(
-                float(data["format"]["duration"])
-            )
-
-        return {
-            "width": width,
-            "height": height,
-            "duration": duration
-        }
-
-    except Exception as e:
-        log(
-            f"[PROBE] Could not get video info: {e}"
-        )
-
-        return {
-            "width": 1920,
-            "height": 1080,
-            "duration": 60
-        }
+def log_section(title):
+    print()
+    print("=" * 70, flush=True)
+    print(title, flush=True)
+    print("=" * 70, flush=True)
 
 
 # ============================================================
-# TELEGRAM UPLOAD
+# CONFIG
 # ============================================================
 
-def send_to_telegram(
-    file_path,
-    stream_id,
-    part_number,
-    total_parts
-):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
+URL = os.environ.get("RECORD_URL", "")
 
-    file_size_mb = (
-        file_path.stat().st_size /
-        (1024 * 1024)
-    )
-
-    if file_size_mb > TELEGRAM_MAX_SIZE_MB:
-        log(
-            f"[TG] ✗ File too large: "
-            f"{file_size_mb:.2f} MB"
-        )
-        return False
-
-    video_info = get_video_info(file_path)
-
-    caption = (
-        f"📺 <b>البث:</b> "
-        f"<code>{stream_id}</code>\n"
-        f"📦 <b>الجزء:</b> "
-        f"{part_number}/{total_parts}\n"
-        f"📊 <b>الحجم:</b> "
-        f"{file_size_mb:.2f} MB\n"
-        f"⏱️ <b>المدة:</b> "
-        f"{video_info['duration']} ثانية"
-    )
-
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/sendVideo"
-    )
-
-    boundary = (
-        f"----PythonBoundary"
-        f"{int(time.time() * 1000000)}"
-    )
-
-    body_parts = []
-
-    def add_field(name, value):
-        body_parts.append(
-            f"--{boundary}\r\n".encode()
-        )
-
-        body_parts.append(
-            (
-                f'Content-Disposition: '
-                f'form-data; name="{name}"'
-                f'\r\n\r\n'
-            ).encode()
-        )
-
-        body_parts.append(
-            str(value).encode("utf-8")
-        )
-
-        body_parts.append(b"\r\n")
-
-    add_field("chat_id", TELEGRAM_CHAT_ID)
-    add_field("caption", caption)
-    add_field("parse_mode", "HTML")
-    add_field("supports_streaming", "true")
-    add_field(
-        "duration",
-        video_info["duration"]
-    )
-    add_field(
-        "width",
-        video_info["width"]
-    )
-    add_field(
-        "height",
-        video_info["height"]
-    )
-
-    body_parts.append(
-        f"--{boundary}\r\n".encode()
-    )
-
-    body_parts.append(
-        (
-            f'Content-Disposition: form-data; '
-            f'name="video"; '
-            f'filename="{file_path.name}"'
-            f"\r\n"
-        ).encode()
-    )
-
-    body_parts.append(
-        b"Content-Type: video/mp4\r\n\r\n"
-    )
-
-    with open(file_path, "rb") as f:
-        file_data = f.read()
-
-    body_parts.append(file_data)
-
-    body_parts.append(
-        f"\r\n--{boundary}--\r\n".encode()
-    )
-
-    body = b"".join(body_parts)
-
-    req = urllib.request.Request(
-        url,
-        data=body,
-        method="POST"
-    )
-
-    req.add_header(
-        "Content-Type",
-        f"multipart/form-data; boundary={boundary}"
-    )
-
-    try:
-        with urllib.request.urlopen(
-            req,
-            timeout=600
-        ) as response:
-
-            result = json.loads(
-                response.read().decode()
-            )
-
-            if result.get("ok"):
-                log(
-                    f"[TG] ✓ {file_path.name} "
-                    f"({file_size_mb:.2f} MB) "
-                    f"[{video_info['duration']}s] "
-                    f"[STREAMING]"
-                )
-
-                return True
-
-            log(
-                f"[TG] ✗ API error: {result}"
-            )
-
-            return False
-
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode(
-            "utf-8",
-            errors="replace"
-        )
-
-        log(
-            f"[TG] ✗ HTTP {e.code}: "
-            f"{error_body[:500]}"
-        )
-
-        return False
-
-    except Exception as e:
-        log(
-            f"[TG] ✗ Error: "
-            f"{type(e).__name__}: {e}"
-        )
-
-        return False
-
-
-# ============================================================
-# UPLOAD WITH RETRY
-# ============================================================
-
-def send_to_telegram_with_retry(
-    file_path,
-    stream_id,
-    part_number,
-    total_parts
-):
-    """
-    Wrapper around send_to_telegram with automatic retry logic.
-    """
-
-    for attempt in range(
-        1,
-        UPLOAD_MAX_RETRIES + 1
-    ):
-        if attempt > 1:
-            log(
-                f"[TG] Retry attempt "
-                f"{attempt}/{UPLOAD_MAX_RETRIES} "
-                f"for {file_path.name}"
-            )
-
-        if send_to_telegram(
-            file_path,
-            stream_id,
-            part_number,
-            total_parts
-        ):
-            return True
-
-        if attempt < UPLOAD_MAX_RETRIES:
-            log(
-                f"[TG] Upload failed, retrying "
-                f"in {UPLOAD_RETRY_DELAY_SECONDS}s..."
-            )
-
-            time.sleep(
-                UPLOAD_RETRY_DELAY_SECONDS
-            )
-
-    log(
-        f"[TG] ✗ Failed after "
-        f"{UPLOAD_MAX_RETRIES} attempts: "
-        f"{file_path.name}"
-    )
-
-    return False
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-URL = os.environ.get(
-    "RECORD_URL",
-    "https://superlivetv.com/fr/livestream/150596097"
+RECORDING_DIR = Path(
+    os.environ.get("RECORDING_DIR", "recordings")
 )
-
-RECORDINGS_DIR = Path(
-    os.environ.get(
-        "RECORDINGS_DIR",
-        "recordings"
-    )
-).resolve()
 
 TEMP_DIR = Path(
-    os.environ.get(
-        "TEMP_DIR",
-        str(RECORDINGS_DIR / "_temp")
-    )
-).resolve()
-
-VIDEO_BITRATE = int(
-    os.environ.get(
-        "VIDEO_BITRATE",
-        "8000000"
-    )
+    os.environ.get("TEMP_DIR", "tmp_recordings")
 )
 
-AUDIO_BITRATE = int(
-    os.environ.get(
-        "AUDIO_BITRATE",
-        "192000"
-    )
-)
+RECORDING_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-VIDEO_WAIT_SECONDS = int(
-    os.environ.get(
-        "VIDEO_WAIT_SECONDS",
-        "60"
-    )
-)
+VIDEO_BITRATE = 8_000_000
+AUDIO_BITRATE = 192_000
 
-PAGE_TIMEOUT_MS = int(
-    os.environ.get(
-        "PAGE_TIMEOUT_MS",
-        "30000"
-    )
-)
+VIDEO_WAIT_SECONDS = 60
+PAGE_TIMEOUT_MS = 30_000
+FIRST_CHUNK_TIMEOUT_SECONDS = 10
 
-FIRST_CHUNK_TIMEOUT_SECONDS = int(
-    os.environ.get(
-        "FIRST_CHUNK_TIMEOUT_SECONDS",
-        "10"
-    )
-)
-
-STREAM_ID = os.environ.get(
-    "STREAM_ID",
-    ""
-)
+STREAM_ID = os.environ.get("STREAM_ID", "")
 
 STOP_CHECK_INTERVAL = 3
 STREAM_IDLE_TIMEOUT = 20
+
 MIN_CHUNK_SIZE = 500
+
 MAX_RECORDING_SECONDS = 6 * 3600
 
 GLOBAL_WATCHDOG_SECONDS = (
@@ -619,605 +249,471 @@ GLOBAL_WATCHDOG_SECONDS = (
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) "
-    "AppleWebKit/537.36 "
-    "(KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
 )
 
 
 # ============================================================
-# LOGGING
+# VIDEO HELPERS
 # ============================================================
 
-def log(msg=""):
-    try:
-        print(msg, flush=True)
-    except Exception:
-        pass
+def run_command(command, timeout=None):
+    log("Running command:")
+    log(" ".join(str(x) for x in command))
 
-
-def log_section(t):
-    log(
-        "\n"
-        + "=" * 70
-        + f"\n{t}\n"
-        + "=" * 70
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
     )
 
+    if result.stdout:
+        log(result.stdout.strip())
+
+    if result.stderr:
+        log(result.stderr.strip())
+
+    return result
+
+
+def verify_video_file(path):
+    path = Path(path)
+
+    if not path.exists():
+        log(f"Video verification failed: file does not exist: {path}")
+        return False
+
+    size = path.stat().st_size
+
+    if size <= 10 * 1024:
+        log(
+            f"Video verification failed: file too small "
+            f"({size} bytes)"
+        )
+        return False
+
+    command = [
+        "ffprobe",
+        "-hide_banner",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=format_name,duration,size",
+        "-show_entries",
+        "stream=index,codec_type,codec_name,width,height,"
+        "r_frame_rate,avg_frame_rate,time_base,start_time,duration",
+        "-of",
+        "json",
+        str(path),
+    ]
 
-# ============================================================
-# WEBRTC HOOK
-# ============================================================
-
-WEBRTC_HOOK = r"""
-(() => {
-    if (window.__superlive_hook_installed) return;
-
-    window.__superlive_hook_installed = true;
-    window.__superlive_audio_tracks = [];
-    window.__superlive_video_tracks = [];
-    window.__superlive_track_links = [];
-    window.__superlive_streams = [];
-
-    let recorder = null;
-    let recorderError = null;
-    let isRecording = false;
-    let chunkCount = 0;
-
-    let lastChunkTime = Date.now();
-    let lastChunkSize = 0;
-
-    let uploadQueue = [];
-    let isUploading = false;
-    let uploadErrors = 0;
-
-
-    async function processQueue() {
-        if (isUploading) return;
-
-        isUploading = true;
-
-        while (uploadQueue.length > 0) {
-            const buffer = uploadQueue.shift();
-
-            try {
-                const resp = await fetch(
-                    "/__slr_chunk",
-                    {
-                        method: "POST",
-                        body: buffer,
-                        headers: {
-                            "Content-Type":
-                                "application/octet-stream"
-                        }
-                    }
-                );
-
-                if (!resp.ok) {
-                    uploadErrors++;
-                }
-
-            } catch (err) {
-                uploadErrors++;
-            }
-        }
-
-        isUploading = false;
-    }
-
-
-    function addUnique(arr, value) {
-        if (value && !arr.includes(value)) {
-            arr.push(value);
-        }
-    }
-
-
-    function rememberStream(stream) {
-        if (!stream) return;
-
-        try {
-            addUnique(
-                window.__superlive_streams,
-                stream
-            );
-
-            for (const t of stream.getTracks()) {
-                rememberTrack(t, stream);
-            }
-
-        } catch (_) {}
-    }
-
-
-    function rememberTrack(
-        track,
-        stream = null
-    ) {
-        if (!track) return;
-
-        try {
-            if (track.kind === "audio") {
-                addUnique(
-                    window.__superlive_audio_tracks,
-                    track
-                );
-            }
-
-            if (track.kind === "video") {
-                addUnique(
-                    window.__superlive_video_tracks,
-                    track
-                );
-            }
-
-            if (stream) {
-                const existing =
-                    window.__superlive_track_links.find(
-                        x => x.track === track
-                    );
-
-                if (existing) {
-                    addUnique(
-                        existing.streams,
-                        stream
-                    );
-                } else {
-                    window.__superlive_track_links.push({
-                        track: track,
-                        streams: [stream]
-                    });
-                }
-            }
-
-        } catch (_) {}
-    }
-
-
-    const OriginalPC =
-        window.RTCPeerConnection ||
-        window.webkitRTCPeerConnection;
-
-
-    if (OriginalPC) {
-        const WrappedPC = function(...args) {
-            const pc =
-                new OriginalPC(...args);
-
-            try {
-                pc.addEventListener(
-                    "track",
-                    (e) => {
-                        if (e.track) {
-                            rememberTrack(e.track);
-                        }
-
-                        if (e.streams) {
-                            for (const s of e.streams) {
-                                rememberStream(s);
-                            }
-                        }
-
-                        if (
-                            e.receiver &&
-                            e.receiver.track
-                        ) {
-                            rememberTrack(
-                                e.receiver.track
-                            );
-                        }
-                    }
-                );
-            } catch (_) {}
-
-            return pc;
-        };
-
-        WrappedPC.prototype =
-            OriginalPC.prototype;
-
-        Object.setPrototypeOf(
-            WrappedPC,
-            OriginalPC
-        );
-
-        window.RTCPeerConnection =
-            WrappedPC;
-
-        if (window.webkitRTCPeerConnection) {
-            window.webkitRTCPeerConnection =
-                WrappedPC;
-        }
-    }
-
-
-    window.__superlivePrepare = () => {
-        const videos =
-            Array.from(
-                document.querySelectorAll("video")
-            );
-
-        let video = videos.find(
-            v =>
-                v.srcObject &&
-                v.readyState >= 2 &&
-                v.videoWidth > 0
-        );
-
-        if (!video) {
-            video = videos.find(
-                v => v.srcObject
-            ) || null;
-        }
-
-        if (!video) {
-            throw new Error(
-                "No video element found."
-            );
-        }
-
-
-        const sourceStream =
-            video.srcObject;
-
-
-        let videoTrack =
-            sourceStream
-                ? sourceStream
-                    .getVideoTracks()
-                    .find(
-                        t =>
-                            t.readyState === "live"
-                    )
-                : null;
-
-
-        if (!videoTrack) {
-            videoTrack =
-                (
-                    window.__superlive_video_tracks ||
-                    []
-                ).find(
-                    t =>
-                        t.readyState === "live"
-                );
-        }
-
-
-        if (!videoTrack) {
-            throw new Error(
-                "No live video track."
-            );
-        }
-
-
-        let audioTrack =
-            sourceStream
-                ? sourceStream
-                    .getAudioTracks()
-                    .find(
-                        t =>
-                            t.readyState === "live"
-                    )
-                : null;
-
-
-        if (!audioTrack) {
-            const links =
-                window.__superlive_track_links ||
-                [];
-
-            const linked =
-                links.filter(
-                    l =>
-                        l.track &&
-                        l.track.kind === "audio" &&
-                        l.streams &&
-                        l.streams.some(
-                            s =>
-                                s.getVideoTracks()
-                                    .some(
-                                        v =>
-                                            v === videoTrack ||
-                                            v.id === videoTrack.id
-                                    )
-                        )
-                );
-
-            audioTrack =
-                linked.find(
-                    l =>
-                        !l.track.muted
-                )?.track ||
-                linked[0]?.track ||
-                null;
-        }
-
-
-        if (!audioTrack) {
-            const liveAudios =
-                (
-                    window.__superlive_audio_tracks ||
-                    []
-                ).filter(
-                    t =>
-                        t.readyState === "live"
-                );
-
-            audioTrack =
-                liveAudios.find(
-                    t =>
-                        !t.muted
-                ) ||
-                liveAudios[0] ||
-                null;
-        }
-
-
-        if (!audioTrack) {
-            throw new Error(
-                "No live audio track found."
-            );
-        }
-
-
-        window.__preparedStream =
-            new MediaStream([
-                videoTrack,
-                audioTrack
-            ]);
-
-
-        return {
-            video: videoTrack.id,
-            audio: audioTrack.id
-        };
-    };
-
-
-    window.__superliveStartRec = (
-        vb,
-        ab,
-        ts
-    ) => {
-        let mimeType =
-            "video/webm;codecs=vp9,opus";
-
-
-        if (
-            !MediaRecorder.isTypeSupported(
-                mimeType
-            )
-        ) {
-            mimeType =
-                "video/webm;codecs=vp8,opus";
-
-            if (
-                !MediaRecorder.isTypeSupported(
-                    mimeType
-                )
-            ) {
-                mimeType = "video/webm";
-            }
-        }
-
-
-        recorder = new MediaRecorder(
-            window.__preparedStream,
-            {
-                mimeType: mimeType,
-                videoBitsPerSecond: vb,
-                audioBitsPerSecond: ab
-            }
-        );
-
-
-        isRecording = true;
-
-
-        recorder.ondataavailable = (e) => {
-            if (
-                e.data.size > 0 &&
-                isRecording
-            ) {
-                chunkCount++;
-
-                lastChunkSize =
-                    e.data.size;
-
-                lastChunkTime =
-                    Date.now();
-
-
-                if (chunkCount % 10 === 0) {
-                    console.log(
-                        `[JS] Chunk #${chunkCount} | ` +
-                        `size: ${e.data.size} bytes`
-                    );
-                }
-
-
-                e.data.arrayBuffer()
-                    .then(buf => {
-                        uploadQueue.push(buf);
-                        processQueue();
-                    });
-            }
-        };
-
-
-        recorder.onerror = (e) => {
-            recorderError =
-                e.error
-                    ? String(e.error)
-                    : "Error";
-        };
-
-
-        recorder.start(ts);
-
-
-        return {
-            state: recorder.state,
-            mimeType: mimeType
-        };
-    };
-
-
-    window.__superliveWaitChunk =
-        async (ms) => {
-            const s = Date.now();
-
-            while (
-                Date.now() - s < ms
-            ) {
-                if (chunkCount > 0) {
-                    return {
-                        ok: true
-                    };
-                }
-
-                await new Promise(
-                    r =>
-                        setTimeout(r, 200)
-                );
-            }
-
-            return {
-                ok: false,
-                error:
-                    recorderError ||
-                    "Timeout"
-            };
-        };
-
-
-    window.__superliveGetStatus = () => {
-        const v =
-            document.querySelector("video");
-
-        let videoTrackState =
-            "no_video";
-
-
-        if (v && v.srcObject) {
-            const vTracks =
-                v.srcObject.getVideoTracks();
-
-            videoTrackState =
-                vTracks.length > 0
-                    ? vTracks[0].readyState
-                    : "no_track";
-        }
-
-
-        return {
-            queueLength:
-                uploadQueue.length,
-
-            isUploading:
-                isUploading,
-
-            chunkCount:
-                chunkCount,
-
-            idleTimeMs:
-                Date.now() - lastChunkTime,
-
-            lastChunkSize:
-                lastChunkSize,
-
-            videoReadyState:
-                v
-                    ? v.readyState
-                    : 0,
-
-            videoTrackState:
-                videoTrackState
-        };
-    };
-
-
-    window.__superliveStopRec = () => {
-        isRecording = false;
-
-        if (
-            recorder &&
-            recorder.state !== "inactive"
-        ) {
-            recorder.stop();
-        }
-    };
-
-})();
-"""
-
-
-# ============================================================
-# PYTHON HELPERS
-# ============================================================
-
-async def safe_eval(
-    page,
-    expr,
-    arg=None,
-    timeout=15
-):
     try:
-        if arg is not None:
-            return await asyncio.wait_for(
-                page.evaluate(expr, arg),
-                timeout=timeout
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+
+        if result.returncode != 0:
+            log(
+                "ffprobe verification failed: "
+                + result.stderr.strip()
+            )
+            return False
+
+        info = json.loads(result.stdout)
+
+        fmt = info.get("format", {})
+        streams = info.get("streams", [])
+
+        duration = float(fmt.get("duration") or 0)
+
+        if duration <= 1:
+            log(
+                f"Video verification failed: "
+                f"duration={duration}"
+            )
+            return False
+
+        has_video = any(
+            s.get("codec_type") == "video"
+            for s in streams
+        )
+
+        if not has_video:
+            log("Video verification failed: no video stream")
+            return False
+
+        log(
+            f"Verified video: "
+            f"{size / 1024 / 1024:.2f} MB, "
+            f"duration={duration:.3f}s"
+        )
+
+        return True
+
+    except Exception as e:
+        log(f"Video verification exception: {e}")
+        return False
+
+
+def get_video_info(path):
+    command = [
+        "ffprobe",
+        "-hide_banner",
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=index,codec_type,codec_name,width,height,"
+        "r_frame_rate,avg_frame_rate,time_base,start_time,duration",
+        "-show_entries",
+        "format=format_name,duration,size",
+        "-of",
+        "json",
+        str(path),
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+
+        if result.returncode != 0:
+            log(
+                "ffprobe failed: "
+                + result.stderr.strip()
+            )
+            return None
+
+        return json.loads(result.stdout)
+
+    except Exception as e:
+        log(f"get_video_info error: {e}")
+        return None
+
+
+def get_duration(info):
+    if not info:
+        return 0.0
+
+    try:
+        return float(
+            info.get("format", {}).get("duration") or 0
+        )
+    except Exception:
+        return 0.0
+
+
+def log_video_info(label, path):
+    info = get_video_info(path)
+
+    if not info:
+        log(f"{label}: ffprobe information unavailable")
+        return None
+
+    fmt = info.get("format", {})
+
+    log(
+        f"{label}: "
+        f"format={fmt.get('format_name')} "
+        f"duration={fmt.get('duration')} "
+        f"size={fmt.get('size')}"
+    )
+
+    for stream in info.get("streams", []):
+        if stream.get("codec_type") == "video":
+            log(
+                f"{label} video: "
+                f"codec={stream.get('codec_name')} "
+                f"resolution="
+                f"{stream.get('width')}x{stream.get('height')} "
+                f"r_frame_rate={stream.get('r_frame_rate')} "
+                f"avg_frame_rate={stream.get('avg_frame_rate')} "
+                f"time_base={stream.get('time_base')} "
+                f"start_time={stream.get('start_time')} "
+                f"duration={stream.get('duration')}"
             )
 
-        return await asyncio.wait_for(
-            page.evaluate(expr),
-            timeout=timeout
+        elif stream.get("codec_type") == "audio":
+            log(
+                f"{label} audio: "
+                f"codec={stream.get('codec_name')} "
+                f"time_base={stream.get('time_base')} "
+                f"start_time={stream.get('start_time')} "
+                f"duration={stream.get('duration')}"
+            )
+
+    return info
+
+
+# ============================================================
+# TELEGRAM UPLOAD
+# ============================================================
+
+def send_to_telegram(path, caption=""):
+    path = Path(path)
+
+    if not path.exists():
+        log(f"Telegram upload failed: {path} does not exist")
+        return False
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Telegram credentials are missing")
+        return False
+
+    info = get_video_info(path)
+
+    width = 0
+    height = 0
+    duration = 0
+
+    if info:
+        duration = int(
+            max(
+                0,
+                round(
+                    get_duration(info)
+                ),
+            )
+        )
+
+        for stream in info.get("streams", []):
+            if stream.get("codec_type") == "video":
+                width = int(stream.get("width") or 0)
+                height = int(stream.get("height") or 0)
+                break
+
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendVideo"
+    )
+
+    boundary = (
+        "----SuperLiveRecorderBoundary"
+        + str(int(time.time() * 1000))
+    )
+
+    fields = {
+        "chat_id": str(TELEGRAM_CHAT_ID),
+        "caption": caption,
+        "parse_mode": "HTML",
+        "supports_streaming": "true",
+        "duration": str(duration),
+        "width": str(width),
+        "height": str(height),
+    }
+
+    body = bytearray()
+
+    for key, value in fields.items():
+        body.extend(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; '
+                f'name="{key}"\r\n\r\n'
+                f"{value}\r\n"
+            ).encode("utf-8")
+        )
+
+    filename = path.name
+
+    body.extend(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; '
+            f'name="video"; filename="{filename}"\r\n'
+            f"Content-Type: video/mp4\r\n\r\n"
+        ).encode("utf-8")
+    )
+
+    try:
+        with open(path, "rb") as f:
+            body.extend(f.read())
+
+    except Exception as e:
+        log(f"Unable to read video for Telegram: {e}")
+        return False
+
+    body.extend(
+        f"\r\n--{boundary}--\r\n".encode("utf-8")
+    )
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=bytes(body),
+            method="POST",
+            headers={
+                "Content-Type": (
+                    f"multipart/form-data; "
+                    f"boundary={boundary}"
+                ),
+                "User-Agent": "SuperLiveRecorder/1.0",
+            },
+        )
+
+        with urllib.request.urlopen(
+            req,
+            timeout=600,
+        ) as response:
+            response_body = response.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+
+        try:
+            result = json.loads(response_body)
+
+            if result.get("ok"):
+                log(
+                    f"Telegram upload successful: "
+                    f"{path.name}"
+                )
+                return True
+
+            log(
+                "Telegram returned failure: "
+                f"{response_body}"
+            )
+
+        except Exception:
+            log(
+                "Telegram response: "
+                f"{response_body}"
+            )
+
+    except urllib.error.HTTPError as e:
+        try:
+            error_body = e.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+        except Exception:
+            error_body = str(e)
+
+        log(
+            f"Telegram HTTP error {e.code}: "
+            f"{error_body}"
         )
 
     except Exception as e:
-        raise RuntimeError(
-            f"Eval failed: {e}"
+        log(f"Telegram upload error: {e}")
+
+    return False
+
+
+def send_to_telegram_with_retry(path, caption=""):
+    for attempt in range(
+        1,
+        UPLOAD_MAX_RETRIES + 1,
+    ):
+        log(
+            f"Telegram upload attempt "
+            f"{attempt}/{UPLOAD_MAX_RETRIES}: "
+            f"{path}"
         )
 
+        if send_to_telegram(path, caption):
+            return True
+
+        if attempt < UPLOAD_MAX_RETRIES:
+            log(
+                f"Waiting "
+                f"{UPLOAD_RETRY_DELAY_SECONDS}s "
+                f"before retry..."
+            )
+
+            time.sleep(
+                UPLOAD_RETRY_DELAY_SECONDS
+            )
+
+    return False
+
 
 # ============================================================
-# WEBM → MP4 CONVERSION
+# FFMPEG CONVERSION
 # ============================================================
 
-def convert_webm_to_mp4(
-    webm_path,
-    mp4_path
-):
+def convert_webm_to_mp4(webm_path, mp4_path):
     """
-    Convert WebM to MP4 with Telegram-compatible settings.
+    Convert WebM to H.264/AAC MP4 while preserving the
+    original frame timestamps as much as possible.
 
-    The conversion intentionally avoids -copyts so that timestamps
-    are regenerated from the decoded stream rather than preserving
-    potentially irregular MediaRecorder timestamps.
-
-    CFR mode is used to prevent VFR timestamp irregularities from
-    becoming playback stutter.
-
-    Quality remains controlled by CRF 20.
+    IMPORTANT:
+    - No fps filter.
+    - No CFR.
+    - No forced keyframes.
+    - No timestamp regeneration.
     """
 
-    cmd = [
+    webm_path = Path(webm_path)
+    mp4_path = Path(mp4_path)
+
+    if not webm_path.exists():
+        raise FileNotFoundError(webm_path)
+
+    log_section("WEBM SOURCE ANALYSIS")
+
+    webm_info = log_video_info(
+        "WEBM BEFORE CONVERSION",
+        webm_path,
+    )
+
+    webm_duration = get_duration(webm_info)
+
+    log(
+        f"Source WebM duration: "
+        f"{webm_duration:.3f}s"
+    )
+
+    log_section("FFMPEG WEBM -> MP4")
+
+    # IMPORTANT:
+    #
+    # We intentionally do NOT use:
+    #
+    #   -vf fps=...
+    #   -fps_mode cfr
+    #   -force_key_frames ...
+    #   -avoid_negative_ts make_zero
+    #
+    # The WebM is already smooth, so changing its frame timing
+    # is exactly what we want to avoid.
+    #
+    # -copyts:
+    #   preserve input timestamps.
+    #
+    # -start_at_zero:
+    #   shift the preserved timestamps so the output begins at 0.
+    #
+    # -fps_mode passthrough:
+    #   pass frames using their timestamps instead of forcing CFR.
+    #
+    # -vsync is deliberately NOT used because fps_mode is the
+    # modern per-stream control.
+
+    command = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
-        "error",
+        "warning",
         "-y",
 
-        "-fflags",
-        "+genpts",
-
+        "-copyts",
         "-i",
         str(webm_path),
 
         "-map",
         "0:v:0",
-
         "-map",
         "0:a:0?",
 
@@ -1226,30 +722,22 @@ def convert_webm_to_mp4(
         "height=ceil(ih/2)*2:"
         "color=black",
 
-        "-fps_mode",
-        "cfr",
+        "-fps_mode:v",
+        "passthrough",
 
-        "-force_key_frames",
-        "expr:gte(t,n_forced*2)",
-
-        "-avoid_negative_ts",
-        "make_zero",
+        "-start_at_zero",
 
         "-c:v",
         "libx264",
-
         "-preset",
-        "fast",
-
+        "veryfast",
         "-crf",
-        "20",
+        "18",
 
         "-profile:v",
         "main",
-
         "-level",
         "4.1",
-
         "-pix_fmt",
         "yuv420p",
 
@@ -1261,923 +749,1336 @@ def convert_webm_to_mp4(
 
         "-c:a",
         "aac",
-
         "-b:a",
         "192k",
-
         "-ar",
         "48000",
-
         "-ac",
         "2",
 
         "-movflags",
         "+faststart",
 
-        str(mp4_path)
+        str(mp4_path),
     ]
 
+    start_time = time.monotonic()
 
     result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
 
+    elapsed = time.monotonic() - start_time
+
+    if result.stderr:
+        log(
+            "FFmpeg output:\n"
+            + result.stderr.strip()
+        )
+
+    log(
+        f"FFmpeg conversion finished in "
+        f"{elapsed:.1f}s"
+    )
 
     if result.returncode != 0:
-        log(
-            f"[FFmpeg] ✗ Error: "
-            f"{result.stderr[:1000]}"
+        raise RuntimeError(
+            "FFmpeg conversion failed:\n"
+            + result.stderr
         )
-        return False
 
+    if not mp4_path.exists():
+        raise RuntimeError(
+            "FFmpeg reported success but MP4 "
+            "file was not created"
+        )
+
+    if mp4_path.stat().st_size <= 10 * 1024:
+        raise RuntimeError(
+            "Generated MP4 is unexpectedly small"
+        )
+
+    log_section("MP4 OUTPUT ANALYSIS")
+
+    mp4_info = log_video_info(
+        "MP4 AFTER CONVERSION",
+        mp4_path,
+    )
+
+    mp4_duration = get_duration(mp4_info)
+
+    log(
+        f"Output MP4 duration: "
+        f"{mp4_duration:.3f}s"
+    )
+
+    # --------------------------------------------------------
+    # Duration sanity check
+    # --------------------------------------------------------
+
+    if webm_duration > 1 and mp4_duration > 1:
+        difference = abs(
+            mp4_duration - webm_duration
+        )
+
+        log(
+            f"WebM/MP4 duration difference: "
+            f"{difference:.3f}s"
+        )
+
+        # A tiny difference is normal because of codec/container
+        # behavior. A large difference is a strong indication
+        # that timestamps were damaged during conversion.
+        allowed_difference = max(
+            5.0,
+            webm_duration * 0.02,
+        )
+
+        if difference > allowed_difference:
+            raise RuntimeError(
+                "MP4 duration differs too much from "
+                "the original WebM: "
+                f"WebM={webm_duration:.3f}s, "
+                f"MP4={mp4_duration:.3f}s, "
+                f"difference={difference:.3f}s"
+            )
+
+    if not verify_video_file(mp4_path):
+        raise RuntimeError(
+            "Generated MP4 failed verification"
+        )
 
     return True
 
 
 # ============================================================
-# WORKFLOW
+# SPLIT MP4
+# ============================================================
+
+def split_mp4_if_needed(mp4_path):
+    mp4_path = Path(mp4_path)
+
+    size_mb = (
+        mp4_path.stat().st_size
+        / (1024 * 1024)
+    )
+
+    log(
+        f"MP4 size: {size_mb:.2f} MB"
+    )
+
+    if size_mb <= TELEGRAM_MAX_SIZE_MB:
+        return [mp4_path]
+
+    info = get_video_info(mp4_path)
+
+    duration = get_duration(info)
+
+    if duration <= 1:
+        raise RuntimeError(
+            "Cannot split MP4: invalid duration"
+        )
+
+    target_bytes = (
+        TELEGRAM_TARGET_SIZE_MB
+        * 1024
+        * 1024
+    )
+
+    current_bytes = mp4_path.stat().st_size
+
+    estimated_parts = max(
+        2,
+        int(
+            current_bytes / target_bytes
+        ) + 1,
+    )
+
+    segment_time = max(
+        30,
+        duration / estimated_parts,
+    )
+
+    log(
+        f"Splitting MP4 into approximately "
+        f"{estimated_parts} parts, "
+        f"segment_time={segment_time:.1f}s"
+    )
+
+    output_pattern = (
+        mp4_path.parent
+        / f"{mp4_path.stem}_part_%03d.mp4"
+    )
+
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-y",
+
+        "-i",
+        str(mp4_path),
+
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+
+        "-c",
+        "copy",
+
+        "-f",
+        "segment",
+
+        "-segment_time",
+        str(segment_time),
+
+        "-reset_timestamps",
+        "1",
+
+        "-movflags",
+        "+faststart",
+
+        str(output_pattern),
+    ]
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if result.stderr:
+        log(
+            "FFmpeg split output:\n"
+            + result.stderr.strip()
+        )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "FFmpeg split failed:\n"
+            + result.stderr
+        )
+
+    parts = sorted(
+        mp4_path.parent.glob(
+            f"{mp4_path.stem}_part_*.mp4"
+        )
+    )
+
+    if not parts:
+        raise RuntimeError(
+            "FFmpeg split produced no parts"
+        )
+
+    valid_parts = []
+
+    for part in parts:
+        part_size_mb = (
+            part.stat().st_size
+            / (1024 * 1024)
+        )
+
+        log(
+            f"Split part: "
+            f"{part.name} "
+            f"{part_size_mb:.2f} MB"
+        )
+
+        if part_size_mb > TELEGRAM_MAX_SIZE_MB:
+            log(
+                f"WARNING: {part.name} is still "
+                f"larger than Telegram limit"
+            )
+
+        if not verify_video_file(part):
+            raise RuntimeError(
+                f"Invalid split part: {part}"
+            )
+
+        valid_parts.append(part)
+
+    return valid_parts
+
+
+# ============================================================
+# PLAYWRIGHT / WEBRTC HOOK
+# ============================================================
+
+WEBRTC_HOOK = r"""
+(() => {
+    if (window.__superlive_hook_installed) {
+        return;
+    }
+
+    window.__superlive_hook_installed = true;
+
+    window.__superliveVideoTracks = [];
+    window.__superliveAudioTracks = [];
+    window.__superliveStreams = [];
+    window.__superliveTrackLinks = new Map();
+
+    const OriginalRTCPeerConnection =
+        window.RTCPeerConnection;
+
+    if (!OriginalRTCPeerConnection) {
+        return;
+    }
+
+    function rememberTrack(track, stream) {
+        if (!track) {
+            return;
+        }
+
+        if (track.kind === "video") {
+            if (!window.__superliveVideoTracks.includes(track)) {
+                window.__superliveVideoTracks.push(track);
+            }
+        }
+
+        if (track.kind === "audio") {
+            if (!window.__superliveAudioTracks.includes(track)) {
+                window.__superliveAudioTracks.push(track);
+            }
+        }
+
+        if (stream) {
+            if (!window.__superliveStreams.includes(stream)) {
+                window.__superliveStreams.push(stream);
+            }
+
+            if (!window.__superliveTrackLinks.has(track)) {
+                window.__superliveTrackLinks.set(
+                    track,
+                    stream
+                );
+            }
+        }
+    }
+
+    class WrappedRTCPeerConnection
+        extends OriginalRTCPeerConnection {
+
+        constructor(...args) {
+            super(...args);
+
+            this.addEventListener(
+                "track",
+                (event) => {
+                    try {
+                        const track = event.track;
+                        const streams = event.streams || [];
+
+                        if (streams.length) {
+                            for (const stream of streams) {
+                                rememberTrack(track, stream);
+                            }
+                        } else {
+                            rememberTrack(track, null);
+                        }
+                    } catch (e) {
+                        console.warn(
+                            "superlive track hook error",
+                            e
+                        );
+                    }
+                }
+            );
+        }
+    }
+
+    window.RTCPeerConnection =
+        WrappedRTCPeerConnection;
+
+    window.__superlivePrepare = () => {
+        const videos = Array.from(
+            document.querySelectorAll("video")
+        );
+
+        let selectedVideoTrack = null;
+        let selectedStream = null;
+
+        for (const video of videos) {
+            try {
+                const stream = video.srcObject;
+
+                if (!stream) {
+                    continue;
+                }
+
+                const videoTracks =
+                    stream.getVideoTracks();
+
+                const liveVideoTrack =
+                    videoTracks.find(
+                        t => t.readyState === "live"
+                    );
+
+                if (liveVideoTrack) {
+                    selectedVideoTrack =
+                        liveVideoTrack;
+
+                    selectedStream = stream;
+
+                    break;
+                }
+            } catch (e) {
+                console.warn(
+                    "superlive video scan error",
+                    e
+                );
+            }
+        }
+
+        if (!selectedVideoTrack) {
+            selectedVideoTrack =
+                window.__superliveVideoTracks.find(
+                    t => t.readyState === "live"
+                );
+        }
+
+        if (!selectedVideoTrack) {
+            throw new Error(
+                "No live video track found"
+            );
+        }
+
+        let selectedAudioTrack = null;
+
+        if (selectedStream) {
+            selectedAudioTrack =
+                selectedStream
+                    .getAudioTracks()
+                    .find(
+                        t => t.readyState === "live"
+                    );
+        }
+
+        if (!selectedAudioTrack) {
+            const linkedStream =
+                window.__superliveTrackLinks.get(
+                    selectedVideoTrack
+                );
+
+            if (linkedStream) {
+                selectedAudioTrack =
+                    linkedStream
+                        .getAudioTracks()
+                        .find(
+                            t => t.readyState === "live"
+                        );
+            }
+        }
+
+        if (!selectedAudioTrack) {
+            selectedAudioTrack =
+                window.__superliveAudioTracks.find(
+                    t => t.readyState === "live"
+                );
+        }
+
+        const tracks = [
+            selectedVideoTrack
+        ];
+
+        if (selectedAudioTrack) {
+            tracks.push(selectedAudioTrack);
+        }
+
+        window.__preparedStream =
+            new MediaStream(tracks);
+
+        window.__preparedVideoTrack =
+            selectedVideoTrack;
+
+        window.__preparedAudioTrack =
+            selectedAudioTrack;
+
+        return {
+            hasVideo: !!selectedVideoTrack,
+            hasAudio: !!selectedAudioTrack,
+            videoReadyState:
+                selectedVideoTrack.readyState,
+            audioReadyState:
+                selectedAudioTrack
+                    ? selectedAudioTrack.readyState
+                    : null
+        };
+    };
+
+    window.__superliveStartRec = (
+        videoBitrate,
+        audioBitrate,
+        timeslice
+    ) => {
+        if (!window.__preparedStream) {
+            throw new Error(
+                "Prepared stream is missing"
+            );
+        }
+
+        let mimeType = "";
+
+        if (
+            MediaRecorder.isTypeSupported(
+                "video/webm;codecs=vp9,opus"
+            )
+        ) {
+            mimeType =
+                "video/webm;codecs=vp9,opus";
+        } else if (
+            MediaRecorder.isTypeSupported(
+                "video/webm;codecs=vp8,opus"
+            )
+        ) {
+            mimeType =
+                "video/webm;codecs=vp8,opus";
+        } else if (
+            MediaRecorder.isTypeSupported(
+                "video/webm"
+            )
+        ) {
+            mimeType = "video/webm";
+        } else {
+            throw new Error(
+                "No supported WebM MediaRecorder MIME type"
+            );
+        }
+
+        const recorderOptions = {
+            mimeType,
+            videoBitsPerSecond: videoBitrate,
+            audioBitsPerSecond: audioBitrate
+        };
+
+        const recorder =
+            new MediaRecorder(
+                window.__preparedStream,
+                recorderOptions
+            );
+
+        window.__superliveRecorder =
+            recorder;
+
+        window.__superliveChunkCount = 0;
+        window.__superliveLastChunkAt =
+            performance.now();
+        window.__superliveLastChunkSize = 0;
+        window.__superliveUploadQueue = [];
+        window.__superliveIsUploading = false;
+
+        recorder.ondataavailable = async (event) => {
+            try {
+                if (
+                    !event.data ||
+                    event.data.size < 1
+                ) {
+                    return;
+                }
+
+                window.__superliveChunkCount++;
+                window.__superliveLastChunkAt =
+                    performance.now();
+                window.__superliveLastChunkSize =
+                    event.data.size;
+
+                const buffer =
+                    await event.data.arrayBuffer();
+
+                window.__superliveUploadQueue.push(
+                    new Uint8Array(buffer)
+                );
+
+                processQueue();
+            } catch (e) {
+                console.error(
+                    "superlive dataavailable error",
+                    e
+                );
+            }
+        };
+
+        recorder.onerror = (event) => {
+            console.error(
+                "superlive MediaRecorder error",
+                event
+            );
+        };
+
+        async function processQueue() {
+            if (
+                window.__superliveIsUploading
+            ) {
+                return;
+            }
+
+            window.__superliveIsUploading =
+                true;
+
+            try {
+                while (
+                    window.__superliveUploadQueue.length
+                ) {
+                    const chunk =
+                        window.__superliveUploadQueue.shift();
+
+                    try {
+                        await fetch(
+                            "/__slr_chunk",
+                            {
+                                method: "POST",
+                                body: chunk
+                            }
+                        );
+                    } catch (e) {
+                        console.error(
+                            "superlive chunk upload error",
+                            e
+                        );
+
+                        /*
+                         * Put the chunk back so a temporary
+                         * request failure does not silently
+                         * destroy part of the recording.
+                         */
+                        window.__superliveUploadQueue.unshift(
+                            chunk
+                        );
+
+                        break;
+                    }
+                }
+            } finally {
+                window.__superliveIsUploading =
+                    false;
+            }
+        }
+
+        recorder.start(timeslice);
+
+        return {
+            mimeType,
+            state: recorder.state
+        };
+    };
+
+    window.__superliveWaitChunk = async (
+        timeoutMs
+    ) => {
+        const start =
+            performance.now();
+
+        while (
+            window.__superliveChunkCount < 1
+        ) {
+            if (
+                performance.now() - start
+                > timeoutMs
+            ) {
+                return false;
+            }
+
+            await new Promise(
+                resolve =>
+                    setTimeout(resolve, 100)
+            );
+        }
+
+        return true;
+    };
+
+    window.__superliveGetStatus = () => {
+        const videoTrack =
+            window.__preparedVideoTrack;
+
+        return {
+            queueLength:
+                window.__superliveUploadQueue
+                    ? window.__superliveUploadQueue.length
+                    : 0,
+
+            isUploading:
+                !!window.__superliveIsUploading,
+
+            chunkCount:
+                window.__superliveChunkCount || 0,
+
+            idleTimeMs:
+                window.__superliveLastChunkAt
+                    ? performance.now()
+                    - window.__superliveLastChunkAt
+                    : Infinity,
+
+            lastChunkSize:
+                window.__superliveLastChunkSize || 0,
+
+            videoReadyState:
+                videoTrack
+                    ? videoTrack.readyState
+                    : null,
+
+            videoSettings:
+                videoTrack &&
+                videoTrack.getSettings
+                    ? videoTrack.getSettings()
+                    : null
+        };
+    };
+
+    window.__superliveStopRec = () => {
+        const recorder =
+            window.__superliveRecorder;
+
+        if (
+            recorder &&
+            recorder.state !== "inactive"
+        ) {
+            recorder.stop();
+        }
+    };
+})();
+"""
+
+
+# ============================================================
+# SAFE EVAL
+# ============================================================
+
+def safe_eval(value):
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
+# ============================================================
+# RECORDING
 # ============================================================
 
 async def run_recording(playwright):
+    if not URL:
+        raise RuntimeError(
+            "RECORD_URL environment variable is missing"
+        )
 
-    log(
-        "[1/4] Launching Chromium..."
-    )
+    if not STREAM_ID:
+        log(
+            "WARNING: STREAM_ID is empty"
+        )
 
-    log(
-        f"[DEBUG] STREAM_ID = '{STREAM_ID}'"
-    )
-
+    chromium_args = [
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-features=CalculateNativeWinOcclusion",
+        "--autoplay-policy=no-user-gesture-required",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+    ]
 
     browser = await playwright.chromium.launch(
         headless=False,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--autoplay-policy=no-user-gesture-required",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--window-size=1920,1080"
-        ]
+        args=chromium_args,
     )
-
 
     context = await browser.new_context(
         viewport={
             "width": 1920,
-            "height": 1080
+            "height": 1080,
         },
-        locale="fr-FR",
-        user_agent=USER_AGENT
+        user_agent=USER_AGENT,
     )
-
 
     await context.add_init_script(
         WEBRTC_HOOK
     )
 
-
     page = await context.new_page()
 
+    chunk_count = 0
+    total_bytes = 0
 
-    page.on(
-        "console",
-        lambda m:
-            log(
-                f"[CONSOLE:{m.type}] {m.text}"
-            )
-            if m.type in [
-                "error",
-                "warning"
-            ]
-            else None
-    )
-
-
-    TEMP_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    RECORDINGS_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
+    recording_started_at = time.monotonic()
 
     timestamp = time.strftime(
         "%Y%m%d_%H%M%S"
     )
 
-
     webm_path = (
-        TEMP_DIR /
-        f"rec_{timestamp}.webm"
+        TEMP_DIR
+        / f"recording_{timestamp}.webm"
     )
 
-
-    webm_file = open(
-        webm_path,
-        "wb"
+    mp4_path = (
+        RECORDING_DIR
+        / f"recording_{timestamp}.mp4"
     )
 
+    webm_file = None
 
-    total_bytes = 0
-    chunk_count = 0
-    is_recording_active = True
-
-
-    async def handle_chunk(
-        route,
-        request
-    ):
-        nonlocal total_bytes
-        nonlocal chunk_count
-
-        if not is_recording_active:
-            await route.fulfill(
-                status=200,
-                body=b"ok",
-                content_type="text/plain"
-            )
-            return
-
-
-        try:
-            body = request.post_data_buffer
-
-            if body:
-                webm_file.write(body)
-                webm_file.flush()
-
-                total_bytes += len(body)
-                chunk_count += 1
-
-        except Exception as e:
-            log(
-                f"[WARN] Write error: {e}"
-            )
-
-
-        await route.fulfill(
-            status=200,
-            body=b"ok",
-            content_type="text/plain"
+    try:
+        webm_file = open(
+            webm_path,
+            "wb",
         )
 
-
-    await page.route(
-        "**/__slr_chunk",
-        handle_chunk
-    )
-
-
-    log(
-        f"[2/4] Navigating to {URL}"
-    )
-
-
-    start_navigate = time.monotonic()
-
-
-    await page.goto(
-        URL,
-        wait_until="domcontentloaded",
-        timeout=PAGE_TIMEOUT_MS
-    )
-
-
-    log(
-        f"[✓] Page loaded in "
-        f"{time.monotonic() - start_navigate:.1f}s"
-    )
-
-
-    log(
-        "[*] Waiting for WebRTC "
-        "(timeout: 60s)..."
-    )
-
-
-    start_wait = time.monotonic()
-    stream_locked = False
-
-
-    while (
-        time.monotonic() - start_wait
-        < VIDEO_WAIT_SECONDS
-    ):
-        try:
-            info = await safe_eval(
-                page,
-                """() => {
-                    const v =
-                        document.querySelector('video');
-
-                    return {
-                        hasVideo:
-                            !!(
-                                v &&
-                                v.videoWidth > 0
-                            ),
-
-                        audioCount:
-                            (
-                                window.__superlive_audio_tracks ||
-                                []
-                            ).filter(
-                                t =>
-                                    t.readyState === 'live'
-                            ).length
-                    };
-                }"""
-            )
-
-
-            if (
-                info["hasVideo"] and
-                info["audioCount"] > 0
-            ):
-                log(
-                    f"[✓] WebRTC locked in "
-                    f"{time.monotonic() - start_wait:.1f}s"
-                )
-
-                stream_locked = True
-                break
-
-        except Exception:
-            pass
-
-
-        await asyncio.sleep(1)
-
-
-    if not stream_locked:
-        webm_file.close()
-
-        await page.unroute(
-            "**/__slr_chunk"
-        )
-
-        kv_update_state(
-            STREAM_ID,
-            "failed",
-            error="WebRTC timeout"
-        )
-
-        kv_delete_state(
-            STREAM_ID
-        )
-
-        raise RuntimeError(
-            "WebRTC timeout"
-        )
-
-
-    log(
-        "[3/4] Starting recorder..."
-    )
-
-
-    await safe_eval(
-        page,
-        "window.__superlivePrepare()"
-    )
-
-
-    rec_info = await safe_eval(
-        page,
-        (
-            "window.__superliveStartRec("
-            f"{VIDEO_BITRATE}, "
-            f"{AUDIO_BITRATE}, "
-            "1000)"
-        )
-    )
-
-
-    log(
-        f"[✓] Recorder started: "
-        f"{rec_info.get('mimeType')}"
-    )
-
-
-    wait_res = await safe_eval(
-        page,
-        (
-            "window.__superliveWaitChunk("
-            f"{FIRST_CHUNK_TIMEOUT_SECONDS * 1000}"
-            ")"
-        )
-    )
-
-
-    if not wait_res.get("ok"):
-        webm_file.close()
-
-        await page.unroute(
-            "**/__slr_chunk"
-        )
-
-        kv_update_state(
-            STREAM_ID,
-            "failed",
-            error="No data"
-        )
-
-        kv_delete_state(
-            STREAM_ID
-        )
-
-        raise RuntimeError(
-            "No data from recorder"
-        )
-
-
-    log(
-        "[✓] Recording active!"
-    )
-
-
-    send_telegram_notification(
-        f"🔴 <b>بدأ تسجيل البث</b>\n"
-        f"📺 <code>{STREAM_ID}</code>\n"
-        f"🔗 <a href=\"{URL}\">افتح البث</a>"
-    )
-
-
-    total_start = time.monotonic()
-    last_stop_check = time.monotonic()
-    last_progress_log = time.monotonic()
-
-    stop_reason = "unknown"
-
-
-    kv_update_state(
-        STREAM_ID,
-        "recording"
-    )
-
-
-    while (
-        time.monotonic() - total_start
-        < MAX_RECORDING_SECONDS
-    ):
-        await asyncio.sleep(1)
-
-        elapsed = (
-            time.monotonic() -
-            total_start
-        )
-
-
-        if (
-            time.monotonic() -
-            last_stop_check
-            >= STOP_CHECK_INTERVAL
-        ):
-            last_stop_check = time.monotonic()
+        async def handle_chunk(route, request):
+            nonlocal chunk_count
+            nonlocal total_bytes
 
             try:
-                if check_stop_requested(
+                body = request.post_data_buffer
+
+                if body:
+                    webm_file.write(body)
+                    webm_file.flush()
+
+                    chunk_count += 1
+                    total_bytes += len(body)
+
+                await route.fulfill(
+                    status=200,
+                    body=b"OK",
+                )
+
+            except Exception as e:
+                log(
+                    f"Chunk handler error: {e}"
+                )
+
+                try:
+                    await route.fulfill(
+                        status=500,
+                        body=b"ERROR",
+                    )
+                except Exception:
+                    pass
+
+        await page.route(
+            "**/__slr_chunk",
+            handle_chunk,
+        )
+
+        log_section("OPENING PAGE")
+
+        await page.goto(
+            URL,
+            wait_until="domcontentloaded",
+            timeout=PAGE_TIMEOUT_MS,
+        )
+
+        log(
+            "Page loaded. Waiting for live video..."
+        )
+
+        # ----------------------------------------------------
+        # Wait for actual video + audio
+        # ----------------------------------------------------
+
+        video_ready = False
+
+        wait_started = time.monotonic()
+
+        while (
+            time.monotonic()
+            - wait_started
+            < VIDEO_WAIT_SECONDS
+        ):
+            try:
+                result = await page.evaluate(
+                    """
+                    () => {
+                        const videos =
+                            Array.from(
+                                document.querySelectorAll("video")
+                            );
+
+                        for (const video of videos) {
+                            try {
+                                const stream =
+                                    video.srcObject;
+
+                                if (!stream) {
+                                    continue;
+                                }
+
+                                const videoTracks =
+                                    stream.getVideoTracks();
+
+                                const audioTracks =
+                                    stream.getAudioTracks();
+
+                                const liveVideo =
+                                    videoTracks.some(
+                                        t =>
+                                            t.readyState
+                                            === "live"
+                                    );
+
+                                const liveAudio =
+                                    audioTracks.some(
+                                        t =>
+                                            t.readyState
+                                            === "live"
+                                    );
+
+                                if (
+                                    video.videoWidth > 0 &&
+                                    video.videoHeight > 0 &&
+                                    liveVideo
+                                ) {
+                                    return {
+                                        ready: true,
+                                        width:
+                                            video.videoWidth,
+                                        height:
+                                            video.videoHeight,
+                                        audio:
+                                            liveAudio
+                                    };
+                                }
+                            } catch (e) {}
+                        }
+
+                        return {
+                            ready: false
+                        };
+                    }
+                    """
+                )
+
+                if result.get("ready"):
+                    video_ready = True
+
+                    log(
+                        "Live video detected: "
+                        f"{result.get('width')}x"
+                        f"{result.get('height')} "
+                        f"audio={result.get('audio')}"
+                    )
+
+                    break
+
+            except Exception as e:
+                log(
+                    f"Video detection error: {e}"
+                )
+
+            await asyncio.sleep(1)
+
+        if not video_ready:
+            raise RuntimeError(
+                "Live video was not detected"
+            )
+
+        # ----------------------------------------------------
+        # Prepare stream
+        # ----------------------------------------------------
+
+        prepared = await page.evaluate(
+            """
+            () => window.__superlivePrepare()
+            """
+        )
+
+        log(
+            "Prepared stream: "
+            + json.dumps(
+                prepared,
+                ensure_ascii=False,
+            )
+        )
+
+        # ----------------------------------------------------
+        # Start MediaRecorder
+        # ----------------------------------------------------
+
+        start_result = await page.evaluate(
+            """
+            ([videoBitrate, audioBitrate, timeslice]) =>
+                window.__superliveStartRec(
+                    videoBitrate,
+                    audioBitrate,
+                    timeslice
+                )
+            """,
+            [
+                VIDEO_BITRATE,
+                AUDIO_BITRATE,
+                1000,
+            ],
+        )
+
+        log(
+            "MediaRecorder started: "
+            + json.dumps(
+                start_result,
+                ensure_ascii=False,
+            )
+        )
+
+        # ----------------------------------------------------
+        # Wait for first chunk
+        # ----------------------------------------------------
+
+        first_chunk = await page.evaluate(
+            """
+            () =>
+                window.__superliveWaitChunk(
+                    10000
+                )
+            """
+        )
+
+        if not first_chunk:
+            raise RuntimeError(
+                "First recording chunk was not received"
+            )
+
+        log("First recording chunk received")
+
+        # ----------------------------------------------------
+        # Main recording loop
+        # ----------------------------------------------------
+
+        last_status_log = time.monotonic()
+
+        while True:
+            elapsed = (
+                time.monotonic()
+                - recording_started_at
+            )
+
+            if elapsed >= MAX_RECORDING_SECONDS:
+                log(
+                    "Maximum recording duration reached"
+                )
+                break
+
+            if (
+                STREAM_ID
+                and check_stop_requested(
                     STREAM_ID
+                )
+            ):
+                log(
+                    "Stop requested"
+                )
+                break
+
+            try:
+                status = await page.evaluate(
+                    """
+                    () =>
+                        window.__superliveGetStatus()
+                    """
+                )
+
+                idle_ms = float(
+                    status.get(
+                        "idleTimeMs",
+                        0,
+                    )
+                )
+
+                video_state = status.get(
+                    "videoReadyState"
+                )
+
+                if (
+                    video_state
+                    and video_state != "live"
                 ):
                     log(
-                        f"[!] STOP requested "
-                        f"at {int(elapsed)}s"
+                        "Video track is no longer live: "
+                        f"{video_state}"
+                    )
+                    break
+
+                if (
+                    idle_ms
+                    > STREAM_IDLE_TIMEOUT * 1000
+                ):
+                    log(
+                        "No recording chunk received "
+                        f"for {idle_ms / 1000:.1f}s"
+                    )
+                    break
+
+                if (
+                    time.monotonic()
+                    - last_status_log
+                    >= 30
+                ):
+                    settings = status.get(
+                        "videoSettings"
                     )
 
-                    stop_reason = (
-                        "stop_requested"
+                    log(
+                        "Recording status: "
+                        f"chunks={status.get('chunkCount')} "
+                        f"queue={status.get('queueLength')} "
+                        f"uploading={status.get('isUploading')} "
+                        f"idle={idle_ms / 1000:.1f}s "
+                        f"last_chunk="
+                        f"{status.get('lastChunkSize')} bytes "
+                        f"video={video_state} "
+                        f"settings={settings}"
                     )
 
+                    log(
+                        f"Local WebM received: "
+                        f"{total_bytes / 1024 / 1024:.2f} MB"
+                    )
+
+                    last_status_log = (
+                        time.monotonic()
+                    )
+
+            except Exception as e:
+                log(
+                    f"Status check error: {e}"
+                )
+
+            await asyncio.sleep(
+                STOP_CHECK_INTERVAL
+            )
+
+        # ----------------------------------------------------
+        # Stop MediaRecorder
+        # ----------------------------------------------------
+
+        log("Stopping MediaRecorder...")
+
+        try:
+            await page.evaluate(
+                """
+                () =>
+                    window.__superliveStopRec()
+                """
+            )
+        except Exception as e:
+            log(
+                f"MediaRecorder stop error: {e}"
+            )
+
+        # ----------------------------------------------------
+        # Allow upload queue to drain
+        # ----------------------------------------------------
+
+        log(
+            "Waiting for remaining recording "
+            "chunks to upload..."
+        )
+
+        drain_started = time.monotonic()
+
+        while (
+            time.monotonic()
+            - drain_started
+            < 15
+        ):
+            try:
+                status = await page.evaluate(
+                    """
+                    () =>
+                        window.__superliveGetStatus()
+                    """
+                )
+
+                queue_length = int(
+                    status.get(
+                        "queueLength",
+                        0,
+                    )
+                )
+
+                uploading = bool(
+                    status.get(
+                        "isUploading",
+                        False,
+                    )
+                )
+
+                if (
+                    queue_length == 0
+                    and not uploading
+                ):
                     break
 
             except Exception:
                 pass
 
+            await asyncio.sleep(0.2)
 
-        if (
-            time.monotonic() -
-            last_progress_log
-            >= 30
+        log(
+            f"Final WebM received: "
+            f"{total_bytes / 1024 / 1024:.2f} MB, "
+            f"chunks={chunk_count}"
+        )
+
+        await page.unroute(
+            "**/__slr_chunk",
+            handle_chunk,
+        )
+
+        webm_file.flush()
+        os.fsync(webm_file.fileno())
+        webm_file.close()
+        webm_file = None
+
+        await browser.close()
+
+        # ----------------------------------------------------
+        # Verify WebM BEFORE conversion
+        # ----------------------------------------------------
+
+        log_section("VERIFY ORIGINAL WEBM")
+
+        if not verify_video_file(webm_path):
+            raise RuntimeError(
+                "Original WebM failed verification"
+            )
+
+        # ----------------------------------------------------
+        # IMPORTANT DIAGNOSTIC:
+        # WebM is kept until MP4 is fully verified.
+        # ----------------------------------------------------
+
+        convert_webm_to_mp4(
+            webm_path,
+            mp4_path,
+        )
+
+        # ----------------------------------------------------
+        # Remove WebM only after successful conversion
+        # ----------------------------------------------------
+
+        try:
+            webm_path.unlink()
+            log(
+                f"Removed temporary WebM: "
+                f"{webm_path}"
+            )
+        except Exception as e:
+            log(
+                f"Could not remove WebM: {e}"
+            )
+
+        # ----------------------------------------------------
+        # Split if necessary
+        # ----------------------------------------------------
+
+        parts = split_mp4_if_needed(
+            mp4_path
+        )
+
+        # ----------------------------------------------------
+        # Upload
+        # ----------------------------------------------------
+
+        log_section("UPLOADING VIDEO")
+
+        total_parts = len(parts)
+
+        for index, part in enumerate(
+            parts,
+            start=1,
         ):
-            last_progress_log = time.monotonic()
+            caption = (
+                f"🎥 Recording"
+            )
+
+            if total_parts > 1:
+                caption += (
+                    f"\nPart {index}/{total_parts}"
+                )
+
+            success = (
+                send_to_telegram_with_retry(
+                    part,
+                    caption,
+                )
+            )
+
+            if not success:
+                raise RuntimeError(
+                    f"Failed to upload part "
+                    f"{index}/{total_parts}: "
+                    f"{part}"
+                )
 
             log(
-                f"[*] Progress: "
-                f"{int(elapsed)}s | "
-                f"{chunk_count} chunks | "
-                f"{total_bytes / 1024 / 1024:.2f} MB"
+                f"Uploaded part "
+                f"{index}/{total_parts}"
             )
 
+        # ----------------------------------------------------
+        # Cleanup split parts
+        # ----------------------------------------------------
+
+        for part in parts:
+            if part != mp4_path:
+                try:
+                    part.unlink()
+                except Exception as e:
+                    log(
+                        f"Could not remove split part "
+                        f"{part}: {e}"
+                    )
 
         try:
-            status = await safe_eval(
-                page,
-                "window.__superliveGetStatus()"
-            )
+            if mp4_path.exists():
+                mp4_path.unlink()
 
-            idle_ms = status.get(
-                "idleTimeMs",
-                0
-            )
-
-            video_track_state = status.get(
-                "videoTrackState",
-                "unknown"
-            )
-
-
-            if (
-                video_track_state == "ended"
-                and chunk_count > 5
-            ):
-                log(
-                    f"[!] Stream ended "
-                    f"(track state = "
-                    f"{video_track_state})"
-                )
-
-                stop_reason = (
-                    "stream_ended_track"
-                )
-
-                break
-
-
-            if (
-                idle_ms >
-                STREAM_IDLE_TIMEOUT * 1000
-            ):
-                log(
-                    f"[!] Stream ended "
-                    f"(no data for "
-                    f"{idle_ms / 1000:.1f}s)"
-                )
-
-                stop_reason = (
-                    "stream_ended_idle"
-                )
-
-                break
-
-        except Exception:
-            pass
-
-
-    log(
-        f"[*] Stopping "
-        f"(reason: {stop_reason})..."
-    )
-
-
-    await safe_eval(
-        page,
-        "window.__superliveStopRec()"
-    )
-
-
-    for _ in range(30):
-        try:
-            status = await safe_eval(
-                page,
-                "window.__superliveGetStatus()"
-            )
-
-            if (
-                status["queueLength"] == 0
-                and not status["isUploading"]
-            ):
-                break
-
-        except Exception:
-            pass
-
-        await asyncio.sleep(0.5)
-
-
-    is_recording_active = False
-
-
-    await page.unroute(
-        "**/__slr_chunk"
-    )
-
-
-    webm_file.close()
-
-
-    final_size = webm_path.stat().st_size
-
-
-    log(
-        f"[✓] Capture done: "
-        f"{final_size / 1024 / 1024:.2f} MB | "
-        f"{chunk_count} chunks"
-    )
-
-
-    if final_size < 1024:
-        kv_update_state(
-            STREAM_ID,
-            "failed",
-            error="Empty file"
-        )
-
-        kv_delete_state(
-            STREAM_ID
-        )
-
-        raise RuntimeError(
-            "Empty recording"
-        )
-
-
-    log(
-        "[*] Closing browser..."
-    )
-
-
-    await context.close()
-    await browser.close()
-
-
-    log(
-        "[4/4] Converting + Uploading..."
-    )
-
-
-    full_mp4_path = (
-        RECORDINGS_DIR /
-        f"full_{timestamp}.mp4"
-    )
-
-
-    log(
-        "[*] FFmpeg converting..."
-    )
-
-
-    convert_start = time.monotonic()
-
-
-    success = convert_webm_to_mp4(
-        webm_path,
-        full_mp4_path
-    )
-
-
-    convert_time = (
-        time.monotonic() -
-        convert_start
-    )
-
-
-    webm_path.unlink(
-        missing_ok=True
-    )
-
-
-    if (
-        not success
-        or not full_mp4_path.exists()
-    ):
-        kv_update_state(
-            STREAM_ID,
-            "failed",
-            error="FFmpeg failed"
-        )
-
-        kv_delete_state(
-            STREAM_ID
-        )
-
-        raise RuntimeError(
-            "FFmpeg failed"
-        )
-
-
-    total_size = (
-        full_mp4_path.stat().st_size /
-        1024 /
-        1024
-    )
-
-
-    log(
-        f"[✓] Converted in "
-        f"{convert_time:.1f}s: "
-        f"{total_size:.2f} MB"
-    )
-
-
-    log(
-        "[*] Checking if split is needed..."
-    )
-
-
-    if (
-        full_mp4_path.stat().st_size
-        <= int(
-            TELEGRAM_MAX_SIZE_MB *
-            1024 *
-            1024
-        )
-    ):
-        final_files = [
-            full_mp4_path
-        ]
-
-        log(
-            "[✓] No split needed "
-            "(under 45 MB)"
-        )
-
-    else:
-        log(
-            "[*] Splitting for Telegram..."
-        )
-
-
-        split_start = time.monotonic()
-
-
-        duration_cmd = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(full_mp4_path)
-        ]
-
-
-        result = subprocess.run(
-            duration_cmd,
-            capture_output=True,
-            text=True
-        )
-
-
-        try:
-            duration = float(
-                result.stdout.strip()
-            )
-
-        except Exception:
-            duration = 300
-
-
-        num_parts = max(
-            2,
-            int(
-                total_size /
-                TELEGRAM_TARGET_SIZE_MB
-            ) + 1
-        )
-
-
-        segment_time = max(
-            30,
-            int(
-                duration /
-                num_parts
-            )
-        )
-
-
-        output_pattern = str(
-            RECORDINGS_DIR /
-            f"stream_{STREAM_ID}_part%02d.mp4"
-        )
-
-
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(full_mp4_path),
-            "-c",
-            "copy",
-            "-map",
-            "0",
-            "-f",
-            "segment",
-            "-segment_time",
-            str(segment_time),
-            "-reset_timestamps",
-            "1",
-            "-movflags",
-            "+faststart",
-            output_pattern
-        ]
-
-
-        split_result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True
-        )
-
-
-        if split_result.returncode != 0:
+        except Exception as e:
             log(
-                f"[FFmpeg] ✗ Split error: "
-                f"{split_result.stderr[:1000]}"
+                f"Could not remove MP4: {e}"
             )
 
-            full_mp4_path.unlink(
-                missing_ok=True
-            )
+        # ----------------------------------------------------
+        # State update
+        # ----------------------------------------------------
 
+        if STREAM_ID:
             kv_update_state(
                 STREAM_ID,
-                "failed",
-                error="Split failed"
+                "completed",
             )
 
             kv_delete_state(
                 STREAM_ID
             )
 
-            raise RuntimeError(
-                "FFmpeg split failed"
-            )
-
-
-        full_mp4_path.unlink()
-
-
-        final_files = sorted(
-            RECORDINGS_DIR.glob(
-                f"stream_{STREAM_ID}_part*.mp4"
-            )
-        )
-
-
-        split_time = (
-            time.monotonic() -
-            split_start
-        )
-
-
-        log(
-            f"[✓] Split into "
-            f"{len(final_files)} parts "
-            f"in {split_time:.1f}s"
-        )
-
-
-    send_telegram_notification(
-        f"📤 <b>جاري رفع الفيديو...</b>\n"
-        f"📺 <code>{STREAM_ID}</code>\n"
-        f"📊 الحجم: {total_size:.2f} MB\n"
-        f"📦 الأجزاء: {len(final_files)}"
-    )
-
-
-    log(
-        f"[*] Uploading "
-        f"{len(final_files)} files "
-        f"to Telegram..."
-    )
-
-
-    kv_update_state(
-        STREAM_ID,
-        "uploading",
-        file_size_mb=total_size
-    )
-
-
-    upload_start = time.monotonic()
-
-    success_count = 0
-    failed_count = 0
-
-    total_parts = len(final_files)
-
-
-    for i, file_path in enumerate(
-        final_files,
-        1
-    ):
-        if not verify_video_file(
-            file_path
-        ):
-            log(
-                f"[TG] ⚠ Skipping invalid "
-                f"file: {file_path.name}"
-            )
-
-            failed_count += 1
-            continue
-
-
-        if send_to_telegram_with_retry(
-            file_path,
-            STREAM_ID,
-            i,
-            total_parts
-        ):
-            success_count += 1
-
-            try:
-                file_path.unlink()
-
-            except Exception:
-                pass
-
-        else:
-            failed_count += 1
-
-
-        time.sleep(1)
-
-
-    upload_time = (
-        time.monotonic() -
-        upload_start
-    )
-
-
-    log(
-        f"[✓] Uploaded in "
-        f"{upload_time:.1f}s: "
-        f"{success_count}/{total_parts} "
-        f"(failed: {failed_count})"
-    )
-
-
-    kv_update_state(
-        STREAM_ID,
-        "finished",
-        file_size_mb=total_size,
-        telegram_sent=(
-            success_count > 0
-        )
-    )
-
-
-    if success_count > 0:
-        kv_delete_state(
-            STREAM_ID
-        )
-
-
-    if success_count == total_parts:
         send_telegram_notification(
-            f"✅ <b>تم رفع الفيديو بنجاح</b>\n"
-            f"📺 <code>{STREAM_ID}</code>\n"
-            f"📦 الأجزاء: "
-            f"{success_count}/{total_parts}\n"
-            f"📊 الحجم: "
-            f"{total_size:.2f} MB"
+            "✅ Recording completed successfully."
         )
 
-    elif success_count > 0:
-        send_telegram_notification(
-            f"⚠️ <b>تم رفع الفيديو جزئياً</b>\n"
-            f"📺 <code>{STREAM_ID}</code>\n"
-            f"📦 الأجزاء: "
-            f"{success_count}/{total_parts}\n"
-            f"❌ فشل: "
-            f"{failed_count}"
-        )
+        log_section("RECORDING COMPLETED")
 
-    else:
-        send_telegram_notification(
-            f"❌ <b>فشل رفع الفيديو</b>\n"
-            f"📺 <code>{STREAM_ID}</code>\n"
-            f"📊 الحجم: "
-            f"{total_size:.2f} MB"
-        )
+        return True
 
+    except Exception:
+        try:
+            if webm_file is not None:
+                webm_file.flush()
+                webm_file.close()
+                webm_file = None
+        except Exception:
+            pass
 
-    total_time = (
-        time.monotonic() -
-        total_start
-    )
+        try:
+            await browser.close()
+        except Exception:
+            pass
 
-
-    log(
-        f"\n[✓✓✓] DONE! "
-        f"Total: {total_time:.1f}s | "
-        f"Convert: {convert_time:.1f}s | "
-        f"Upload: {upload_time:.1f}s"
-    )
-
-
-    return []
+        raise
 
 
 # ============================================================
@@ -2187,15 +2088,17 @@ async def run_recording(playwright):
 async def main():
     log_section(
         "SUPERLIVE RECORDER "
-        "(STABLE + IMPROVEMENTS)"
+        "(TIMESTAMP-PRESERVING MP4 CONVERSION)"
     )
 
-    from playwright.async_api import async_playwright
+    from playwright.async_api import (
+        async_playwright
+    )
 
-    async with async_playwright() as p:
+    async with async_playwright() as playwright:
         return await asyncio.wait_for(
-            run_recording(p),
-            timeout=GLOBAL_WATCHDOG_SECONDS
+            run_recording(playwright),
+            timeout=GLOBAL_WATCHDOG_SECONDS,
         )
 
 
@@ -2205,22 +2108,25 @@ if __name__ == "__main__":
 
     except Exception as e:
         log(
-            f"\n[FATAL] "
-            f"{type(e).__name__}: {e}"
+            f"FATAL ERROR: {e}"
         )
 
         import traceback
 
         traceback.print_exc()
 
-        kv_update_state(
-            STREAM_ID,
-            "failed",
-            error=str(e)
-        )
+        try:
+            if STREAM_ID:
+                kv_update_state(
+                    STREAM_ID,
+                    "failed",
+                    error=str(e),
+                )
 
-        kv_delete_state(
-            STREAM_ID
-        )
+                kv_delete_state(
+                    STREAM_ID
+                )
+        except Exception:
+            pass
 
         sys.exit(1)
