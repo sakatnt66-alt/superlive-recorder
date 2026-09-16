@@ -279,7 +279,7 @@ def run_command(command, timeout=None):
     return result
 
 
-def verify_video_file(path):
+def verify_video_file(path, allow_zero_duration=False):
     path = Path(path)
 
     if not path.exists():
@@ -300,11 +300,13 @@ def verify_video_file(path):
         "-hide_banner",
         "-v",
         "error",
+        "-count_packets",
         "-show_entries",
         "format=format_name,duration,size",
         "-show_entries",
         "stream=index,codec_type,codec_name,width,height,"
-        "r_frame_rate,avg_frame_rate,time_base,start_time,duration",
+        "r_frame_rate,avg_frame_rate,time_base,start_time,"
+        "duration,nb_read_packets",
         "-of",
         "json",
         str(path),
@@ -331,28 +333,92 @@ def verify_video_file(path):
         fmt = info.get("format", {})
         streams = info.get("streams", [])
 
-        duration = float(fmt.get("duration") or 0)
+        try:
+            duration = float(fmt.get("duration") or 0)
+        except Exception:
+            duration = 0.0
 
-        if duration <= 1:
+        video_streams = [
+            s
+            for s in streams
+            if s.get("codec_type") == "video"
+        ]
+
+        if not video_streams:
             log(
-                f"Video verification failed: "
-                f"duration={duration}"
+                "Video verification failed: "
+                "no video stream"
             )
             return False
 
-        has_video = any(
-            s.get("codec_type") == "video"
-            for s in streams
-        )
+        video_stream = video_streams[0]
 
-        if not has_video:
-            log("Video verification failed: no video stream")
+        try:
+            packet_count = int(
+                video_stream.get("nb_read_packets") or 0
+            )
+        except Exception:
+            packet_count = 0
+
+        codec_name = video_stream.get("codec_name")
+        width = int(video_stream.get("width") or 0)
+        height = int(video_stream.get("height") or 0)
+
+        if not codec_name:
+            log(
+                "Video verification failed: "
+                "video codec is missing"
+            )
             return False
+
+        if width <= 0 or height <= 0:
+            log(
+                "Video verification failed: "
+                f"invalid video dimensions {width}x{height}"
+            )
+            return False
+
+        if packet_count <= 0:
+            log(
+                "Video verification failed: "
+                "video stream contains no readable packets"
+            )
+            return False
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # MediaRecorder WebM files can legitimately report
+        # format.duration=0 through ffprobe even though the
+        # actual WebM contains valid playable video packets.
+        #
+        # For the original WebM we therefore validate the
+        # actual video stream and packet count instead of
+        # requiring a non-zero container duration.
+        # ----------------------------------------------------
+
+        if duration <= 1:
+            if allow_zero_duration:
+                log(
+                    "WARNING: WebM container duration is "
+                    f"{duration}, but video stream is valid "
+                    f"({codec_name}, {width}x{height}, "
+                    f"packets={packet_count})."
+                )
+            else:
+                log(
+                    f"Video verification failed: "
+                    f"duration={duration}"
+                )
+                return False
 
         log(
             f"Verified video: "
             f"{size / 1024 / 1024:.2f} MB, "
-            f"duration={duration:.3f}s"
+            f"duration={duration:.3f}s, "
+            f"codec={codec_name}, "
+            f"resolution={width}x{height}, "
+            f"video_packets={packet_count}"
         )
 
         return True
@@ -1272,43 +1338,51 @@ WEBRTC_HOOK = r"""
         window.__superliveUploadQueue = [];
         window.__superliveIsUploading = false;
 
-        recorder.ondataavailable = async (event) => {
-            try {
-                if (
-                    !event.data ||
-                    event.data.size < 1
-                ) {
-                    return;
+        /*
+         * IMPORTANT FINAL-CHUNK SYNCHRONIZATION
+         *
+         * MediaRecorder.stop() does not make the final
+         * dataavailable event synchronously available.
+         *
+         * Additionally, dataavailable itself is async here
+         * because event.data.arrayBuffer() is awaited.
+         *
+         * Therefore we track every pending dataavailable
+         * operation and only declare the recorder fully finalized
+         * after:
+         *
+         *   1. recorder emitted "stop"
+         *   2. every pending dataavailable handler finished
+         *   3. all final buffers have been placed into the queue
+         *
+         * This prevents Python from closing the WebM too early.
+         */
+
+        let pendingDataTasks = 0;
+        let recorderStopFired = false;
+        let finalDataResolve = null;
+
+        window.__superliveFinalDataReady = false;
+
+        window.__superliveFinalDataPromise =
+            new Promise((resolve) => {
+                finalDataResolve = resolve;
+            });
+
+        function maybeResolveFinalData() {
+            if (
+                recorderStopFired &&
+                pendingDataTasks === 0 &&
+                !window.__superliveFinalDataReady
+            ) {
+                window.__superliveFinalDataReady = true;
+
+                if (finalDataResolve) {
+                    finalDataResolve(true);
+                    finalDataResolve = null;
                 }
-
-                window.__superliveChunkCount++;
-                window.__superliveLastChunkAt =
-                    performance.now();
-                window.__superliveLastChunkSize =
-                    event.data.size;
-
-                const buffer =
-                    await event.data.arrayBuffer();
-
-                window.__superliveUploadQueue.push(
-                    new Uint8Array(buffer)
-                );
-
-                processQueue();
-            } catch (e) {
-                console.error(
-                    "superlive dataavailable error",
-                    e
-                );
             }
-        };
-
-        recorder.onerror = (event) => {
-            console.error(
-                "superlive MediaRecorder error",
-                event
-            );
-        };
+        }
 
         async function processQueue() {
             if (
@@ -1328,13 +1402,22 @@ WEBRTC_HOOK = r"""
                         window.__superliveUploadQueue.shift();
 
                     try {
-                        await fetch(
-                            "/__slr_chunk",
-                            {
-                                method: "POST",
-                                body: chunk
-                            }
-                        );
+                        const response =
+                            await fetch(
+                                "/__slr_chunk",
+                                {
+                                    method: "POST",
+                                    body: chunk
+                                }
+                            );
+
+                        if (!response.ok) {
+                            throw new Error(
+                                "HTTP " +
+                                response.status
+                            );
+                        }
+
                     } catch (e) {
                         console.error(
                             "superlive chunk upload error",
@@ -1356,8 +1439,107 @@ WEBRTC_HOOK = r"""
             } finally {
                 window.__superliveIsUploading =
                     false;
+
+                /*
+                 * If another chunk was queued during the
+                 * previous processing pass, immediately make
+                 * another attempt.
+                 */
+                if (
+                    window.__superliveUploadQueue.length
+                ) {
+                    processQueue();
+                }
             }
         }
+
+        recorder.ondataavailable = async (event) => {
+            pendingDataTasks++;
+
+            try {
+                if (
+                    !event.data ||
+                    event.data.size < 1
+                ) {
+                    return;
+                }
+
+                window.__superliveChunkCount++;
+                window.__superliveLastChunkAt =
+                    performance.now();
+                window.__superliveLastChunkSize =
+                    event.data.size;
+
+                const buffer =
+                    await event.data.arrayBuffer();
+
+                window.__superliveUploadQueue.push(
+                    new Uint8Array(buffer)
+                );
+
+            } catch (e) {
+                console.error(
+                    "superlive dataavailable error",
+                    e
+                );
+
+            } finally {
+                pendingDataTasks--;
+
+                /*
+                 * The buffer is now safely in the queue.
+                 * Only after this point may final-data readiness
+                 * be declared.
+                 */
+                maybeResolveFinalData();
+
+                processQueue();
+            }
+        };
+
+        recorder.onstop = () => {
+            recorderStopFired = true;
+
+            /*
+             * MediaRecorder fires the final dataavailable
+             * before the stop event, but our dataavailable handler
+             * itself is asynchronous, so pendingDataTasks may
+             * still be > 0 here.
+             */
+            maybeResolveFinalData();
+        };
+
+        recorder.onerror = (event) => {
+            console.error(
+                "superlive MediaRecorder error",
+                event
+            );
+        };
+
+        window.__superliveWaitRecorderFinal =
+            async (timeoutMs) => {
+                if (
+                    window.__superliveFinalDataReady
+                ) {
+                    return true;
+                }
+
+                const timeoutPromise =
+                    new Promise((resolve) => {
+                        setTimeout(
+                            () => resolve(false),
+                            timeoutMs
+                        );
+                    });
+
+                const result =
+                    await Promise.race([
+                        window.__superliveFinalDataPromise,
+                        timeoutPromise
+                    ]);
+
+                return result === true;
+            };
 
         recorder.start(timeslice);
 
@@ -1426,7 +1608,15 @@ WEBRTC_HOOK = r"""
                 videoTrack &&
                 videoTrack.getSettings
                     ? videoTrack.getSettings()
-                    : null
+                    : null,
+
+            recorderState:
+                window.__superliveRecorder
+                    ? window.__superliveRecorder.state
+                    : null,
+
+            finalDataReady:
+                !!window.__superliveFinalDataReady
         };
     };
 
@@ -1439,6 +1629,9 @@ WEBRTC_HOOK = r"""
             recorder.state !== "inactive"
         ) {
             recorder.stop();
+        } else {
+            recorderStopFired = true;
+            maybeResolveFinalData();
         }
     };
 })();
@@ -1869,6 +2062,42 @@ async def run_recording(playwright):
             )
 
         # ----------------------------------------------------
+        # WAIT FOR ACTUAL FINAL DATAAVAILABLE
+        # ----------------------------------------------------
+
+        log(
+            "Waiting for MediaRecorder final "
+            "dataavailable event..."
+        )
+
+        final_data_ready = False
+
+        try:
+            final_data_ready = await page.evaluate(
+                """
+                () =>
+                    window.__superliveWaitRecorderFinal(
+                        15000
+                    )
+                """
+            )
+        except Exception as e:
+            log(
+                f"Final MediaRecorder wait error: {e}"
+            )
+
+        if final_data_ready:
+            log(
+                "MediaRecorder final dataavailable "
+                "processing completed"
+            )
+        else:
+            log(
+                "WARNING: Timed out waiting for "
+                "MediaRecorder final dataavailable"
+            )
+
+        # ----------------------------------------------------
         # Allow upload queue to drain
         # ----------------------------------------------------
 
@@ -1882,7 +2111,7 @@ async def run_recording(playwright):
         while (
             time.monotonic()
             - drain_started
-            < 15
+            < 30
         ):
             try:
                 status = await page.evaluate(
@@ -1906,9 +2135,20 @@ async def run_recording(playwright):
                     )
                 )
 
+                final_ready = bool(
+                    status.get(
+                        "finalDataReady",
+                        False,
+                    )
+                )
+
                 if (
                     queue_length == 0
                     and not uploading
+                    and (
+                        final_ready
+                        or final_data_ready
+                    )
                 ):
                     break
 
@@ -1916,6 +2156,29 @@ async def run_recording(playwright):
                 pass
 
             await asyncio.sleep(0.2)
+
+        # ----------------------------------------------------
+        # Final status before closing WebM
+        # ----------------------------------------------------
+
+        try:
+            final_status = await page.evaluate(
+                """
+                () =>
+                    window.__superliveGetStatus()
+                """
+            )
+
+            log(
+                "Final recorder status: "
+                + json.dumps(
+                    final_status,
+                    ensure_ascii=False,
+                )
+            )
+
+        except Exception:
+            pass
 
         log(
             f"Final WebM received: "
@@ -1941,7 +2204,10 @@ async def run_recording(playwright):
 
         log_section("VERIFY ORIGINAL WEBM")
 
-        if not verify_video_file(webm_path):
+        if not verify_video_file(
+            webm_path,
+            allow_zero_duration=True,
+        ):
             raise RuntimeError(
                 "Original WebM failed verification"
             )
