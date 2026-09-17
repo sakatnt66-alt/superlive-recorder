@@ -1083,24 +1083,17 @@ def convert_webm_to_mp4(
     """
     Convert a COMPLETE MediaRecorder WebM into H.264/AAC MP4.
 
-    The important design rule here is:
-
-        Do not manufacture a CFR timeline.
-
-    The WebM is expected to contain the original MediaRecorder
-    timestamps. Video timing is therefore preserved as VFR.
+    The source WebM has unreliable container frame-rate metadata
+    (ffprobe reports 1000 fps even though the live track is about 30 fps).
+    Convert it to a stable 30 fps CFR timeline so playback does not inherit
+    large VFR timestamp gaps. The 30 fps value is based on the live track
+    reported by MediaStream, not the bogus WebM r_frame_rate metadata.
 
     Audio timestamps are normalized separately because the
     previous recordings showed actual backward audio timestamps.
 
-    This function deliberately does NOT use:
-
-        -fflags +genpts
-        fps=30
-        -r 30
-        -fps_mode cfr
-        -vsync cfr
-        forced keyframes
+    This function deliberately does NOT use the WebM-reported 1000 fps
+    as the output frame rate. It uses a fixed 30 fps CFR output instead.
     """
 
     webm_path = Path(webm_path)
@@ -1203,10 +1196,11 @@ def convert_webm_to_mp4(
         "-vf",
         "pad=width=ceil(iw/2)*2:"
         "height=ceil(ih/2)*2:"
-        "color=black",
+        "color=black,"
+        "fps=30",
 
         "-fps_mode:v",
-        "passthrough",
+        "cfr",
 
         "-c:v",
         "libx264",
@@ -1264,6 +1258,8 @@ def convert_webm_to_mp4(
 
         "-max_interleave_delta",
         "0",
+
+        "-shortest",
 
         # ----------------------------------------------------
         # MP4
