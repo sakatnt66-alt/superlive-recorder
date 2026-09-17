@@ -264,13 +264,9 @@ KEEP_SOURCE_WEBM = os.environ.get(
 #   2) AB_TEST_MODE=record
 #
 # In source_only mode the script does not create WebM/MP4 and does not upload.
-AB_TEST_MODE = os.environ.get(
-    "AB_TEST_MODE", "record"
-).strip().lower()
+AB_TEST_MODE = "source_only"
 
-DIAGNOSTIC_SECONDS = int(
-    os.environ.get("DIAGNOSTIC_SECONDS", "300")
-)
+DIAGNOSTIC_SECONDS = 300
 
 USER_AGENT = (
 "Mozilla/5.0 (X11; Linux x86_64) "
