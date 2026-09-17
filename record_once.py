@@ -227,7 +227,7 @@ os.environ.get("TEMP_DIR", "tmp_recordings")
 RECORDING_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-VIDEO_BITRATE = 2_500_000
+VIDEO_BITRATE = 8_000_000
 AUDIO_BITRATE = 192_000
 
 VIDEO_WAIT_SECONDS = 60
@@ -1376,11 +1376,10 @@ def convert_webm_to_mp4(
         "-vf",
         "pad=width=ceil(iw/2)*2:"
         "height=ceil(ih/2)*2:"
-        "color=black,"
-        "fps=30",
+        "color=black",
 
         "-fps_mode:v",
-        "cfr",
+        "passthrough",
 
         "-c:v",
         "libx264",
@@ -2018,54 +2017,93 @@ window.__superlivePrepare = () => {
     let selectedStream = null;
     let selectedVideoElement = null;
 
-    // Select only a real <video srcObject>, never an arbitrary global track.
-    // This prevents recording a recommendation/preview/stale peer instead of
-    // the main livestream player.
+    // Select the active livestream player, not an arbitrary WebRTC track.
+    // Prefer a visible/playing player that owns its own live audio track;
+    // video-only previews are deliberately lower priority.
     const candidates = [];
     for (let index = 0; index < videos.length; index++) {
         const video = videos[index];
         try {
             const stream = video.srcObject;
             if (!stream) continue;
-            const liveVideoTrack = stream.getVideoTracks().find(t => t.readyState === "live");
+
+            const liveVideoTrack = stream.getVideoTracks().find(
+                t => t.readyState === "live"
+            );
             if (!liveVideoTrack) continue;
+
             const rect = video.getBoundingClientRect();
             const style = getComputedStyle(video);
             const area = Math.max(0, rect.width) * Math.max(0, rect.height);
-            const visible = style.display !== "none" && style.visibility !== "hidden" &&
-                Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
-            const pixels = Math.max(0, video.videoWidth || 0) * Math.max(0, video.videoHeight || 0);
+            const visible =
+                style.display !== "none" &&
+                style.visibility !== "hidden" &&
+                Number(style.opacity || 1) > 0 &&
+                rect.width > 0 &&
+                rect.height > 0;
+            const playing = !video.paused && !video.ended;
+            const ready = video.readyState >= 3;
+            const hasAudio = stream.getAudioTracks().some(
+                t => t.readyState === "live"
+            );
+
             let score = 0;
-            if (visible) score += 1000000000;
-            score += Math.min(area, 1000000) * 1000;
-            score += Math.min(pixels, 10000000);
-            if (!video.paused) score += 5000000;
-            if (video.readyState >= 3) score += 1000000;
-            if (video.autoplay) score += 100000;
-            candidates.push({ video, stream, track: liveVideoTrack, index, score, visible, area, width: video.videoWidth || 0, height: video.videoHeight || 0 });
+            if (visible) score += 1_000_000_000;
+            if (playing) score += 100_000_000;
+            if (ready) score += 10_000_000;
+            if (hasAudio) score += 5_000_000;
+            if (video.autoplay) score += 1_000_000;
+
+            let trackFrameRate = 0;
+            try {
+                const settings = liveVideoTrack.getSettings ? liveVideoTrack.getSettings() : null;
+                const value = settings && Number(settings.frameRate);
+                if (Number.isFinite(value) && value > 0) trackFrameRate = value;
+            } catch (e) {}
+
+            // Prefer a normal live cadence when all other player signals are
+            // comparable. A stale/preview track on this page was observed at
+            // roughly 14 FPS while the real player was around 30 FPS.
+            score += Math.min(trackFrameRate, 60) * 100_000;
+            score += Math.min(area, 2_000_000);
+
+            candidates.push({
+                video, stream, track: liveVideoTrack, index, score,
+                visible, playing, ready, hasAudio, area,
+                width: video.videoWidth || 0,
+                height: video.videoHeight || 0
+            });
         } catch (e) {
             console.warn("superlive video candidate scan error", e);
         }
     }
-    candidates.sort((a, b) => b.score - a.score);
-    if (candidates.length) {
+
+    const audioCandidates = candidates.filter(c => c.hasAudio);
+    const eligible = audioCandidates.length ? audioCandidates : candidates;
+    eligible.sort((a, b) => (b.score - a.score) || (a.index - b.index));
+
+    if (eligible.length) {
         console.info("superlive video candidates", candidates.map(c => ({
-            index: c.index, width: c.width, height: c.height, visible: c.visible,
-            area: Math.round(c.area), paused: c.video.paused, readyState: c.video.readyState,
+            index: c.index, width: c.width, height: c.height,
+            visible: c.visible, playing: c.playing, ready: c.ready,
+            hasAudio: c.hasAudio,
+            frameRate: Number(c.trackFrameRate.toFixed(2)),
+            area: Math.round(c.area),
             score: Math.round(c.score)
         })));
-        const best = candidates[0];
+        const best = eligible[0];
         selectedVideoTrack = best.track;
         selectedStream = best.stream;
         selectedVideoElement = best.video;
     }
+
     if (!selectedVideoTrack || !selectedVideoElement) {
-        throw new Error("No live video element/track found");
+        throw new Error("No active livestream video element/track found");
     }
 
-    if (!candidates[0].visible) {
+    if (!eligible[0].visible || !eligible[0].playing || !eligible[0].ready) {
         throw new Error(
-            "Live video candidates exist, but none is visibly rendered; refusing to record an arbitrary/hidden stream"
+            "Live video candidates exist, but none is visibly and actively playing; refusing to record an arbitrary stream"
         );
     }
 
