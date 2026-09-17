@@ -3291,9 +3291,11 @@ async def run_recording(playwright):
                         """
                     )
 
-                    video_state = diag.get("videoReadyState")
-
-                    if video_state == 4 or diag.get("videoEnded"):
+                    # HTMLMediaElement.readyState == 4 means HAVE_ENOUGH_DATA;
+                    # it does NOT mean playback has ended.  The previous check
+                    # incorrectly treated normal readyState=4 as end-of-video,
+                    # causing Test A to stop after about one second.
+                    if diag.get("videoEnded"):
                         log(
                             "Video playback ended during source-only test."
                         )
