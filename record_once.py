@@ -227,7 +227,7 @@ os.environ.get("TEMP_DIR", "tmp_recordings")
 RECORDING_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-VIDEO_BITRATE = 3_000_000
+VIDEO_BITRATE = 2_500_000
 AUDIO_BITRATE = 192_000
 
 VIDEO_WAIT_SECONDS = 60
@@ -235,6 +235,15 @@ PAGE_TIMEOUT_MS = 30_000
 FIRST_CHUNK_TIMEOUT_SECONDS = 10
 
 STREAM_ID = os.environ.get("STREAM_ID", "")
+if not STREAM_ID:
+    import re
+    _stream_match = re.search(
+        r"/livestream/([^/?#]+)",
+        URL,
+        re.IGNORECASE,
+    )
+    if _stream_match:
+        STREAM_ID = _stream_match.group(1)
 
 STOP_CHECK_INTERVAL = 3
 STREAM_IDLE_TIMEOUT = 20
@@ -1859,6 +1868,7 @@ window.__superliveVideoTracks = [];
 window.__superliveAudioTracks = [];
 window.__superliveStreams = [];
 window.__superliveTrackLinks = new Map();
+window.__superliveTrackConnections = new Map();
 
 // ------------------------------------------------------------
 // FRAME-CADENCE DIAGNOSTICS
@@ -1965,6 +1975,8 @@ class WrappedRTCPeerConnection
                     const streams =
                         event.streams || [];
 
+                    window.__superliveTrackConnections.set(track, this);
+
                     if (streams.length) {
                         for (
                             const stream
@@ -2004,55 +2016,56 @@ window.__superlivePrepare = () => {
 
     let selectedVideoTrack = null;
     let selectedStream = null;
+    let selectedVideoElement = null;
 
-    for (const video of videos) {
+    // Select only a real <video srcObject>, never an arbitrary global track.
+    // This prevents recording a recommendation/preview/stale peer instead of
+    // the main livestream player.
+    const candidates = [];
+    for (let index = 0; index < videos.length; index++) {
+        const video = videos[index];
         try {
-            const stream =
-                video.srcObject;
-
-            if (!stream) {
-                continue;
-            }
-
-            const videoTracks =
-                stream.getVideoTracks();
-
-            const liveVideoTrack =
-                videoTracks.find(
-                    t =>
-                        t.readyState
-                        === "live"
-                );
-
-            if (liveVideoTrack) {
-                selectedVideoTrack =
-                    liveVideoTrack;
-
-                selectedStream =
-                    stream;
-
-                break;
-            }
+            const stream = video.srcObject;
+            if (!stream) continue;
+            const liveVideoTrack = stream.getVideoTracks().find(t => t.readyState === "live");
+            if (!liveVideoTrack) continue;
+            const rect = video.getBoundingClientRect();
+            const style = getComputedStyle(video);
+            const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+            const visible = style.display !== "none" && style.visibility !== "hidden" &&
+                Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
+            const pixels = Math.max(0, video.videoWidth || 0) * Math.max(0, video.videoHeight || 0);
+            let score = 0;
+            if (visible) score += 1000000000;
+            score += Math.min(area, 1000000) * 1000;
+            score += Math.min(pixels, 10000000);
+            if (!video.paused) score += 5000000;
+            if (video.readyState >= 3) score += 1000000;
+            if (video.autoplay) score += 100000;
+            candidates.push({ video, stream, track: liveVideoTrack, index, score, visible, area, width: video.videoWidth || 0, height: video.videoHeight || 0 });
         } catch (e) {
-            console.warn(
-                "superlive video scan error",
-                e
-            );
+            console.warn("superlive video candidate scan error", e);
         }
     }
-
-    if (!selectedVideoTrack) {
-        selectedVideoTrack =
-            window.__superliveVideoTracks.find(
-                t =>
-                    t.readyState
-                    === "live"
-            );
+    candidates.sort((a, b) => b.score - a.score);
+    if (candidates.length) {
+        console.info("superlive video candidates", candidates.map(c => ({
+            index: c.index, width: c.width, height: c.height, visible: c.visible,
+            area: Math.round(c.area), paused: c.video.paused, readyState: c.video.readyState,
+            score: Math.round(c.score)
+        })));
+        const best = candidates[0];
+        selectedVideoTrack = best.track;
+        selectedStream = best.stream;
+        selectedVideoElement = best.video;
+    }
+    if (!selectedVideoTrack || !selectedVideoElement) {
+        throw new Error("No live video element/track found");
     }
 
-    if (!selectedVideoTrack) {
+    if (!candidates[0].visible) {
         throw new Error(
-            "No live video track found"
+            "Live video candidates exist, but none is visibly rendered; refusing to record an arbitrary/hidden stream"
         );
     }
 
@@ -2087,14 +2100,7 @@ window.__superlivePrepare = () => {
         }
     }
 
-    if (!selectedAudioTrack) {
-        selectedAudioTrack =
-            window.__superliveAudioTracks.find(
-                t =>
-                    t.readyState
-                    === "live"
-            );
-    }
+    // Never attach audio from an unrelated global track.
 
     const tracks = [
         selectedVideoTrack
@@ -2128,23 +2134,84 @@ window.__superlivePrepare = () => {
     window.__superliveRecorderStopFired = false;
     window.__superliveFinalDataReady = false;
 
-    window.__superliveVideoElement = null;
+    window.__superliveVideoElement = selectedVideoElement;
 
-    for (const video of videos) {
-        try {
-            const stream = video.srcObject;
-            if (stream &&
-                stream.getVideoTracks().includes(selectedVideoTrack)) {
-                window.__superliveVideoElement = video;
-                break;
-            }
-        } catch (e) {
-            console.warn(
-                "superlive video element selection error",
-                e
-            );
+    // Low-overhead live-end monitor. Track "ended" is decisive; prolonged
+    // mute/no-progress or failed/closed WebRTC connection is also decisive.
+    window.__superliveEndState = {
+        ended: false, reason: null, lastProgressAt: performance.now(),
+        lastCurrentTime: selectedVideoElement.currentTime || 0,
+        lastTotalVideoFrames: 0, mutedSince: selectedVideoTrack.muted ? performance.now() : null,
+        connectionBadSince: null, monitorTimer: null
+    };
+    try {
+        const q = selectedVideoElement.getVideoPlaybackQuality ? selectedVideoElement.getVideoPlaybackQuality() : null;
+        window.__superliveEndState.lastTotalVideoFrames = q && q.totalVideoFrames != null ? q.totalVideoFrames : 0;
+    } catch (e) {}
+    const markEnded = (reason) => {
+        if (!window.__superliveEndState.ended) {
+            window.__superliveEndState.ended = true;
+            window.__superliveEndState.reason = reason;
+            console.info("superlive stream end detected", reason);
         }
-    }
+    };
+    selectedVideoTrack.addEventListener("ended", () => markEnded("video_track_ended"));
+    selectedVideoTrack.addEventListener("mute", () => {
+        if (!window.__superliveEndState.mutedSince) window.__superliveEndState.mutedSince = performance.now();
+    });
+    selectedVideoTrack.addEventListener("unmute", () => {
+        window.__superliveEndState.mutedSince = null;
+        window.__superliveEndState.lastProgressAt = performance.now();
+    });
+    selectedVideoElement.addEventListener("ended", () => markEnded("video_element_ended"));
+    window.__superliveTrackConnection = window.__superliveTrackConnections ?
+        window.__superliveTrackConnections.get(selectedVideoTrack) : null;
+    window.__superliveEndState.monitorTimer = setInterval(() => {
+        try {
+            const state = window.__superliveEndState;
+            if (!state || state.ended) return;
+            const now = performance.now();
+            const video = window.__superliveVideoElement;
+            const track = window.__preparedVideoTrack;
+            if (!video || !track) return;
+            if (track.readyState === "ended") return markEnded("video_track_ended");
+            if (video.ended) return markEnded("video_element_ended");
+            let totalFrames = state.lastTotalVideoFrames;
+            try {
+                const q = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
+                if (q && q.totalVideoFrames != null) totalFrames = q.totalVideoFrames;
+            } catch (e) {}
+            const currentTime = Number(video.currentTime || 0);
+            const progressed = currentTime > Number(state.lastCurrentTime || 0) + 0.02 ||
+                totalFrames > Number(state.lastTotalVideoFrames || 0);
+            if (progressed) {
+                state.lastProgressAt = now;
+                state.lastCurrentTime = currentTime;
+                state.lastTotalVideoFrames = totalFrames;
+            }
+            if (track.muted) {
+                if (!state.mutedSince) state.mutedSince = now;
+            } else {
+                state.mutedSince = null;
+            }
+            const connection = window.__superliveTrackConnection;
+            const connectionState = connection ? connection.connectionState : null;
+            if (connectionState === "failed" || connectionState === "closed") {
+                if (!state.connectionBadSince) state.connectionBadSince = now;
+            } else {
+                state.connectionBadSince = null;
+            }
+            const noProgressMs = now - state.lastProgressAt;
+            const mutedMs = state.mutedSince ? now - state.mutedSince : 0;
+            const badConnectionMs = state.connectionBadSince ? now - state.connectionBadSince : 0;
+            if (track.muted && mutedMs >= 15000 && noProgressMs >= 15000)
+                return markEnded("video_track_muted_and_no_progress_15s");
+            if ((connectionState === "failed" || connectionState === "closed") && badConnectionMs >= 10000 && noProgressMs >= 10000)
+                return markEnded("webrtc_connection_failed_no_progress_10s");
+        } catch (e) {
+            console.warn("superlive end monitor error", e);
+        }
+    }, 2000);
 
     // --------------------------------------------------------
     // OPTIONAL DIAGNOSTICS
@@ -2177,17 +2244,10 @@ window.__superlivePrepare = () => {
     window.__superliveEventLoopTimer = null;
     window.__superliveLongTaskObserver = null;
 
-    // The recorder is driven by the MediaStream track, not by the visible
-    // page renderer. Hide the selected video element to remove unnecessary
-    // compositor/presentation work while leaving the WebRTC track itself
-    // untouched for MediaRecorder. We intentionally do NOT detach srcObject
-    // or stop/pause the track.
-    if (window.__superliveVideoElement) {
-        try {
-            window.__superliveVideoElement.style.visibility = "hidden";
-            window.__superliveVideoElement.style.pointerEvents = "none";
-        } catch (e) {}
-    }
+    // Keep the selected player rendered normally. We deliberately avoid
+    // changing visibility/display/pause state because doing so can alter
+    // the site's decoder/compositor behavior. MediaRecorder consumes the
+    // selected WebRTC track directly.
 
     return {
         hasVideo:
@@ -2825,6 +2885,16 @@ window.__superliveStartRec = (
                 longTaskTotalMs:
                     window.__superliveLongTaskTotalMs || 0,
 
+                streamEnded:
+                    !!(window.__superliveEndState && window.__superliveEndState.ended),
+                streamEndReason:
+                    window.__superliveEndState ? window.__superliveEndState.reason : null,
+                streamNoProgressMs:
+                    window.__superliveEndState ?
+                        Math.max(0, performance.now() - window.__superliveEndState.lastProgressAt) : 0,
+                streamMuted:
+                    !!(window.__preparedVideoTrack && window.__preparedVideoTrack.muted),
+
                 playbackQuality:
                     (() => {
                         const video =
@@ -2943,12 +3013,6 @@ async def run_recording(playwright):
         "--autoplay-policy=no-user-gesture-required",
         "--no-sandbox",
         "--disable-dev-shm-usage",
-        "--disable-extensions",
-        "--disable-default-apps",
-        "--disable-component-update",
-        "--disable-sync",
-        "--disable-background-networking",
-        "--no-first-run",
     ]
 
     browser = await playwright.chromium.launch(
@@ -2958,8 +3022,8 @@ async def run_recording(playwright):
 
     context = await browser.new_context(
         viewport={
-            "width": 1280,
-            "height": 720,
+            "width": 1920,
+            "height": 1080,
         },
         user_agent=USER_AGENT,
     )
@@ -3050,8 +3114,33 @@ async def run_recording(playwright):
             timeout=PAGE_TIMEOUT_MS,
         )
 
+        current_page_url = page.url
+        expected_stream_id = str(STREAM_ID or "").strip()
+        if expected_stream_id:
+            import re
+            page_stream_match = re.search(
+                r"/livestream/([^/?#]+)",
+                current_page_url,
+                re.IGNORECASE,
+            )
+            page_stream_id = (
+                page_stream_match.group(1)
+                if page_stream_match
+                else ""
+            )
+            if page_stream_id != expected_stream_id:
+                raise RuntimeError(
+                    "Target livestream mismatch: "
+                    f"requested={expected_stream_id}, "
+                    f"page={page_stream_id or 'missing'}, "
+                    f"url={current_page_url}"
+                )
+
         log(
             "Page loaded. "
+            f"Target URL verified: {current_page_url}"
+        )
+        log(
             "Waiting for live video..."
         )
 
@@ -3075,56 +3164,27 @@ async def run_recording(playwright):
                                 document.querySelectorAll("video")
                             );
 
+                        const candidates = [];
                         for (const video of videos) {
                             try {
-                                const stream =
-                                    video.srcObject;
-
-                                if (!stream) {
-                                    continue;
-                                }
-
-                                const videoTracks =
-                                    stream.getVideoTracks();
-
-                                const audioTracks =
-                                    stream.getAudioTracks();
-
-                                const liveVideo =
-                                    videoTracks.some(
-                                        t =>
-                                            t.readyState
-                                            === "live"
-                                    );
-
-                                const liveAudio =
-                                    audioTracks.some(
-                                        t =>
-                                            t.readyState
-                                            === "live"
-                                    );
-
-                                if (
-                                    video.videoWidth > 0 &&
-                                    video.videoHeight > 0 &&
-                                    liveVideo
-                                ) {
-                                    return {
-                                        ready: true,
-                                        width:
-                                            video.videoWidth,
-                                        height:
-                                            video.videoHeight,
-                                        audio:
-                                            liveAudio
-                                    };
-                                }
+                                const stream = video.srcObject;
+                                if (!stream) continue;
+                                if (!stream.getVideoTracks().some(t => t.readyState === "live")) continue;
+                                const rect = video.getBoundingClientRect();
+                                const style = getComputedStyle(video);
+                                const visible = style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
+                                const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+                                candidates.push({
+                                    width: video.videoWidth || 0, height: video.videoHeight || 0, area, visible,
+                                    audio: stream.getAudioTracks().some(t => t.readyState === "live")
+                                });
                             } catch (e) {}
                         }
-
-                        return {
-                            ready: false
-                        };
+                        candidates.sort((a,b) => (Number(b.visible)-Number(a.visible)) || (b.area-a.area) || ((b.width*b.height)-(a.width*a.height)));
+                        if (candidates.length && candidates[0].width > 0 && candidates[0].height > 0) {
+                            return { ready: true, width: candidates[0].width, height: candidates[0].height, audio: candidates[0].audio, candidates: candidates.length };
+                        }
+                        return { ready: false, candidates: candidates.length };
                     }
                     """
                 )
@@ -3168,6 +3228,29 @@ async def run_recording(playwright):
                 ensure_ascii=False,
             )
         )
+
+        try:
+            selected_info = await page.evaluate(
+                """
+                () => {
+                    const v = window.__superliveVideoElement;
+                    const t = window.__preparedVideoTrack;
+                    const s = v && v.srcObject;
+                    const r = v ? v.getBoundingClientRect() : null;
+                    return {
+                        videoWidth: v ? v.videoWidth : 0, videoHeight: v ? v.videoHeight : 0,
+                        renderedWidth: r ? r.width : 0, renderedHeight: r ? r.height : 0,
+                        paused: v ? v.paused : null, readyState: v ? v.readyState : null,
+                        videoTrackId: t ? t.id : null,
+                        videoTrackIds: s ? s.getVideoTracks().map(x => x.id) : [],
+                        audioTrackIds: s ? s.getAudioTracks().map(x => x.id) : []
+                    };
+                }
+                """
+            )
+            log("SELECTED TARGET VIDEO: " + json.dumps(selected_info, ensure_ascii=False))
+        except Exception as e:
+            log(f"Selected video diagnostics unavailable: {e}")
 
         if AB_TEST_MODE == "source_only":
             log_section(
@@ -3372,6 +3455,28 @@ async def run_recording(playwright):
                 break
 
             try:
+                current_page_url = page.url
+                import re
+                page_stream_match = re.search(
+                    r"/livestream/([^/?#]+)",
+                    current_page_url,
+                    re.IGNORECASE,
+                )
+                page_stream_id = (
+                    page_stream_match.group(1)
+                    if page_stream_match
+                    else ""
+                )
+                if STREAM_ID and page_stream_id != STREAM_ID:
+                    log(
+                        "Target livestream changed/redirected; stopping safely: "
+                        f"expected={STREAM_ID} actual={page_stream_id or 'missing'}"
+                    )
+                    break
+            except Exception as e:
+                log(f"Target URL check error: {e}")
+
+            try:
                 status = await page.evaluate(
                     """
                     () =>
@@ -3397,6 +3502,13 @@ async def run_recording(playwright):
                     log(
                         "Video track is no longer live: "
                         f"{video_state}"
+                    )
+                    break
+
+                if status.get("streamEnded"):
+                    log(
+                        "LIVE STREAM ENDED: "
+                        f"{status.get('streamEndReason')}"
                     )
                     break
 
@@ -3793,6 +3905,20 @@ async def run_recording(playwright):
 
         webm_file.close()
         webm_file = None
+
+        try:
+            await page.evaluate(
+                """
+                () => {
+                    if (window.__superliveEndState && window.__superliveEndState.monitorTimer) {
+                        clearInterval(window.__superliveEndState.monitorTimer);
+                        window.__superliveEndState.monitorTimer = null;
+                    }
+                }
+                """
+            )
+        except Exception:
+            pass
 
         await browser.close()
 
