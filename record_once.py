@@ -1233,6 +1233,87 @@ def convert_webm_to_mp4(
         )
     )
 
+    # --------------------------------------------------------
+    # THREE-STAGE FRAME-RATE COMPARISON
+    # --------------------------------------------------------
+    # Source/rendered values come from live browser diagnostics.
+    # The WebM value is measured from the actual recorded packet
+    # timestamps, so it is the best available measurement of the
+    # encoded/recorded frame cadence.
+    # --------------------------------------------------------
+    try:
+        source_overall_fps = float(
+            final_status.get(
+                "sourceVideoFpsOverall",
+                0,
+            ) or 0
+        )
+    except Exception:
+        source_overall_fps = 0.0
+
+    try:
+        rendered_overall_fps = float(
+            final_status.get(
+                "renderedVideoFpsOverall",
+                0,
+            ) or 0
+        )
+    except Exception:
+        rendered_overall_fps = 0.0
+
+    recorded_webm_fps = None
+    if webm_timestamp_info:
+        try:
+            recorded_webm_fps = float(
+                webm_timestamp_info.get(
+                    "estimated_avg_fps"
+                )
+                or 0
+            )
+        except Exception:
+            recorded_webm_fps = 0.0
+
+    log_section(
+        "THREE-STAGE FRAME RATE COMPARISON"
+    )
+
+    log(
+        f"Source/WebRTC delivered FPS (overall): "
+        f"{source_overall_fps:.3f}"
+    )
+
+    log(
+        f"Rendered <video> FPS (overall): "
+        f"{rendered_overall_fps:.3f}"
+    )
+
+    if recorded_webm_fps is not None:
+        log(
+            f"Recorded WebM packet FPS (timestamp-based): "
+            f"{recorded_webm_fps:.3f}"
+        )
+
+        log(
+            "Frame-rate gaps: "
+            f"source->rendered="
+            f"{(source_overall_fps - rendered_overall_fps):.3f} FPS, "
+            f"rendered->recorded="
+            f"{(rendered_overall_fps - recorded_webm_fps):.3f} FPS, "
+            f"source->recorded="
+            f"{(source_overall_fps - recorded_webm_fps):.3f} FPS"
+        )
+    else:
+        log(
+            "Recorded WebM packet FPS could not be calculated."
+        )
+
+    log(
+        "Interpretation: source≈rendered means WebRTC/Chromium "
+        "delivery is stable; rendered≫recorded points toward "
+        "MediaRecorder/encoding loss; source≫rendered points "
+        "toward Chromium rendering/decoding loss."
+    )
+
     log_section(
         "FFMPEG WEBM -> MP4"
     )
@@ -1773,6 +1854,35 @@ window.__superliveAudioTracks = [];
 window.__superliveStreams = [];
 window.__superliveTrackLinks = new Map();
 
+// ------------------------------------------------------------
+// FRAME-CADENCE DIAGNOSTICS
+// ------------------------------------------------------------
+// These counters deliberately measure three different stages:
+//
+//   1) sourceVideoFrameCount  = frames delivered by the selected
+//      WebRTC MediaStreamTrack (using a cloned track)
+//   2) renderedVideoFrameCount = frames actually presented by the
+//      page's <video> element (requestVideoFrameCallback)
+//   3) recorded WebM FPS       = measured later from real WebM
+//      packet timestamps after MediaRecorder stops
+//
+// This lets us distinguish source/WebRTC delivery, Chromium
+// rendering, and MediaRecorder/encoding losses without changing
+// the recording stream itself.
+// ------------------------------------------------------------
+window.__superliveSourceVideoFrameCount = 0;
+window.__superliveSourceVideoFrameCountAtLastStatus = 0;
+window.__superliveSourceVideoFrameLastStatusAt = performance.now();
+window.__superliveSourceVideoFrameCallbackActive = false;
+window.__superliveSourceVideoFrameReader = null;
+window.__superliveSourceVideoFrameClone = null;
+
+window.__superliveRenderedVideoFrameCount = 0;
+window.__superliveRenderedVideoFrameCountAtLastStatus = 0;
+window.__superliveRenderedVideoFrameLastStatusAt = performance.now();
+window.__superliveRenderedVideoFrameCallbackActive = false;
+window.__superliveDiagnosticsStartedAt = performance.now();
+
 const OriginalRTCPeerConnection =
     window.RTCPeerConnection;
 
@@ -2017,10 +2127,81 @@ window.__superlivePrepare = () => {
         }
     }
 
+    // --------------------------------------------------------
+    // SOURCE FRAME COUNTER
+    // --------------------------------------------------------
+    // Count actual frames delivered by the selected WebRTC track.
+    // A clone is used so this diagnostic reader never consumes the
+    // frames from the track used by MediaRecorder.
+    window.__superliveSourceVideoFrameCount = 0;
+    window.__superliveSourceVideoFrameCountAtLastStatus = 0;
+    window.__superliveSourceVideoFrameLastStatusAt = performance.now();
+    window.__superliveSourceVideoFrameCallbackActive = false;
+    window.__superliveSourceVideoFrameReader = null;
+    window.__superliveSourceVideoFrameClone = null;
+
+    if (
+        typeof window.MediaStreamTrackProcessor === "function" &&
+        selectedVideoTrack &&
+        typeof selectedVideoTrack.clone === "function"
+    ) {
+        try {
+            const diagnosticClone = selectedVideoTrack.clone();
+            const processor = new MediaStreamTrackProcessor({
+                track: diagnosticClone
+            });
+            const reader = processor.readable.getReader();
+
+            window.__superliveSourceVideoFrameClone = diagnosticClone;
+            window.__superliveSourceVideoFrameReader = reader;
+            window.__superliveSourceVideoFrameCallbackActive = true;
+
+            (async () => {
+                try {
+                    while (true) {
+                        const result = await reader.read();
+
+                        if (result.done) {
+                            break;
+                        }
+
+                        window.__superliveSourceVideoFrameCount += 1;
+
+                        try {
+                            result.value.close();
+                        } catch (e) {}
+                    }
+                } catch (e) {
+                    console.warn(
+                        "superlive source frame counter stopped",
+                        e
+                    );
+                } finally {
+                    window.__superliveSourceVideoFrameCallbackActive = false;
+                }
+            })();
+        } catch (e) {
+            console.warn(
+                "superlive source frame counter unavailable",
+                e
+            );
+            window.__superliveSourceVideoFrameCallbackActive = false;
+        }
+    } else {
+        console.warn(
+            "superlive source frame counter unavailable: " +
+            "MediaStreamTrackProcessor is not supported"
+        );
+    }
+
+    // --------------------------------------------------------
+    // RENDERED FRAME COUNTER
+    // --------------------------------------------------------
     window.__superliveRenderedVideoFrameCount = 0;
     window.__superliveRenderedVideoFrameCountAtLastStatus = 0;
     window.__superliveRenderedVideoFrameLastStatusAt = performance.now();
     window.__superliveRenderedVideoFrameCallbackActive = false;
+    window.__superliveDiagnosticsStartedAt = performance.now();
 
     const videoElement = window.__superliveVideoElement;
 
@@ -2496,6 +2677,92 @@ window.__superliveStartRec = (
                             : 0;
                     })(),
 
+                sourceVideoFrameCount:
+                    window
+                        .__superliveSourceVideoFrameCount
+                    || 0,
+
+                sourceVideoFrameCallbackActive:
+                    !!window
+                        .__superliveSourceVideoFrameCallbackActive,
+
+                sourceVideoFpsSinceStatus:
+                    (() => {
+                        const now = performance.now();
+                        const previousTime =
+                            window
+                                .__superliveSourceVideoFrameLastStatusAt
+                            || now;
+                        const elapsed =
+                            (now - previousTime) / 1000;
+                        const currentCount =
+                            window
+                                .__superliveSourceVideoFrameCount
+                            || 0;
+                        const previousCount =
+                            window
+                                .__superliveSourceVideoFrameCountAtLastStatus
+                            || 0;
+
+                        window
+                            .__superliveSourceVideoFrameLastStatusAt = now;
+                        window
+                            .__superliveSourceVideoFrameCountAtLastStatus =
+                            currentCount;
+
+                        return elapsed > 0
+                            ? (currentCount - previousCount) / elapsed
+                            : 0;
+                    })(),
+
+                diagnosticsElapsedSeconds:
+                    Math.max(
+                        0,
+                        (
+                            performance.now()
+                            - (
+                                window.__superliveDiagnosticsStartedAt
+                                || performance.now()
+                            )
+                        ) / 1000
+                    ),
+
+                renderedVideoFpsOverall:
+                    (() => {
+                        const elapsed =
+                            (
+                                performance.now()
+                                - (
+                                    window.__superliveDiagnosticsStartedAt
+                                    || performance.now()
+                                )
+                            ) / 1000;
+                        const count =
+                            window.__superliveRenderedVideoFrameCount
+                            || 0;
+                        return elapsed > 0
+                            ? count / elapsed
+                            : 0;
+                    })(),
+
+                sourceVideoFpsOverall:
+                    (() => {
+                        const elapsed =
+                            (
+                                performance.now()
+                                - (
+                                    window.__superliveDiagnosticsStartedAt
+                                    || performance.now()
+                                )
+                            ) / 1000;
+                        const count =
+                            window.__superliveSourceVideoFrameCount
+                            || 0;
+                        return elapsed > 0
+                            ? count / elapsed
+                            : 0;
+                    })(),
+
                 finalDataReady:
                     !!window
                         .__superliveFinalDataReady
@@ -2922,11 +3189,27 @@ async def run_recording(playwright):
 
                     rendered_fps = status.get(
                         "renderedVideoFpsSinceStatus"
-                    )
+                    ) or 0.0
 
                     rendered_count = status.get(
                         "renderedVideoFrameCount"
-                    )
+                    ) or 0
+
+                    source_fps = status.get(
+                        "sourceVideoFpsSinceStatus"
+                    ) or 0.0
+
+                    source_count = status.get(
+                        "sourceVideoFrameCount"
+                    ) or 0
+
+                    rendered_overall = status.get(
+                        "renderedVideoFpsOverall"
+                    ) or 0.0
+
+                    source_overall = status.get(
+                        "sourceVideoFpsOverall"
+                    ) or 0.0
 
                     log(
                         "Recording status: "
@@ -2947,8 +3230,12 @@ async def run_recording(playwright):
                         f"{video_state} "
                         f"settings="
                         f"{settings} "
+                        f"source_fps={source_fps:.2f} "
+                        f"source_frames={source_count} "
                         f"rendered_fps={rendered_fps:.2f} "
-                        f"rendered_frames={rendered_count}"
+                        f"rendered_frames={rendered_count} "
+                        f"source_overall_fps={source_overall:.2f} "
+                        f"rendered_overall_fps={rendered_overall:.2f}"
                     )
 
                     log(
@@ -3400,7 +3687,7 @@ async def run_recording(playwright):
 async def main():
     log_section(
     "SUPERLIVE RECORDER "
-    "(ORDERED CHUNKS + STABLE 30FPS CFR MP4)"
+    "(ORDERED CHUNKS + VP8 CAPTURE + STABLE 30FPS CFR MP4)"
     )
 
     from playwright.async_api import (
