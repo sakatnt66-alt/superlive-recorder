@@ -227,7 +227,7 @@ os.environ.get("TEMP_DIR", "tmp_recordings")
 RECORDING_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-VIDEO_BITRATE = 5_000_000
+VIDEO_BITRATE = 3_000_000
 AUDIO_BITRATE = 192_000
 
 VIDEO_WAIT_SECONDS = 60
@@ -1999,6 +1999,55 @@ window.__superlivePrepare = () => {
     window.__preparedAudioTrack =
         selectedAudioTrack;
 
+    window.__superliveVideoElement = null;
+
+    for (const video of videos) {
+        try {
+            const stream = video.srcObject;
+            if (stream &&
+                stream.getVideoTracks().includes(selectedVideoTrack)) {
+                window.__superliveVideoElement = video;
+                break;
+            }
+        } catch (e) {
+            console.warn(
+                "superlive video element selection error",
+                e
+            );
+        }
+    }
+
+    window.__superliveRenderedVideoFrameCount = 0;
+    window.__superliveRenderedVideoFrameCountAtLastStatus = 0;
+    window.__superliveRenderedVideoFrameLastStatusAt = performance.now();
+    window.__superliveRenderedVideoFrameCallbackActive = false;
+
+    const videoElement = window.__superliveVideoElement;
+
+    if (videoElement &&
+        typeof videoElement.requestVideoFrameCallback === "function") {
+        window.__superliveRenderedVideoFrameCallbackActive = true;
+
+        const onVideoFrame = () => {
+            window.__superliveRenderedVideoFrameCount += 1;
+
+            if (window.__superliveVideoElement === videoElement &&
+                videoElement.readyState > 0) {
+                try {
+                    videoElement.requestVideoFrameCallback(onVideoFrame);
+                } catch (e) {
+                    window.__superliveRenderedVideoFrameCallbackActive = false;
+                }
+            }
+        };
+
+        try {
+            videoElement.requestVideoFrameCallback(onVideoFrame);
+        } catch (e) {
+            window.__superliveRenderedVideoFrameCallbackActive = false;
+        }
+    }
+
     return {
         hasVideo:
             !!selectedVideoTrack,
@@ -2409,6 +2458,44 @@ window.__superliveStartRec = (
                     :
                     null,
 
+                renderedVideoFrameCount:
+                    window
+                        .__superliveRenderedVideoFrameCount
+                    || 0,
+
+                renderedVideoFrameCallbackActive:
+                    !!window
+                        .__superliveRenderedVideoFrameCallbackActive,
+
+                renderedVideoFpsSinceStatus:
+                    (() => {
+                        const now = performance.now();
+                        const previousTime =
+                            window
+                                .__superliveRenderedVideoFrameLastStatusAt
+                            || now;
+                        const elapsed =
+                            (now - previousTime) / 1000;
+                        const currentCount =
+                            window
+                                .__superliveRenderedVideoFrameCount
+                            || 0;
+                        const previousCount =
+                            window
+                                .__superliveRenderedVideoFrameCountAtLastStatus
+                            || 0;
+
+                        window
+                            .__superliveRenderedVideoFrameLastStatusAt = now;
+                        window
+                            .__superliveRenderedVideoFrameCountAtLastStatus =
+                            currentCount;
+
+                        return elapsed > 0
+                            ? (currentCount - previousCount) / elapsed
+                            : 0;
+                    })(),
+
                 finalDataReady:
                     !!window
                         .__superliveFinalDataReady
@@ -2491,7 +2578,6 @@ async def run_recording(playwright):
         "--autoplay-policy=no-user-gesture-required",
         "--no-sandbox",
         "--disable-dev-shm-usage",
-        "--disable-gpu",
     ]
 
     browser = await playwright.chromium.launch(
@@ -2834,6 +2920,14 @@ async def run_recording(playwright):
                         "videoSettings"
                     )
 
+                    rendered_fps = status.get(
+                        "renderedVideoFpsSinceStatus"
+                    )
+
+                    rendered_count = status.get(
+                        "renderedVideoFrameCount"
+                    )
+
                     log(
                         "Recording status: "
                         f"chunks="
@@ -2852,7 +2946,9 @@ async def run_recording(playwright):
                         f"video="
                         f"{video_state} "
                         f"settings="
-                        f"{settings}"
+                        f"{settings} "
+                        f"rendered_fps={rendered_fps:.2f} "
+                        f"rendered_frames={rendered_count}"
                     )
 
                     log(
