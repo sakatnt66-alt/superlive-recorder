@@ -264,7 +264,7 @@ KEEP_SOURCE_WEBM = os.environ.get(
 #   2) AB_TEST_MODE=record
 #
 # In source_only mode the script does not create WebM/MP4 and does not upload.
-AB_TEST_MODE = "source_only"
+AB_TEST_MODE = "record"
 
 DIAGNOSTIC_SECONDS = 300
 
@@ -2140,11 +2140,15 @@ window.__superlivePrepare = () => {
     }
 
     // --------------------------------------------------------
-    // SOURCE FRAME COUNTER
+    // OPTIONAL DIAGNOSTICS
     // --------------------------------------------------------
-    // Count actual frames delivered by the selected WebRTC track.
-    // A clone is used so this diagnostic reader never consumes the
-    // frames from the track used by MediaRecorder.
+    // The production recorder deliberately does NOT run a second
+    // MediaStreamTrackProcessor, requestVideoFrameCallback loop,
+    // PerformanceObserver, or event-loop timer. Those diagnostics are
+    // useful for investigation but add work to the same browser process
+    // that must receive/decode/record the live stream.
+    // Keeping them inactive here avoids the diagnostic code becoming part
+    // of the recording bottleneck.
     window.__superliveSourceVideoFrameCount = 0;
     window.__superliveSourceVideoFrameCountAtLastStatus = 0;
     window.__superliveSourceVideoFrameLastStatusAt = performance.now();
@@ -2152,136 +2156,30 @@ window.__superlivePrepare = () => {
     window.__superliveSourceVideoFrameReader = null;
     window.__superliveSourceVideoFrameClone = null;
 
-    if (
-        typeof window.MediaStreamTrackProcessor === "function" &&
-        selectedVideoTrack &&
-        typeof selectedVideoTrack.clone === "function"
-    ) {
-        try {
-            const diagnosticClone = selectedVideoTrack.clone();
-            const processor = new MediaStreamTrackProcessor({
-                track: diagnosticClone
-            });
-            const reader = processor.readable.getReader();
-
-            window.__superliveSourceVideoFrameClone = diagnosticClone;
-            window.__superliveSourceVideoFrameReader = reader;
-            window.__superliveSourceVideoFrameCallbackActive = true;
-
-            (async () => {
-                try {
-                    while (true) {
-                        const result = await reader.read();
-
-                        if (result.done) {
-                            break;
-                        }
-
-                        window.__superliveSourceVideoFrameCount += 1;
-
-                        try {
-                            result.value.close();
-                        } catch (e) {}
-                    }
-                } catch (e) {
-                    console.warn(
-                        "superlive source frame counter stopped",
-                        e
-                    );
-                } finally {
-                    window.__superliveSourceVideoFrameCallbackActive = false;
-                }
-            })();
-        } catch (e) {
-            console.warn(
-                "superlive source frame counter unavailable",
-                e
-            );
-            window.__superliveSourceVideoFrameCallbackActive = false;
-        }
-    } else {
-        console.warn(
-            "superlive source frame counter unavailable: " +
-            "MediaStreamTrackProcessor is not supported"
-        );
-    }
-
-    // --------------------------------------------------------
-    // RENDERED FRAME COUNTER
-    // --------------------------------------------------------
     window.__superliveRenderedVideoFrameCount = 0;
     window.__superliveRenderedVideoFrameCountAtLastStatus = 0;
     window.__superliveRenderedVideoFrameLastStatusAt = performance.now();
     window.__superliveRenderedVideoFrameCallbackActive = false;
     window.__superliveDiagnosticsStartedAt = performance.now();
 
-    // --------------------------------------------------------
-    // EVENT-LOOP / MAIN-THREAD DIAGNOSTICS
-    // --------------------------------------------------------
-    // This does not attempt to measure CPU percentage. Instead it measures
-    // how much the page's main-thread timer is delayed, which can expose
-    // browser-side contention without changing the media pipeline.
     window.__superliveEventLoopSamples = 0;
     window.__superliveEventLoopDelayTotalMs = 0;
     window.__superliveEventLoopMaxDelayMs = 0;
     window.__superliveLongTaskCount = 0;
     window.__superliveLongTaskTotalMs = 0;
     window.__superliveEventLoopTimer = null;
+    window.__superliveLongTaskObserver = null;
 
-    try {
-        const longTaskObserver =
-            new PerformanceObserver((list) => {
-                for (const entry of list.getEntries()) {
-                    window.__superliveLongTaskCount += 1;
-                    window.__superliveLongTaskTotalMs += entry.duration || 0;
-                }
-            });
-        longTaskObserver.observe({type: "longtask", buffered: true});
-        window.__superliveLongTaskObserver = longTaskObserver;
-    } catch (e) {
-        window.__superliveLongTaskObserver = null;
-    }
-
-    const eventLoopTickExpected = performance.now() + 1000;
-    let nextExpected = eventLoopTickExpected;
-    window.__superliveEventLoopTimer = setInterval(() => {
-        const now = performance.now();
-        const delay = Math.max(0, now - nextExpected);
-        window.__superliveEventLoopSamples += 1;
-        window.__superliveEventLoopDelayTotalMs += delay;
-        if (delay > window.__superliveEventLoopMaxDelayMs) {
-            window.__superliveEventLoopMaxDelayMs = delay;
-        }
-        nextExpected += 1000;
-        if (now - nextExpected > 5000) {
-            nextExpected = now + 1000;
-        }
-    }, 1000);
-
-    const videoElement = window.__superliveVideoElement;
-
-    if (videoElement &&
-        typeof videoElement.requestVideoFrameCallback === "function") {
-        window.__superliveRenderedVideoFrameCallbackActive = true;
-
-        const onVideoFrame = () => {
-            window.__superliveRenderedVideoFrameCount += 1;
-
-            if (window.__superliveVideoElement === videoElement &&
-                videoElement.readyState > 0) {
-                try {
-                    videoElement.requestVideoFrameCallback(onVideoFrame);
-                } catch (e) {
-                    window.__superliveRenderedVideoFrameCallbackActive = false;
-                }
-            }
-        };
-
+    // The recorder is driven by the MediaStream track, not by the visible
+    // page renderer. Hide the selected video element to remove unnecessary
+    // compositor/presentation work while leaving the WebRTC track itself
+    // untouched for MediaRecorder. We intentionally do NOT detach srcObject
+    // or stop/pause the track.
+    if (window.__superliveVideoElement) {
         try {
-            videoElement.requestVideoFrameCallback(onVideoFrame);
-        } catch (e) {
-            window.__superliveRenderedVideoFrameCallbackActive = false;
-        }
+            window.__superliveVideoElement.style.visibility = "hidden";
+            window.__superliveVideoElement.style.pointerEvents = "none";
+        } catch (e) {}
     }
 
     return {
@@ -3038,6 +2936,12 @@ async def run_recording(playwright):
         "--autoplay-policy=no-user-gesture-required",
         "--no-sandbox",
         "--disable-dev-shm-usage",
+        "--disable-extensions",
+        "--disable-default-apps",
+        "--disable-component-update",
+        "--disable-sync",
+        "--disable-background-networking",
+        "--no-first-run",
     ]
 
     browser = await playwright.chromium.launch(
@@ -3047,8 +2951,8 @@ async def run_recording(playwright):
 
     context = await browser.new_context(
         viewport={
-            "width": 1920,
-            "height": 1080,
+            "width": 1280,
+            "height": 720,
         },
         user_agent=USER_AGENT,
     )
@@ -3102,7 +3006,6 @@ async def run_recording(playwright):
 
                 if body:
                     webm_file.write(body)
-                    webm_file.flush()
 
                     chunk_count += 1
                     total_bytes += len(body)
@@ -3401,7 +3304,7 @@ async def run_recording(playwright):
             [
                 VIDEO_BITRATE,
                 AUDIO_BITRATE,
-                1000,
+                2000,
             ],
         )
 
