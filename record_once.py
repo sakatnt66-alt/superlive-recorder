@@ -208,58 +208,58 @@ def log_section(title):
     print(title, flush=True)
     print("=" * 70, flush=True)
 
-    # ============================================================
+# ============================================================
 
-    # CONFIG
+# CONFIG
 
-    # ============================================================
+# ============================================================
 
-    URL = os.environ.get("RECORD_URL", "")
+URL = os.environ.get("RECORD_URL", "")
 
-    RECORDING_DIR = Path(
-    os.environ.get("RECORDING_DIR", "recordings")
-    )
+RECORDING_DIR = Path(
+os.environ.get("RECORDING_DIR", "recordings")
+)
 
-    TEMP_DIR = Path(
-    os.environ.get("TEMP_DIR", "tmp_recordings")
-    )
+TEMP_DIR = Path(
+os.environ.get("TEMP_DIR", "tmp_recordings")
+)
 
-    RECORDING_DIR.mkdir(parents=True, exist_ok=True)
-    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+RECORDING_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-    VIDEO_BITRATE = 8_000_000
-    AUDIO_BITRATE = 192_000
+VIDEO_BITRATE = 8_000_000
+AUDIO_BITRATE = 192_000
 
-    VIDEO_WAIT_SECONDS = 60
-    PAGE_TIMEOUT_MS = 30_000
-    FIRST_CHUNK_TIMEOUT_SECONDS = 10
+VIDEO_WAIT_SECONDS = 60
+PAGE_TIMEOUT_MS = 30_000
+FIRST_CHUNK_TIMEOUT_SECONDS = 10
 
-    STREAM_ID = os.environ.get("STREAM_ID", "")
+STREAM_ID = os.environ.get("STREAM_ID", "")
 
-    STOP_CHECK_INTERVAL = 3
-    STREAM_IDLE_TIMEOUT = 20
+STOP_CHECK_INTERVAL = 3
+STREAM_IDLE_TIMEOUT = 20
 
-    MIN_CHUNK_SIZE = 500
+MIN_CHUNK_SIZE = 500
 
-    MAX_RECORDING_SECONDS = 6 * 3600
+MAX_RECORDING_SECONDS = 6 * 3600
 
-    GLOBAL_WATCHDOG_SECONDS = (
-    MAX_RECORDING_SECONDS + 1800
-    )
+GLOBAL_WATCHDOG_SECONDS = (
+MAX_RECORDING_SECONDS + 1800
+)
 
-    FINAL_QUEUE_DRAIN_TIMEOUT_SECONDS = 15 * 60
+FINAL_QUEUE_DRAIN_TIMEOUT_SECONDS = 15 * 60
 
-    USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
-    )
+USER_AGENT = (
+"Mozilla/5.0 (X11; Linux x86_64) "
+"AppleWebKit/537.36 (KHTML, like Gecko) "
+"Chrome/131.0.0.0 Safari/537.36"
+)
 
-    # ============================================================
+# ============================================================
 
-    # VIDEO HELPERS
+# VIDEO HELPERS
 
-    # ============================================================
+# ============================================================
 
 def run_command(command, timeout=None):
     log("Running command:")
