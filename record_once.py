@@ -8,10 +8,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+
 # ============================================================
-
 # TELEGRAM
-
 # ============================================================
 
 TELEGRAM_MAX_SIZE_MB = 44.9
@@ -23,13 +22,13 @@ UPLOAD_RETRY_DELAY_SECONDS = 5
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+
 # ============================================================
-
 # WORKER / KV
-
 # ============================================================
 
 WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
+
 
 def kv_get_state(stream_id):
     if not WORKER_URL or not stream_id:
@@ -56,6 +55,7 @@ def kv_get_state(stream_id):
         log(f"KV GET error: {e}")
         return None
 
+
 def kv_delete_state(stream_id):
     if not WORKER_URL or not stream_id:
         return False
@@ -77,6 +77,7 @@ def kv_delete_state(stream_id):
     except Exception as e:
         log(f"KV DELETE error: {e}")
         return False
+
 
 def kv_update_state(stream_id, state, **extra):
     if not WORKER_URL or not stream_id:
@@ -110,6 +111,7 @@ def kv_update_state(stream_id, state, **extra):
     except Exception as e:
         log(f"KV UPDATE error: {e}")
         return False
+
 
 def check_stop_requested(stream_id):
     state = kv_get_state(stream_id)
@@ -146,11 +148,10 @@ def check_stop_requested(stream_id):
 
     return False
 
-    # ============================================================
 
-    # TELEGRAM NOTIFICATION
-
-    # ============================================================
+# ============================================================
+# TELEGRAM NOTIFICATION
+# ============================================================
 
 def send_telegram_notification(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -189,18 +190,18 @@ def send_telegram_notification(text):
         log(f"Telegram notification error: {e}")
         return False
 
-    # ============================================================
 
-    # LOGGING
-
-    # ============================================================
+# ============================================================
+# LOGGING
+# ============================================================
 
 def log(message):
     print(
-    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-    f"{message}",
-    flush=True,
+        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+        f"{message}",
+        flush=True,
     )
+
 
 def log_section(title):
     print()
@@ -208,20 +209,19 @@ def log_section(title):
     print(title, flush=True)
     print("=" * 70, flush=True)
 
+
 # ============================================================
-
 # CONFIG
-
 # ============================================================
 
 URL = os.environ.get("RECORD_URL", "")
 
 RECORDING_DIR = Path(
-os.environ.get("RECORDING_DIR", "recordings")
+    os.environ.get("RECORDING_DIR", "recordings")
 )
 
 TEMP_DIR = Path(
-os.environ.get("TEMP_DIR", "tmp_recordings")
+    os.environ.get("TEMP_DIR", "tmp_recordings")
 )
 
 RECORDING_DIR.mkdir(parents=True, exist_ok=True)
@@ -235,15 +235,6 @@ PAGE_TIMEOUT_MS = 30_000
 FIRST_CHUNK_TIMEOUT_SECONDS = 10
 
 STREAM_ID = os.environ.get("STREAM_ID", "")
-if not STREAM_ID:
-    import re
-    _stream_match = re.search(
-        r"/livestream/([^/?#]+)",
-        URL,
-        re.IGNORECASE,
-    )
-    if _stream_match:
-        STREAM_ID = _stream_match.group(1)
 
 STOP_CHECK_INTERVAL = 3
 STREAM_IDLE_TIMEOUT = 20
@@ -253,40 +244,33 @@ MIN_CHUNK_SIZE = 500
 MAX_RECORDING_SECONDS = 6 * 3600
 
 GLOBAL_WATCHDOG_SECONDS = (
-MAX_RECORDING_SECONDS + 1800
+    MAX_RECORDING_SECONDS + 1800
 )
+
+# ------------------------------------------------------------
+# IMPORTANT:
+#
+# The local upload queue can legitimately become large if
+# Playwright/Node-side request handling is temporarily slower
+# than MediaRecorder.
+#
+# We must NOT close the browser while chunks remain queued.
+#
+# This timeout is only a safety limit. The global watchdog
+# remains the ultimate process limit.
+# ------------------------------------------------------------
 
 FINAL_QUEUE_DRAIN_TIMEOUT_SECONDS = 15 * 60
 
-KEEP_SOURCE_WEBM = os.environ.get(
-    "KEEP_SOURCE_WEBM", "1"
-).lower() in (
-    "1", "true", "yes", "on"
-)
-
-# Diagnostic A/B mode:
-#   record      = normal recording pipeline (MediaRecorder enabled)
-#   source_only = same browser/page/stream diagnostics, but NO MediaRecorder
-#
-# For the decisive A/B test, run this same file twice:
-#   1) AB_TEST_MODE=source_only
-#   2) AB_TEST_MODE=record
-#
-# In source_only mode the script does not create WebM/MP4 and does not upload.
-AB_TEST_MODE = "record"
-
-DIAGNOSTIC_SECONDS = 300
-
 USER_AGENT = (
-"Mozilla/5.0 (X11; Linux x86_64) "
-"AppleWebKit/537.36 (KHTML, like Gecko) "
-"Chrome/131.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
 )
+
 
 # ============================================================
-
 # VIDEO HELPERS
-
 # ============================================================
 
 def run_command(command, timeout=None):
@@ -308,6 +292,7 @@ def run_command(command, timeout=None):
         log(result.stderr.strip())
 
     return result
+
 
 def verify_video_file(path, allow_zero_duration=False):
     path = Path(path)
@@ -459,22 +444,22 @@ def verify_video_file(path, allow_zero_duration=False):
         )
         return False
 
+
 def get_video_info(path):
     command = [
-    "ffprobe",
-    "-hide_banner",
-    "-v",
-    "error",
-    "-count_packets",
-    "-show_entries",
-    "stream=index,codec_type,codec_name,width,height,"
-    "r_frame_rate,avg_frame_rate,time_base,start_time,duration,"
-    "nb_frames,nb_read_packets",
-    "-show_entries",
-    "format=format_name,duration,size",
-    "-of",
-    "json",
-    str(path),
+        "ffprobe",
+        "-hide_banner",
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=index,codec_type,codec_name,width,height,"
+        "r_frame_rate,avg_frame_rate,time_base,start_time,duration,"
+        "nb_frames",
+        "-show_entries",
+        "format=format_name,duration,size",
+        "-of",
+        "json",
+        str(path),
     ]
 
     try:
@@ -501,6 +486,7 @@ def get_video_info(path):
         )
         return None
 
+
 def get_duration(info):
     if not info:
         return 0.0
@@ -513,6 +499,7 @@ def get_duration(info):
     except Exception:
         return 0.0
 
+
 def get_video_packet_count(info):
     if not info:
         return 0
@@ -523,14 +510,14 @@ def get_video_packet_count(info):
 
         try:
             return int(
-                stream.get("nb_read_packets")
-                or stream.get("nb_frames")
+                stream.get("nb_frames")
                 or 0
             )
         except Exception:
             return 0
 
     return 0
+
 
 def log_video_info(label, path):
     info = get_video_info(path)
@@ -570,9 +557,7 @@ def log_video_info(label, path):
                 f"duration="
                 f"{stream.get('duration')} "
                 f"nb_frames="
-                f"{stream.get('nb_frames')} "
-                f"nb_read_packets="
-                f"{stream.get('nb_read_packets')}"
+                f"{stream.get('nb_frames')}"
             )
 
         elif stream.get("codec_type") == "audio":
@@ -589,377 +574,10 @@ def log_video_info(label, path):
 
     return info
 
-def analyze_video_timestamps(
-    label,
-    path,
-    max_logged_anomalies=10,
-    ):
-    """
-    Inspect actual video packet PTS/DTS values.
 
-    This is diagnostic only.
-
-    It does NOT modify the file and does NOT change the
-    conversion pipeline.
-
-    We specifically look for:
-
-        - backward PTS
-        - duplicate PTS
-        - backward DTS
-        - duplicate DTS
-        - unusually large PTS gaps
-
-    This allows us to determine whether the timing problem
-    already exists in the MediaRecorder WebM or is introduced
-    during WebM -> MP4 conversion.
-    """
-
-    path = Path(path)
-
-    command = [
-        "ffprobe",
-        "-hide_banner",
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_packets",
-        "-show_entries",
-        "packet=pts,pts_time,dts,dts_time,duration_time,flags",
-        "-of",
-        "json",
-        str(path),
-    ]
-
-    try:
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=180,
-        )
-
-        if result.returncode != 0:
-            log(
-                f"{label} timestamp analysis failed: "
-                + result.stderr.strip()
-            )
-            return None
-
-        data = json.loads(result.stdout)
-
-        packets = data.get("packets", [])
-
-        if not packets:
-            log(
-                f"{label} timestamp analysis: "
-                "no video packets found"
-            )
-            return None
-
-        previous_pts = None
-        previous_dts = None
-
-        backward_pts = 0
-        duplicate_pts = 0
-        backward_dts = 0
-        duplicate_dts = 0
-
-        largest_pts_gap = 0.0
-        largest_dts_gap = 0.0
-
-        largest_pts_gap_index = None
-        largest_pts_gap_previous = None
-        largest_pts_gap_current = None
-
-        largest_dts_gap_index = None
-        largest_dts_gap_previous = None
-        largest_dts_gap_current = None
-
-        pts_gap_count_100ms = 0
-        pts_gap_count_250ms = 0
-        pts_gap_count_500ms = 0
-        pts_gap_count_1s = 0
-        pts_intervals = []
-
-        first_pts = None
-        last_pts = None
-
-        first_dts = None
-        last_dts = None
-
-        pts_anomalies = []
-        dts_anomalies = []
-
-        for index, packet in enumerate(packets):
-            pts_time_raw = packet.get("pts_time")
-            dts_time_raw = packet.get("dts_time")
-
-            try:
-                pts_time = (
-                    float(pts_time_raw)
-                    if pts_time_raw is not None
-                    else None
-                )
-            except Exception:
-                pts_time = None
-
-            try:
-                dts_time = (
-                    float(dts_time_raw)
-                    if dts_time_raw is not None
-                    else None
-                )
-            except Exception:
-                dts_time = None
-
-            if pts_time is not None:
-                if first_pts is None:
-                    first_pts = pts_time
-
-                if previous_pts is not None:
-                    delta = (
-                        pts_time
-                        - previous_pts
-                    )
-
-                    if delta < 0:
-                        backward_pts += 1
-
-                        if (
-                            len(pts_anomalies)
-                            < max_logged_anomalies
-                        ):
-                            pts_anomalies.append(
-                                (
-                                    index,
-                                    previous_pts,
-                                    pts_time,
-                                    delta,
-                                )
-                            )
-
-                    elif delta == 0:
-                        duplicate_pts += 1
-
-                        if (
-                            len(pts_anomalies)
-                            < max_logged_anomalies
-                        ):
-                            pts_anomalies.append(
-                                (
-                                    index,
-                                    previous_pts,
-                                    pts_time,
-                                    delta,
-                                )
-                            )
-
-                    if delta > 0:
-                        pts_intervals.append(delta)
-                    if delta >= 0.100:
-                        pts_gap_count_100ms += 1
-                    if delta >= 0.250:
-                        pts_gap_count_250ms += 1
-                    if delta >= 0.500:
-                        pts_gap_count_500ms += 1
-                    if delta >= 1.000:
-                        pts_gap_count_1s += 1
-
-                    if delta > largest_pts_gap:
-                        largest_pts_gap = delta
-                        largest_pts_gap_index = index
-                        largest_pts_gap_previous = previous_pts
-                        largest_pts_gap_current = pts_time
-
-                previous_pts = pts_time
-                last_pts = pts_time
-
-            if dts_time is not None:
-                if first_dts is None:
-                    first_dts = dts_time
-
-                if previous_dts is not None:
-                    delta = (
-                        dts_time
-                        - previous_dts
-                    )
-
-                    if delta < 0:
-                        backward_dts += 1
-
-                        if (
-                            len(dts_anomalies)
-                            < max_logged_anomalies
-                        ):
-                            dts_anomalies.append(
-                                (
-                                    index,
-                                    previous_dts,
-                                    dts_time,
-                                    delta,
-                                )
-                            )
-
-                    elif delta == 0:
-                        duplicate_dts += 1
-
-                        if (
-                            len(dts_anomalies)
-                            < max_logged_anomalies
-                        ):
-                            dts_anomalies.append(
-                                (
-                                    index,
-                                    previous_dts,
-                                    dts_time,
-                                    delta,
-                                )
-                            )
-
-                    if delta > largest_dts_gap:
-                        largest_dts_gap = delta
-                        largest_dts_gap_index = index
-                        largest_dts_gap_previous = previous_dts
-                        largest_dts_gap_current = dts_time
-
-                previous_dts = dts_time
-                last_dts = dts_time
-
-        log(
-            f"{label} timestamp summary: "
-            f"packets={len(packets)} "
-            f"first_pts={first_pts} "
-            f"last_pts={last_pts} "
-            f"pts_span="
-            f"{(last_pts - first_pts) if first_pts is not None and last_pts is not None else None} "
-            f"backward_pts={backward_pts} "
-            f"duplicate_pts={duplicate_pts} "
-            f"largest_pts_gap={largest_pts_gap:.6f}s "
-            f"first_dts={first_dts} "
-            f"last_dts={last_dts} "
-            f"backward_dts={backward_dts} "
-            f"duplicate_dts={duplicate_dts} "
-            f"largest_dts_gap={largest_dts_gap:.6f}s"
-        )
-
-        if pts_intervals:
-            avg_interval = sum(pts_intervals) / len(pts_intervals)
-            estimated_fps = (1.0 / avg_interval) if avg_interval > 0 else 0.0
-            log(
-                f"{label} cadence diagnostics: "
-                f"avg_pts_interval={avg_interval:.6f}s "
-                f"estimated_avg_fps={estimated_fps:.3f} "
-                f"gaps>=100ms={pts_gap_count_100ms} "
-                f"gaps>=250ms={pts_gap_count_250ms} "
-                f"gaps>=500ms={pts_gap_count_500ms} "
-                f"gaps>=1s={pts_gap_count_1s}"
-            )
-
-        if largest_pts_gap_index is not None:
-            log(
-                f"{label} largest PTS gap location: "
-                f"packet={largest_pts_gap_index} "
-                f"previous_pts={largest_pts_gap_previous:.6f} "
-                f"current_pts={largest_pts_gap_current:.6f} "
-                f"gap={largest_pts_gap:.6f}s"
-            )
-
-        if largest_dts_gap_index is not None:
-            log(
-                f"{label} largest DTS gap location: "
-                f"packet={largest_dts_gap_index} "
-                f"previous_dts={largest_dts_gap_previous:.6f} "
-                f"current_dts={largest_dts_gap_current:.6f} "
-                f"gap={largest_dts_gap:.6f}s"
-            )
-
-        if pts_anomalies:
-            log(
-                f"{label} PTS anomalies:"
-            )
-
-            for (
-                index,
-                previous,
-                current,
-                delta,
-            ) in pts_anomalies:
-                log(
-                    f"  packet={index} "
-                    f"previous_pts={previous:.6f} "
-                    f"current_pts={current:.6f} "
-                    f"delta={delta:.6f}"
-                )
-
-        if dts_anomalies:
-            log(
-                f"{label} DTS anomalies:"
-            )
-
-            for (
-                index,
-                previous,
-                current,
-                delta,
-            ) in dts_anomalies:
-                log(
-                    f"  packet={index} "
-                    f"previous_dts={previous:.6f} "
-                    f"current_dts={current:.6f} "
-                    f"delta={delta:.6f}"
-                )
-
-        return {
-            "packets": len(packets),
-            "first_pts": first_pts,
-            "last_pts": last_pts,
-            "pts_span": (
-                last_pts - first_pts
-                if first_pts is not None
-                and last_pts is not None
-                else None
-            ),
-            "backward_pts": backward_pts,
-            "duplicate_pts": duplicate_pts,
-            "largest_pts_gap": largest_pts_gap,
-            "largest_pts_gap_index": largest_pts_gap_index,
-            "largest_pts_gap_previous": largest_pts_gap_previous,
-            "largest_pts_gap_current": largest_pts_gap_current,
-            "pts_gap_count_100ms": pts_gap_count_100ms,
-            "pts_gap_count_250ms": pts_gap_count_250ms,
-            "pts_gap_count_500ms": pts_gap_count_500ms,
-            "pts_gap_count_1s": pts_gap_count_1s,
-            "avg_pts_interval": (
-                sum(pts_intervals) / len(pts_intervals)
-                if pts_intervals else None
-            ),
-            "estimated_avg_fps": (
-                1.0 / (sum(pts_intervals) / len(pts_intervals))
-                if pts_intervals and sum(pts_intervals) > 0
-                else None
-            ),
-            "first_dts": first_dts,
-            "last_dts": last_dts,
-            "backward_dts": backward_dts,
-            "duplicate_dts": duplicate_dts,
-            "largest_dts_gap": largest_dts_gap,
-        }
-
-    except Exception as e:
-        log(
-            f"{label} timestamp analysis exception: "
-            f"{e}"
-        )
-        return None
-
-    # ============================================================
-
-    # TELEGRAM UPLOAD
-
-    # ============================================================
+# ============================================================
+# TELEGRAM UPLOAD
+# ============================================================
 
 def send_to_telegram(path, caption=""):
     path = Path(path)
@@ -1142,20 +760,21 @@ def send_to_telegram(path, caption=""):
 
     return False
 
+
 def send_to_telegram_with_retry(
     path,
     caption="",
-    ):
+):
     for attempt in range(
-    1,
-    UPLOAD_MAX_RETRIES + 1,
+        1,
+        UPLOAD_MAX_RETRIES + 1,
     ):
         log(
-    f"Telegram upload attempt "
-    f"{attempt}/"
-    f"{UPLOAD_MAX_RETRIES}: "
-    f"{path}"
-    )
+            f"Telegram upload attempt "
+            f"{attempt}/"
+            f"{UPLOAD_MAX_RETRIES}: "
+            f"{path}"
+        )
 
         if send_to_telegram(
             path,
@@ -1176,32 +795,36 @@ def send_to_telegram_with_retry(
 
     return False
 
-    # ============================================================
 
-    # FFMPEG CONVERSION
-
-    # ============================================================
+# ============================================================
+# FFMPEG CONVERSION
+# ============================================================
 
 def convert_webm_to_mp4(
     webm_path,
     mp4_path,
-    source_overall_fps=0.0,
-    rendered_overall_fps=0.0,
-    ):
+):
     """
     Convert a COMPLETE MediaRecorder WebM into H.264/AAC MP4.
 
-    The source WebM has unreliable container frame-rate metadata
-    (ffprobe reports 1000 fps even though the live track is about 30 fps).
-    Convert it to a stable 30 fps CFR timeline so playback does not inherit
-    large VFR timestamp gaps. The 30 fps value is based on the live track
-    reported by MediaStream, not the bogus WebM r_frame_rate metadata.
+    The important design rule here is:
+
+        Do not manufacture a CFR timeline.
+
+    The WebM is expected to contain the original MediaRecorder
+    timestamps. Video timing is therefore preserved as VFR.
 
     Audio timestamps are normalized separately because the
     previous recordings showed actual backward audio timestamps.
 
-    This function deliberately does NOT use the WebM-reported 1000 fps
-    as the output frame rate. It uses a fixed 30 fps CFR output instead.
+    This function deliberately does NOT use:
+
+        -fflags +genpts
+        fps=30
+        -r 30
+        -fps_mode cfr
+        -vsync cfr
+        forced keyframes
     """
 
     webm_path = Path(webm_path)
@@ -1247,89 +870,6 @@ def convert_webm_to_mp4(
     )
 
     log_section(
-        "WEBM VIDEO TIMESTAMP ANALYSIS"
-    )
-
-    webm_timestamp_info = (
-        analyze_video_timestamps(
-            "WEBM BEFORE CONVERSION",
-            webm_path,
-        )
-    )
-
-    # --------------------------------------------------------
-    # THREE-STAGE FRAME-RATE COMPARISON
-    # --------------------------------------------------------
-    # Source/rendered values come from live browser diagnostics.
-    # The WebM value is measured from the actual recorded packet
-    # timestamps, so it is the best available measurement of the
-    # encoded/recorded frame cadence.
-    # --------------------------------------------------------
-    # Use the frozen values captured immediately after the final recorder
-    # status. This prevents a later diagnostic status read from resetting
-    # the window counters and producing misleading 0.000 FPS values.
-    # Diagnostics are intentionally disabled in the production recording
-    # path to avoid adding CPU/main-thread pressure to Chromium.  The caller
-    # passes the frozen values captured before browser shutdown; keep safe
-    # numeric defaults so conversion can never fail because diagnostics are
-    # unavailable.
-    source_overall_fps = float(source_overall_fps or 0.0)
-    rendered_overall_fps = float(rendered_overall_fps or 0.0)
-
-    recorded_webm_fps = None
-    if webm_timestamp_info:
-        try:
-            recorded_webm_fps = float(
-                webm_timestamp_info.get(
-                    "estimated_avg_fps"
-                )
-                or 0
-            )
-        except Exception:
-            recorded_webm_fps = 0.0
-
-    log_section(
-        "THREE-STAGE FRAME RATE COMPARISON"
-    )
-
-    log(
-        f"Source/WebRTC delivered FPS (overall): "
-        f"{source_overall_fps:.3f}"
-    )
-
-    log(
-        f"Rendered <video> FPS (overall): "
-        f"{rendered_overall_fps:.3f}"
-    )
-
-    if recorded_webm_fps is not None:
-        log(
-            f"Recorded WebM packet FPS (timestamp-based): "
-            f"{recorded_webm_fps:.3f}"
-        )
-
-        log(
-            "Frame-rate gaps: "
-            f"source->rendered="
-            f"{(source_overall_fps - rendered_overall_fps):.3f} FPS, "
-            f"rendered->recorded="
-            f"{(rendered_overall_fps - recorded_webm_fps):.3f} FPS, "
-            f"source->recorded="
-            f"{(source_overall_fps - recorded_webm_fps):.3f} FPS"
-        )
-    else:
-        log(
-            "Recorded WebM packet FPS could not be calculated."
-        )
-
-    log(
-        "Interpretation: source≈rendered means WebRTC/Chromium "
-        "delivery is stable; rendered≫recorded points toward "
-        "MediaRecorder/encoding loss; source≫rendered points "
-        "toward Chromium rendering/decoding loss."
-    )
-
-    log_section(
         "FFMPEG WEBM -> MP4"
     )
 
@@ -1343,18 +883,11 @@ def convert_webm_to_mp4(
         # ----------------------------------------------------
         # INPUT
         #
-        # Preserve the timestamps that are already present in
-        # the MediaRecorder WebM.
-        #
         # Do not use +genpts.
         #
-        # start_at_zero shifts the preserved timeline so that
-        # the resulting MP4 starts at zero without rebuilding
-        # the frame cadence.
+        # We want FFmpeg to consume the timestamps actually
+        # present in the MediaRecorder WebM.
         # ----------------------------------------------------
-
-        "-copyts",
-        "-start_at_zero",
 
         "-i",
         str(webm_path),
@@ -1376,10 +909,11 @@ def convert_webm_to_mp4(
         "-vf",
         "pad=width=ceil(iw/2)*2:"
         "height=ceil(ih/2)*2:"
-        "color=black",
+        "color=black,"
+        "setpts=PTS-STARTPTS",
 
         "-fps_mode:v",
-        "passthrough",
+        "vfr",
 
         "-c:v",
         "libx264",
@@ -1437,8 +971,6 @@ def convert_webm_to_mp4(
 
         "-max_interleave_delta",
         "0",
-
-        "-shortest",
 
         # ----------------------------------------------------
         # MP4
@@ -1532,73 +1064,6 @@ def convert_webm_to_mp4(
         f"{mp4_video_packets}"
     )
 
-    log_section(
-        "MP4 VIDEO TIMESTAMP ANALYSIS"
-    )
-
-    mp4_timestamp_info = (
-        analyze_video_timestamps(
-            "MP4 AFTER CONVERSION",
-            mp4_path,
-        )
-    )
-
-    # --------------------------------------------------------
-    # SOURCE / OUTPUT TIMESTAMP COMPARISON
-    # --------------------------------------------------------
-
-    if (
-        webm_timestamp_info
-        and mp4_timestamp_info
-    ):
-        source_span = (
-            webm_timestamp_info.get(
-                "pts_span"
-            )
-        )
-
-        output_span = (
-            mp4_timestamp_info.get(
-                "pts_span"
-            )
-        )
-
-        if (
-            source_span is not None
-            and output_span is not None
-        ):
-            log(
-                f"Video PTS span comparison: "
-                f"WebM={source_span:.6f}s "
-                f"MP4={output_span:.6f}s "
-                f"difference="
-                f"{abs(output_span - source_span):.6f}s"
-            )
-
-        log(
-            "Timestamp anomaly comparison: "
-            f"WebM backward_pts="
-            f"{webm_timestamp_info.get('backward_pts')} "
-            f"duplicate_pts="
-            f"{webm_timestamp_info.get('duplicate_pts')} "
-            f"| MP4 backward_pts="
-            f"{mp4_timestamp_info.get('backward_pts')} "
-            f"duplicate_pts="
-            f"{mp4_timestamp_info.get('duplicate_pts')}"
-        )
-
-        log(
-            "DTS anomaly comparison: "
-            f"WebM backward_dts="
-            f"{webm_timestamp_info.get('backward_dts')} "
-            f"duplicate_dts="
-            f"{webm_timestamp_info.get('duplicate_dts')} "
-            f"| MP4 backward_dts="
-            f"{mp4_timestamp_info.get('backward_dts')} "
-            f"duplicate_dts="
-            f"{mp4_timestamp_info.get('duplicate_dts')}"
-        )
-
     # --------------------------------------------------------
     # DURATION SANITY CHECK
     # --------------------------------------------------------
@@ -1677,11 +1142,10 @@ def convert_webm_to_mp4(
 
     return True
 
-    # ============================================================
 
-    # SPLIT MP4
-
-    # ============================================================
+# ============================================================
+# SPLIT MP4
+# ============================================================
 
 def split_mp4_if_needed(mp4_path):
     mp4_path = Path(mp4_path)
@@ -1849,286 +1313,196 @@ def split_mp4_if_needed(mp4_path):
 
     return valid_parts
 
-    # ============================================================
 
-    # PLAYWRIGHT / WEBRTC HOOK
-
-    # ============================================================
+# ============================================================
+# PLAYWRIGHT / WEBRTC HOOK
+# ============================================================
 
 WEBRTC_HOOK = r"""
 (() => {
-if (window.__superlive_hook_installed) {
-return;
-}
-
-window.__superlive_hook_installed = true;
-
-window.__superliveVideoTracks = [];
-window.__superliveAudioTracks = [];
-window.__superliveStreams = [];
-window.__superliveTrackLinks = new Map();
-window.__superliveTrackConnections = new Map();
-
-// ------------------------------------------------------------
-// FRAME-CADENCE DIAGNOSTICS
-// ------------------------------------------------------------
-// These counters deliberately measure three different stages:
-//
-//   1) sourceVideoFrameCount  = frames delivered by the selected
-//      WebRTC MediaStreamTrack (using a cloned track)
-//   2) renderedVideoFrameCount = frames actually presented by the
-//      page's <video> element (requestVideoFrameCallback)
-//   3) recorded WebM FPS       = measured later from real WebM
-//      packet timestamps after MediaRecorder stops
-//
-// This lets us distinguish source/WebRTC delivery, Chromium
-// rendering, and MediaRecorder/encoding losses without changing
-// the recording stream itself.
-// ------------------------------------------------------------
-window.__superliveSourceVideoFrameCount = 0;
-window.__superliveSourceVideoFrameCountAtLastStatus = 0;
-window.__superliveSourceVideoFrameLastStatusAt = performance.now();
-window.__superliveSourceVideoFrameCallbackActive = false;
-window.__superliveSourceVideoFrameReader = null;
-window.__superliveSourceVideoFrameClone = null;
-
-window.__superliveRenderedVideoFrameCount = 0;
-window.__superliveRenderedVideoFrameCountAtLastStatus = 0;
-window.__superliveRenderedVideoFrameLastStatusAt = performance.now();
-window.__superliveRenderedVideoFrameCallbackActive = false;
-window.__superliveDiagnosticsStartedAt = performance.now();
-
-const OriginalRTCPeerConnection =
-    window.RTCPeerConnection;
-
-if (!OriginalRTCPeerConnection) {
-    return;
-}
-
-function rememberTrack(track, stream) {
-    if (!track) {
+    if (window.__superlive_hook_installed) {
         return;
     }
 
-    if (track.kind === "video") {
-        if (
-            !window.__superliveVideoTracks.includes(
-                track
-            )
-        ) {
-            window.__superliveVideoTracks.push(
-                track
-            );
+    window.__superlive_hook_installed = true;
+
+    window.__superliveVideoTracks = [];
+    window.__superliveAudioTracks = [];
+    window.__superliveStreams = [];
+    window.__superliveTrackLinks = new Map();
+
+    const OriginalRTCPeerConnection =
+        window.RTCPeerConnection;
+
+    if (!OriginalRTCPeerConnection) {
+        return;
+    }
+
+    function rememberTrack(track, stream) {
+        if (!track) {
+            return;
+        }
+
+        if (track.kind === "video") {
+            if (
+                !window.__superliveVideoTracks.includes(
+                    track
+                )
+            ) {
+                window.__superliveVideoTracks.push(
+                    track
+                );
+            }
+        }
+
+        if (track.kind === "audio") {
+            if (
+                !window.__superliveAudioTracks.includes(
+                    track
+                )
+            ) {
+                window.__superliveAudioTracks.push(
+                    track
+                );
+            }
+        }
+
+        if (stream) {
+            if (
+                !window.__superliveStreams.includes(
+                    stream
+                )
+            ) {
+                window.__superliveStreams.push(
+                    stream
+                );
+            }
+
+            if (
+                !window.__superliveTrackLinks.has(
+                    track
+                )
+            ) {
+                window.__superliveTrackLinks.set(
+                    track,
+                    stream
+                );
+            }
         }
     }
 
-    if (track.kind === "audio") {
-        if (
-            !window.__superliveAudioTracks.includes(
-                track
-            )
-        ) {
-            window.__superliveAudioTracks.push(
-                track
-            );
-        }
-    }
+    class WrappedRTCPeerConnection
+        extends OriginalRTCPeerConnection {
 
-    if (stream) {
-        if (
-            !window.__superliveStreams.includes(
-                stream
-            )
-        ) {
-            window.__superliveStreams.push(
-                stream
-            );
-        }
+        constructor(...args) {
+            super(...args);
 
-        if (
-            !window.__superliveTrackLinks.has(
-                track
-            )
-        ) {
-            window.__superliveTrackLinks.set(
-                track,
-                stream
-            );
-        }
-    }
-}
+            this.addEventListener(
+                "track",
+                (event) => {
+                    try {
+                        const track =
+                            event.track;
 
-class WrappedRTCPeerConnection
-    extends OriginalRTCPeerConnection {
+                        const streams =
+                            event.streams || [];
 
-    constructor(...args) {
-        super(...args);
-
-        this.addEventListener(
-            "track",
-            (event) => {
-                try {
-                    const track =
-                        event.track;
-
-                    const streams =
-                        event.streams || [];
-
-                    window.__superliveTrackConnections.set(track, this);
-
-                    if (streams.length) {
-                        for (
-                            const stream
-                            of streams
-                        ) {
+                        if (streams.length) {
+                            for (
+                                const stream
+                                of streams
+                            ) {
+                                rememberTrack(
+                                    track,
+                                    stream
+                                );
+                            }
+                        } else {
                             rememberTrack(
                                 track,
-                                stream
+                                null
                             );
                         }
-                    } else {
-                        rememberTrack(
-                            track,
-                            null
+                    } catch (e) {
+                        console.warn(
+                            "superlive track hook error",
+                            e
                         );
                     }
-                } catch (e) {
-                    console.warn(
-                        "superlive track hook error",
-                        e
-                    );
                 }
-            }
-        );
-    }
-}
-
-window.RTCPeerConnection =
-    WrappedRTCPeerConnection;
-
-window.__superlivePrepare = () => {
-    const videos = Array.from(
-        document.querySelectorAll(
-            "video"
-        )
-    );
-
-    let selectedVideoTrack = null;
-    let selectedStream = null;
-    let selectedVideoElement = null;
-
-    // Select the active livestream player, not an arbitrary WebRTC track.
-    // Prefer a visible/playing player that owns its own live audio track;
-    // video-only previews are deliberately lower priority.
-    const candidates = [];
-    for (let index = 0; index < videos.length; index++) {
-        const video = videos[index];
-        try {
-            const stream = video.srcObject;
-            if (!stream) continue;
-
-            const liveVideoTrack = stream.getVideoTracks().find(
-                t => t.readyState === "live"
             );
-            if (!liveVideoTrack) continue;
-
-            const rect = video.getBoundingClientRect();
-            const style = getComputedStyle(video);
-            const area = Math.max(0, rect.width) * Math.max(0, rect.height);
-            const visible =
-                style.display !== "none" &&
-                style.visibility !== "hidden" &&
-                Number(style.opacity || 1) > 0 &&
-                rect.width > 0 &&
-                rect.height > 0;
-            const playing = !video.paused && !video.ended;
-            const ready = video.readyState >= 3;
-            const hasAudio = stream.getAudioTracks().some(
-                t => t.readyState === "live"
-            );
-
-            let score = 0;
-            if (visible) score += 1_000_000_000;
-            if (playing) score += 100_000_000;
-            if (ready) score += 10_000_000;
-            if (hasAudio) score += 5_000_000;
-            if (video.autoplay) score += 1_000_000;
-
-            let trackFrameRate = 0;
-            try {
-                const settings = liveVideoTrack.getSettings ? liveVideoTrack.getSettings() : null;
-                const value = settings && Number(settings.frameRate);
-                if (Number.isFinite(value) && value > 0) trackFrameRate = value;
-            } catch (e) {}
-
-            // Prefer a normal live cadence when all other player signals are
-            // comparable. A stale/preview track on this page was observed at
-            // roughly 14 FPS while the real player was around 30 FPS.
-            score += Math.min(trackFrameRate, 60) * 100_000;
-            score += Math.min(area, 2_000_000);
-
-            candidates.push({
-                video, stream, track: liveVideoTrack, index, score,
-                visible, playing, ready, hasAudio, area,
-                width: video.videoWidth || 0,
-                height: video.videoHeight || 0
-            });
-        } catch (e) {
-            console.warn("superlive video candidate scan error", e);
         }
     }
 
-    const audioCandidates = candidates.filter(c => c.hasAudio);
-    const eligible = audioCandidates.length ? audioCandidates : candidates;
-    eligible.sort((a, b) => (b.score - a.score) || (a.index - b.index));
+    window.RTCPeerConnection =
+        WrappedRTCPeerConnection;
 
-    if (eligible.length) {
-        console.info("superlive video candidates", candidates.map(c => ({
-            index: c.index, width: c.width, height: c.height,
-            visible: c.visible, playing: c.playing, ready: c.ready,
-            hasAudio: c.hasAudio,
-            frameRate: Number(c.trackFrameRate.toFixed(2)),
-            area: Math.round(c.area),
-            score: Math.round(c.score)
-        })));
-        const best = eligible[0];
-        selectedVideoTrack = best.track;
-        selectedStream = best.stream;
-        selectedVideoElement = best.video;
-    }
-
-    if (!selectedVideoTrack || !selectedVideoElement) {
-        throw new Error("No active livestream video element/track found");
-    }
-
-    if (!eligible[0].visible || !eligible[0].playing || !eligible[0].ready) {
-        throw new Error(
-            "Live video candidates exist, but none is visibly and actively playing; refusing to record an arbitrary stream"
+    window.__superlivePrepare = () => {
+        const videos = Array.from(
+            document.querySelectorAll(
+                "video"
+            )
         );
-    }
 
-    let selectedAudioTrack = null;
+        let selectedVideoTrack = null;
+        let selectedStream = null;
 
-    if (selectedStream) {
-        selectedAudioTrack =
-            selectedStream
-                .getAudioTracks()
-                .find(
+        for (const video of videos) {
+            try {
+                const stream =
+                    video.srcObject;
+
+                if (!stream) {
+                    continue;
+                }
+
+                const videoTracks =
+                    stream.getVideoTracks();
+
+                const liveVideoTrack =
+                    videoTracks.find(
+                        t =>
+                            t.readyState
+                            === "live"
+                    );
+
+                if (liveVideoTrack) {
+                    selectedVideoTrack =
+                        liveVideoTrack;
+
+                    selectedStream =
+                        stream;
+
+                    break;
+                }
+            } catch (e) {
+                console.warn(
+                    "superlive video scan error",
+                    e
+                );
+            }
+        }
+
+        if (!selectedVideoTrack) {
+            selectedVideoTrack =
+                window.__superliveVideoTracks.find(
                     t =>
                         t.readyState
                         === "live"
                 );
-    }
+        }
 
-    if (!selectedAudioTrack) {
-        const linkedStream =
-            window.__superliveTrackLinks.get(
-                selectedVideoTrack
+        if (!selectedVideoTrack) {
+            throw new Error(
+                "No live video track found"
             );
+        }
 
-        if (linkedStream) {
+        let selectedAudioTrack = null;
+
+        if (selectedStream) {
             selectedAudioTrack =
-                linkedStream
+                selectedStream
                     .getAudioTracks()
                     .find(
                         t =>
@@ -2136,883 +1510,596 @@ window.__superlivePrepare = () => {
                             === "live"
                     );
         }
-    }
 
-    // Never attach audio from an unrelated global track.
+        if (!selectedAudioTrack) {
+            const linkedStream =
+                window.__superliveTrackLinks.get(
+                    selectedVideoTrack
+                );
 
-    const tracks = [
-        selectedVideoTrack
-    ];
-
-    if (selectedAudioTrack) {
-        tracks.push(
-            selectedAudioTrack
-        );
-    }
-
-    window.__preparedStream =
-        new MediaStream(tracks);
-
-    window.__preparedVideoTrack =
-        selectedVideoTrack;
-
-    window.__preparedAudioTrack =
-        selectedAudioTrack;
-
-    // Initialize recording-state fields even when MediaRecorder is not used.
-    window.__superliveRecorder = null;
-    window.__superliveChunkCount = 0;
-    window.__superliveUploadedChunkCount = 0;
-    window.__superliveLastChunkAt = performance.now();
-    window.__superliveLastChunkSize = 0;
-    window.__superliveUploadQueue = [];
-    window.__superliveIsUploading = false;
-    window.__superliveUploadError = null;
-    window.__superlivePendingDataTasks = 0;
-    window.__superliveRecorderStopFired = false;
-    window.__superliveFinalDataReady = false;
-
-    window.__superliveVideoElement = selectedVideoElement;
-
-    // Low-overhead live-end monitor. Track "ended" is decisive; prolonged
-    // mute/no-progress or failed/closed WebRTC connection is also decisive.
-    window.__superliveEndState = {
-        ended: false, reason: null, lastProgressAt: performance.now(),
-        lastCurrentTime: selectedVideoElement.currentTime || 0,
-        lastTotalVideoFrames: 0, mutedSince: selectedVideoTrack.muted ? performance.now() : null,
-        connectionBadSince: null, monitorTimer: null
-    };
-    try {
-        const q = selectedVideoElement.getVideoPlaybackQuality ? selectedVideoElement.getVideoPlaybackQuality() : null;
-        window.__superliveEndState.lastTotalVideoFrames = q && q.totalVideoFrames != null ? q.totalVideoFrames : 0;
-    } catch (e) {}
-    const markEnded = (reason) => {
-        if (!window.__superliveEndState.ended) {
-            window.__superliveEndState.ended = true;
-            window.__superliveEndState.reason = reason;
-            console.info("superlive stream end detected", reason);
+            if (linkedStream) {
+                selectedAudioTrack =
+                    linkedStream
+                        .getAudioTracks()
+                        .find(
+                            t =>
+                                t.readyState
+                                === "live"
+                        );
+            }
         }
-    };
-    selectedVideoTrack.addEventListener("ended", () => markEnded("video_track_ended"));
-    selectedVideoTrack.addEventListener("mute", () => {
-        if (!window.__superliveEndState.mutedSince) window.__superliveEndState.mutedSince = performance.now();
-    });
-    selectedVideoTrack.addEventListener("unmute", () => {
-        window.__superliveEndState.mutedSince = null;
-        window.__superliveEndState.lastProgressAt = performance.now();
-    });
-    selectedVideoElement.addEventListener("ended", () => markEnded("video_element_ended"));
-    window.__superliveTrackConnection = window.__superliveTrackConnections ?
-        window.__superliveTrackConnections.get(selectedVideoTrack) : null;
-    window.__superliveEndState.monitorTimer = setInterval(() => {
-        try {
-            const state = window.__superliveEndState;
-            if (!state || state.ended) return;
-            const now = performance.now();
-            const video = window.__superliveVideoElement;
-            const track = window.__preparedVideoTrack;
-            if (!video || !track) return;
-            if (track.readyState === "ended") return markEnded("video_track_ended");
-            if (video.ended) return markEnded("video_element_ended");
-            let totalFrames = state.lastTotalVideoFrames;
-            try {
-                const q = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
-                if (q && q.totalVideoFrames != null) totalFrames = q.totalVideoFrames;
-            } catch (e) {}
-            const currentTime = Number(video.currentTime || 0);
-            const progressed = currentTime > Number(state.lastCurrentTime || 0) + 0.02 ||
-                totalFrames > Number(state.lastTotalVideoFrames || 0);
-            if (progressed) {
-                state.lastProgressAt = now;
-                state.lastCurrentTime = currentTime;
-                state.lastTotalVideoFrames = totalFrames;
-            }
-            if (track.muted) {
-                if (!state.mutedSince) state.mutedSince = now;
-            } else {
-                state.mutedSince = null;
-            }
-            const connection = window.__superliveTrackConnection;
-            const connectionState = connection ? connection.connectionState : null;
-            if (connectionState === "failed" || connectionState === "closed") {
-                if (!state.connectionBadSince) state.connectionBadSince = now;
-            } else {
-                state.connectionBadSince = null;
-            }
-            const noProgressMs = now - state.lastProgressAt;
-            const mutedMs = state.mutedSince ? now - state.mutedSince : 0;
-            const badConnectionMs = state.connectionBadSince ? now - state.connectionBadSince : 0;
-            if (track.muted && mutedMs >= 15000 && noProgressMs >= 15000)
-                return markEnded("video_track_muted_and_no_progress_15s");
-            if ((connectionState === "failed" || connectionState === "closed") && badConnectionMs >= 10000 && noProgressMs >= 10000)
-                return markEnded("webrtc_connection_failed_no_progress_10s");
-        } catch (e) {
-            console.warn("superlive end monitor error", e);
+
+        if (!selectedAudioTrack) {
+            selectedAudioTrack =
+                window.__superliveAudioTracks.find(
+                    t =>
+                        t.readyState
+                        === "live"
+                );
         }
-    }, 2000);
 
-    // --------------------------------------------------------
-    // OPTIONAL DIAGNOSTICS
-    // --------------------------------------------------------
-    // The production recorder deliberately does NOT run a second
-    // MediaStreamTrackProcessor, requestVideoFrameCallback loop,
-    // PerformanceObserver, or event-loop timer. Those diagnostics are
-    // useful for investigation but add work to the same browser process
-    // that must receive/decode/record the live stream.
-    // Keeping them inactive here avoids the diagnostic code becoming part
-    // of the recording bottleneck.
-    window.__superliveSourceVideoFrameCount = 0;
-    window.__superliveSourceVideoFrameCountAtLastStatus = 0;
-    window.__superliveSourceVideoFrameLastStatusAt = performance.now();
-    window.__superliveSourceVideoFrameCallbackActive = false;
-    window.__superliveSourceVideoFrameReader = null;
-    window.__superliveSourceVideoFrameClone = null;
+        const tracks = [
+            selectedVideoTrack
+        ];
 
-    window.__superliveRenderedVideoFrameCount = 0;
-    window.__superliveRenderedVideoFrameCountAtLastStatus = 0;
-    window.__superliveRenderedVideoFrameLastStatusAt = performance.now();
-    window.__superliveRenderedVideoFrameCallbackActive = false;
-    window.__superliveDiagnosticsStartedAt = performance.now();
+        if (selectedAudioTrack) {
+            tracks.push(
+                selectedAudioTrack
+            );
+        }
 
-    window.__superliveEventLoopSamples = 0;
-    window.__superliveEventLoopDelayTotalMs = 0;
-    window.__superliveEventLoopMaxDelayMs = 0;
-    window.__superliveLongTaskCount = 0;
-    window.__superliveLongTaskTotalMs = 0;
-    window.__superliveEventLoopTimer = null;
-    window.__superliveLongTaskObserver = null;
+        window.__preparedStream =
+            new MediaStream(tracks);
 
-    // Keep the selected player rendered normally. We deliberately avoid
-    // changing visibility/display/pause state because doing so can alter
-    // the site's decoder/compositor behavior. MediaRecorder consumes the
-    // selected WebRTC track directly.
+        window.__preparedVideoTrack =
+            selectedVideoTrack;
 
-    return {
-        hasVideo:
-            !!selectedVideoTrack,
+        window.__preparedAudioTrack =
+            selectedAudioTrack;
 
-        hasAudio:
-            !!selectedAudioTrack,
+        return {
+            hasVideo:
+                !!selectedVideoTrack,
 
-        videoReadyState:
-            selectedVideoTrack.readyState,
+            hasAudio:
+                !!selectedAudioTrack,
 
-        audioReadyState:
-            selectedAudioTrack
-                ? selectedAudioTrack.readyState
-                : null
-    };
-};
+            videoReadyState:
+                selectedVideoTrack.readyState,
 
-window.__superliveGetDiagnostics = () => {
-    const now = performance.now();
-    const start = window.__superliveDiagnosticsStartedAt || now;
-    const elapsed = Math.max(0, (now - start) / 1000);
-
-    const sourceCount = window.__superliveSourceVideoFrameCount || 0;
-    const renderedCount = window.__superliveRenderedVideoFrameCount || 0;
-
-    const sourcePreviousTime =
-        window.__superliveSourceVideoFrameLastStatusAt || now;
-    const renderedPreviousTime =
-        window.__superliveRenderedVideoFrameLastStatusAt || now;
-
-    const sourcePreviousCount =
-        window.__superliveSourceVideoFrameCountAtLastStatus || 0;
-    const renderedPreviousCount =
-        window.__superliveRenderedVideoFrameCountAtLastStatus || 0;
-
-    const sourceElapsed = Math.max(0, (now - sourcePreviousTime) / 1000);
-    const renderedElapsed = Math.max(0, (now - renderedPreviousTime) / 1000);
-
-    const sourceFps = sourceElapsed > 0
-        ? (sourceCount - sourcePreviousCount) / sourceElapsed
-        : 0;
-    const renderedFps = renderedElapsed > 0
-        ? (renderedCount - renderedPreviousCount) / renderedElapsed
-        : 0;
-
-    window.__superliveSourceVideoFrameLastStatusAt = now;
-    window.__superliveSourceVideoFrameCountAtLastStatus = sourceCount;
-    window.__superliveRenderedVideoFrameLastStatusAt = now;
-    window.__superliveRenderedVideoFrameCountAtLastStatus = renderedCount;
-
-    let playbackQuality = null;
-    const video = window.__superliveVideoElement;
-    if (video) {
-        try {
-            const q = video.getVideoPlaybackQuality
-                ? video.getVideoPlaybackQuality()
-                : null;
-            playbackQuality = {
-                totalVideoFrames: q && q.totalVideoFrames != null
-                    ? q.totalVideoFrames : null,
-                droppedVideoFrames: q && q.droppedVideoFrames != null
-                    ? q.droppedVideoFrames : null,
-                corruptedVideoFrames: q && q.corruptedVideoFrames != null
-                    ? q.corruptedVideoFrames : null
-            };
-        } catch (e) {}
-    }
-
-    const eventSamples = window.__superliveEventLoopSamples || 0;
-    const eventTotal = window.__superliveEventLoopDelayTotalMs || 0;
-
-    return {
-        elapsedSeconds: elapsed,
-        sourceVideoFrameCount: sourceCount,
-        renderedVideoFrameCount: renderedCount,
-        sourceFpsSinceStatus: sourceFps,
-        renderedFpsSinceStatus: renderedFps,
-        sourceFpsOverall: elapsed > 0 ? sourceCount / elapsed : 0,
-        renderedFpsOverall: elapsed > 0 ? renderedCount / elapsed : 0,
-        sourceCallbackActive: !!window.__superliveSourceVideoFrameCallbackActive,
-        renderedCallbackActive: !!window.__superliveRenderedVideoFrameCallbackActive,
-        videoReadyState: video ? video.readyState : null,
-        videoPaused: video ? video.paused : null,
-        videoEnded: video ? video.ended : null,
-        videoWidth: video ? video.videoWidth : 0,
-        videoHeight: video ? video.videoHeight : 0,
-        videoCurrentTime: video ? video.currentTime : null,
-        playbackQuality: playbackQuality,
-        eventLoopSamples: eventSamples,
-        eventLoopAvgDelayMs: eventSamples > 0 ? eventTotal / eventSamples : 0,
-        eventLoopMaxDelayMs: window.__superliveEventLoopMaxDelayMs || 0,
-        longTaskCount: window.__superliveLongTaskCount || 0,
-        longTaskTotalMs: window.__superliveLongTaskTotalMs || 0
-    };
-};
-
-window.__superliveStartRec = (
-    videoBitrate,
-    audioBitrate,
-    timeslice
-) => {
-    if (!window.__preparedStream) {
-        throw new Error(
-            "Prepared stream is missing"
-        );
-    }
-
-    let mimeType = "";
-
-    if (
-        MediaRecorder.isTypeSupported(
-            "video/webm;codecs=vp8,opus"
-        )
-    ) {
-        mimeType =
-            "video/webm;codecs=vp8,opus";
-
-    } else if (
-        MediaRecorder.isTypeSupported(
-            "video/webm;codecs=vp9,opus"
-        )
-    ) {
-        mimeType =
-            "video/webm;codecs=vp9,opus";
-
-    } else if (
-        MediaRecorder.isTypeSupported(
-            "video/webm"
-        )
-    ) {
-        mimeType =
-            "video/webm";
-
-    } else {
-        throw new Error(
-            "No supported WebM MediaRecorder MIME type"
-        );
-    }
-
-    const recorderOptions = {
-        mimeType,
-        videoBitsPerSecond:
-            videoBitrate,
-        audioBitsPerSecond:
-            audioBitrate
+            audioReadyState:
+                selectedAudioTrack
+                    ? selectedAudioTrack.readyState
+                    : null
+        };
     };
 
-    const recorder =
-        new MediaRecorder(
-            window.__preparedStream,
-            recorderOptions
-        );
+    window.__superliveStartRec = (
+        videoBitrate,
+        audioBitrate,
+        timeslice
+    ) => {
+        if (!window.__preparedStream) {
+            throw new Error(
+                "Prepared stream is missing"
+            );
+        }
 
-    window.__superliveRecorder =
-        recorder;
+        let mimeType = "";
 
-    window.__superliveChunkCount = 0;
+        if (
+            MediaRecorder.isTypeSupported(
+                "video/webm;codecs=vp9,opus"
+            )
+        ) {
+            mimeType =
+                "video/webm;codecs=vp9,opus";
 
-    window.__superliveUploadedChunkCount = 0;
+        } else if (
+            MediaRecorder.isTypeSupported(
+                "video/webm;codecs=vp8,opus"
+            )
+        ) {
+            mimeType =
+                "video/webm;codecs=vp8,opus";
 
-    window.__superliveLastChunkAt =
-        performance.now();
+        } else if (
+            MediaRecorder.isTypeSupported(
+                "video/webm"
+            )
+        ) {
+            mimeType =
+                "video/webm";
 
-    window.__superliveLastChunkSize =
-        0;
+        } else {
+            throw new Error(
+                "No supported WebM MediaRecorder MIME type"
+            );
+        }
 
-    window.__superliveUploadQueue =
-        [];
-
-    window.__superliveIsUploading =
-        false;
-
-    window.__superliveUploadError =
-        null;
-
-    window.__superlivePendingDataTasks = 0;
-
-    window.__superliveRecorderStopFired =
-        false;
-
-    window.__superliveFinalDataReady =
-        false;
-
-    window.__superliveFinalDataResolve =
-        null;
-
-    window.__superliveFinalDataPromise =
-        new Promise((resolve) => {
-            window.__superliveFinalDataResolve =
-                resolve;
-        });
-
-    window.__superliveMaybeResolveFinalData =
-        () => {
-            if (
-                window.__superliveRecorderStopFired
-                &&
-                window.__superlivePendingDataTasks
-                    === 0
-                &&
-                !window.__superliveFinalDataReady
-            ) {
-                window.__superliveFinalDataReady =
-                    true;
-
-                const resolve =
-                    window.__superliveFinalDataResolve;
-
-                window.__superliveFinalDataResolve =
-                    null;
-
-                if (resolve) {
-                    resolve(true);
-                }
-            }
+        const recorderOptions = {
+            mimeType,
+            videoBitsPerSecond:
+                videoBitrate,
+            audioBitsPerSecond:
+                audioBitrate
         };
 
-    async function processQueue() {
-        if (
-            window.__superliveIsUploading
-        ) {
-            return;
-        }
+        const recorder =
+            new MediaRecorder(
+                window.__preparedStream,
+                recorderOptions
+            );
+
+        window.__superliveRecorder =
+            recorder;
+
+        window.__superliveChunkCount = 0;
+
+        window.__superliveUploadedChunkCount = 0;
+
+        window.__superliveLastChunkAt =
+            performance.now();
+
+        window.__superliveLastChunkSize =
+            0;
+
+        window.__superliveUploadQueue =
+            [];
 
         window.__superliveIsUploading =
-            true;
+            false;
 
-        try {
-            while (
-                window.__superliveUploadQueue
-                    .length
+        window.__superliveUploadError =
+            null;
+
+        /*
+         * ----------------------------------------------------
+         * FINAL DATA SYNCHRONIZATION
+         * ----------------------------------------------------
+         */
+
+        window.__superlivePendingDataTasks = 0;
+
+        window.__superliveRecorderStopFired =
+            false;
+
+        window.__superliveFinalDataReady =
+            false;
+
+        window.__superliveFinalDataResolve =
+            null;
+
+        window.__superliveFinalDataPromise =
+            new Promise((resolve) => {
+                window.__superliveFinalDataResolve =
+                    resolve;
+            });
+
+        window.__superliveMaybeResolveFinalData =
+            () => {
+                if (
+                    window.__superliveRecorderStopFired
+                    &&
+                    window.__superlivePendingDataTasks
+                        === 0
+                    &&
+                    !window.__superliveFinalDataReady
+                ) {
+                    window.__superliveFinalDataReady =
+                        true;
+
+                    const resolve =
+                        window.__superliveFinalDataResolve;
+
+                    window.__superliveFinalDataResolve =
+                        null;
+
+                    if (resolve) {
+                        resolve(true);
+                    }
+                }
+            };
+
+        /*
+         * ----------------------------------------------------
+         * SEQUENTIAL QUEUE PROCESSOR
+         * ----------------------------------------------------
+         *
+         * IMPORTANT:
+         *
+         * MediaRecorder dataavailable events are ordered.
+         * We preserve that order by putting the Blob into the
+         * queue synchronously.
+         *
+         * We intentionally DO NOT call:
+         *
+         *     await event.data.arrayBuffer()
+         *
+         * before queue.push().
+         *
+         * Blob itself is a valid fetch body.
+         *
+         * This removes the asynchronous completion race that
+         * could previously reorder chunks.
+         */
+
+        async function processQueue() {
+            if (
+                window.__superliveIsUploading
             ) {
-                const item =
+                return;
+            }
+
+            window.__superliveIsUploading =
+                true;
+
+            try {
+                while (
                     window.__superliveUploadQueue
-                        .shift();
+                        .length
+                ) {
+                    const item =
+                        window.__superliveUploadQueue
+                            .shift();
+
+                    try {
+                        const response =
+                            await fetch(
+                                "/__slr_chunk",
+                                {
+                                    method: "POST",
+                                    body: item.blob
+                                }
+                            );
+
+                        if (!response.ok) {
+                            throw new Error(
+                                "HTTP "
+                                + response.status
+                            );
+                        }
+
+                        window.__superliveUploadedChunkCount++;
+
+                    } catch (e) {
+                        console.error(
+                            "superlive chunk upload error",
+                            e
+                        );
+
+                        window.__superliveUploadError =
+                            String(e);
+
+                        /*
+                         * Put the exact same chunk back at
+                         * the front. Because the processor is
+                         * strictly sequential, this preserves
+                         * chunk order.
+                         */
+
+                        window.__superliveUploadQueue
+                            .unshift(item);
+
+                        break;
+                    }
+                }
+
+            } finally {
+                window.__superliveIsUploading =
+                    false;
+
+                /*
+                 * If an upload failed, retry asynchronously.
+                 * Do not create a recursive synchronous loop.
+                 */
+
+                if (
+                    window.__superliveUploadQueue
+                        .length
+                ) {
+                    setTimeout(
+                        () => {
+                            processQueue();
+                        },
+                        250
+                    );
+                }
+            }
+        }
+
+        /*
+         * ----------------------------------------------------
+         * DATAAVAILABLE
+         * ----------------------------------------------------
+         */
+
+        recorder.ondataavailable =
+            (event) => {
+
+                window.__superlivePendingDataTasks++;
 
                 try {
-                    const response =
-                        await fetch(
-                            "/__slr_chunk",
-                            {
-                                method: "POST",
-                                body: item.blob
-                            }
-                        );
-
-                    if (!response.ok) {
-                        throw new Error(
-                            "HTTP "
-                            + response.status
-                        );
+                    if (
+                        !event.data
+                        ||
+                        event.data.size < 1
+                    ) {
+                        return;
                     }
 
-                    window.__superliveUploadedChunkCount++;
+                    window.__superliveChunkCount++;
+
+                    window.__superliveLastChunkAt =
+                        performance.now();
+
+                    window.__superliveLastChunkSize =
+                        event.data.size;
+
+                    /*
+                     * CRITICAL:
+                     *
+                     * Push the Blob immediately.
+                     *
+                     * No await.
+                     * No arrayBuffer().
+                     *
+                     * Therefore event order is preserved.
+                     */
+
+                    window.__superliveUploadQueue
+                        .push({
+                            blob: event.data
+                        });
 
                 } catch (e) {
                     console.error(
-                        "superlive chunk upload error",
+                        "superlive dataavailable error",
                         e
                     );
 
                     window.__superliveUploadError =
                         String(e);
 
-                    window.__superliveUploadQueue
-                        .unshift(item);
+                } finally {
+                    window.__superlivePendingDataTasks--;
 
-                    break;
-                }
-            }
-
-        } finally {
-            window.__superliveIsUploading =
-                false;
-
-            if (
-                window.__superliveUploadQueue
-                    .length
-            ) {
-                setTimeout(
-                    () => {
-                        processQueue();
-                    },
-                    250
-                );
-            }
-        }
-    }
-
-    recorder.ondataavailable =
-        (event) => {
-
-            window.__superlivePendingDataTasks++;
-
-            try {
-                if (
-                    !event.data
-                    ||
-                    event.data.size < 1
-                ) {
-                    return;
-                }
-
-                window.__superliveChunkCount++;
-
-                window.__superliveLastChunkAt =
-                    performance.now();
-
-                window.__superliveLastChunkSize =
-                    event.data.size;
-
-                window.__superliveUploadQueue
-                    .push({
-                        blob: event.data
-                    });
-
-            } catch (e) {
-                console.error(
-                    "superlive dataavailable error",
-                    e
-                );
-
-                window.__superliveUploadError =
-                    String(e);
-
-            } finally {
-                window.__superlivePendingDataTasks--;
-
-                window
-                    .__superliveMaybeResolveFinalData();
-
-                processQueue();
-            }
-        };
-
-    recorder.onstop = () => {
-        window.__superliveRecorderStopFired =
-            true;
-
-        window
-            .__superliveMaybeResolveFinalData();
-    };
-
-    recorder.onerror = (event) => {
-        console.error(
-            "superlive MediaRecorder error",
-            event
-        );
-
-        window.__superliveUploadError =
-            "MediaRecorder error";
-    };
-
-    window.__superliveWaitRecorderFinal =
-        async (timeoutMs) => {
-            if (
-                window.__superliveFinalDataReady
-            ) {
-                return true;
-            }
-
-            const timeoutPromise =
-                new Promise(
-                    (resolve) => {
-                        setTimeout(
-                            () =>
-                                resolve(false),
-                            timeoutMs
-                        );
-                    }
-                );
-
-            const result =
-                await Promise.race([
                     window
-                        .__superliveFinalDataPromise,
-                    timeoutPromise
-                ]);
+                        .__superliveMaybeResolveFinalData();
 
-            return result === true;
-        };
+                    processQueue();
+                }
+            };
 
-    window.__superliveStopRec =
-        () => {
-            const activeRecorder =
-                window.__superliveRecorder;
+        /*
+         * ----------------------------------------------------
+         * STOP
+         * ----------------------------------------------------
+         */
 
-            if (
-                activeRecorder
-                &&
-                activeRecorder.state
-                    !== "inactive"
-            ) {
-                activeRecorder.stop();
-                return true;
-            }
-
-            window
-                .__superliveRecorderStopFired =
+        recorder.onstop = () => {
+            window.__superliveRecorderStopFired =
                 true;
 
             window
                 .__superliveMaybeResolveFinalData();
-
-            return false;
         };
 
-    window.__superliveGetStatus =
-        () => {
-            const videoTrack =
-                window.__preparedVideoTrack;
+        recorder.onerror = (event) => {
+            console.error(
+                "superlive MediaRecorder error",
+                event
+            );
 
-            return {
-                queueLength:
-                    window
-                        .__superliveUploadQueue
-                        ?
+            window.__superliveUploadError =
+                "MediaRecorder error";
+        };
+
+        /*
+         * ----------------------------------------------------
+         * WAIT FOR FINAL DATAAVAILABLE
+         * ----------------------------------------------------
+         */
+
+        window.__superliveWaitRecorderFinal =
+            async (timeoutMs) => {
+                if (
+                    window.__superliveFinalDataReady
+                ) {
+                    return true;
+                }
+
+                const timeoutPromise =
+                    new Promise(
+                        (resolve) => {
+                            setTimeout(
+                                () =>
+                                    resolve(false),
+                                timeoutMs
+                            );
+                        }
+                    );
+
+                const result =
+                    await Promise.race([
+                        window
+                            .__superliveFinalDataPromise,
+                        timeoutPromise
+                    ]);
+
+                return result === true;
+            };
+
+        /*
+         * ----------------------------------------------------
+         * STOP RECORDER
+         * ----------------------------------------------------
+         */
+
+        window.__superliveStopRec =
+            () => {
+                const activeRecorder =
+                    window.__superliveRecorder;
+
+                if (
+                    activeRecorder
+                    &&
+                    activeRecorder.state
+                        !== "inactive"
+                ) {
+                    activeRecorder.stop();
+                    return true;
+                }
+
+                window
+                    .__superliveRecorderStopFired =
+                    true;
+
+                window
+                    .__superliveMaybeResolveFinalData();
+
+                return false;
+            };
+
+        /*
+         * ----------------------------------------------------
+         * STATUS
+         * ----------------------------------------------------
+         */
+
+        window.__superliveGetStatus =
+            () => {
+                const videoTrack =
+                    window.__preparedVideoTrack;
+
+                return {
+                    queueLength:
                         window
                             .__superliveUploadQueue
-                            .length
-                        :
-                        0,
+                            ?
+                            window
+                                .__superliveUploadQueue
+                                .length
+                            :
+                            0,
 
-                isUploading:
-                    !!window
-                        .__superliveIsUploading,
+                    isUploading:
+                        !!window
+                            .__superliveIsUploading,
 
-                chunkCount:
-                    window
-                        .__superliveChunkCount
-                    || 0,
+                    chunkCount:
+                        window
+                            .__superliveChunkCount
+                        || 0,
 
-                uploadedChunkCount:
-                    window
-                        .__superliveUploadedChunkCount
-                    || 0,
+                    uploadedChunkCount:
+                        window
+                            .__superliveUploadedChunkCount
+                        || 0,
 
-                uploadError:
-                    window
-                        .__superliveUploadError
-                    || null,
+                    uploadError:
+                        window
+                            .__superliveUploadError
+                        || null,
 
-                pendingDataTasks:
-                    window
-                        .__superlivePendingDataTasks
-                    || 0,
+                    pendingDataTasks:
+                        window
+                            .__superlivePendingDataTasks
+                        || 0,
 
-                idleTimeMs:
-                    window
-                        .__superliveLastChunkAt
-                    ?
-                    performance.now()
-                    -
-                    window
-                        .__superliveLastChunkAt
-                    :
-                    Infinity,
-
-                lastChunkSize:
-                    window
-                        .__superliveLastChunkSize
-                    || 0,
-
-                videoReadyState:
-                    videoTrack
+                    idleTimeMs:
+                        window
+                            .__superliveLastChunkAt
                         ?
-                        videoTrack.readyState
+                        performance.now()
+                        -
+                        window
+                            .__superliveLastChunkAt
+                        :
+                        Infinity,
+
+                    lastChunkSize:
+                        window
+                            .__superliveLastChunkSize
+                        || 0,
+
+                    videoReadyState:
+                        videoTrack
+                            ?
+                            videoTrack.readyState
+                            :
+                            null,
+
+                    videoSettings:
+                        videoTrack
+                        &&
+                        videoTrack.getSettings
+                        ?
+                        videoTrack.getSettings()
                         :
                         null,
 
-                videoSettings:
-                    videoTrack
-                    &&
-                    videoTrack.getSettings
-                    ?
-                    videoTrack.getSettings()
-                    :
-                    null,
-
-                recorderState:
-                    window
-                        .__superliveRecorder
-                    ?
-                    window
-                        .__superliveRecorder
-                        .state
-                    :
-                    null,
-
-                renderedVideoFrameCount:
-                    window
-                        .__superliveRenderedVideoFrameCount
-                    || 0,
-
-                renderedVideoFrameCallbackActive:
-                    !!window
-                        .__superliveRenderedVideoFrameCallbackActive,
-
-                renderedVideoFpsSinceStatus:
-                    (() => {
-                        const now = performance.now();
-                        const previousTime =
-                            window
-                                .__superliveRenderedVideoFrameLastStatusAt
-                            || now;
-                        const elapsed =
-                            (now - previousTime) / 1000;
-                        const currentCount =
-                            window
-                                .__superliveRenderedVideoFrameCount
-                            || 0;
-                        const previousCount =
-                            window
-                                .__superliveRenderedVideoFrameCountAtLastStatus
-                            || 0;
-
+                    recorderState:
                         window
-                            .__superliveRenderedVideoFrameLastStatusAt = now;
+                            .__superliveRecorder
+                        ?
                         window
-                            .__superliveRenderedVideoFrameCountAtLastStatus =
-                            currentCount;
+                            .__superliveRecorder
+                            .state
+                        :
+                        null,
 
-                        return elapsed > 0
-                            ? (currentCount - previousCount) / elapsed
-                            : 0;
-                    })(),
-
-                sourceVideoFrameCount:
-                    window
-                        .__superliveSourceVideoFrameCount
-                    || 0,
-
-                sourceVideoFrameCallbackActive:
-                    !!window
-                        .__superliveSourceVideoFrameCallbackActive,
-
-                sourceVideoFpsSinceStatus:
-                    (() => {
-                        const now = performance.now();
-                        const previousTime =
-                            window
-                                .__superliveSourceVideoFrameLastStatusAt
-                            || now;
-                        const elapsed =
-                            (now - previousTime) / 1000;
-                        const currentCount =
-                            window
-                                .__superliveSourceVideoFrameCount
-                            || 0;
-                        const previousCount =
-                            window
-                                .__superliveSourceVideoFrameCountAtLastStatus
-                            || 0;
-
-                        window
-                            .__superliveSourceVideoFrameLastStatusAt = now;
-                        window
-                            .__superliveSourceVideoFrameCountAtLastStatus =
-                            currentCount;
-
-                        return elapsed > 0
-                            ? (currentCount - previousCount) / elapsed
-                            : 0;
-                    })(),
-
-                diagnosticsElapsedSeconds:
-                    Math.max(
-                        0,
-                        (
-                            performance.now()
-                            - (
-                                window.__superliveDiagnosticsStartedAt
-                                || performance.now()
-                            )
-                        ) / 1000
-                    ),
-
-                renderedVideoFpsOverall:
-                    (() => {
-                        const elapsed =
-                            (
-                                performance.now()
-                                - (
-                                    window.__superliveDiagnosticsStartedAt
-                                    || performance.now()
-                                )
-                            ) / 1000;
-                        const count =
-                            window.__superliveRenderedVideoFrameCount
-                            || 0;
-                        return elapsed > 0
-                            ? count / elapsed
-                            : 0;
-                    })(),
-
-                sourceVideoFpsOverall:
-                    (() => {
-                        const elapsed =
-                            (
-                                performance.now()
-                                - (
-                                    window.__superliveDiagnosticsStartedAt
-                                    || performance.now()
-                                )
-                            ) / 1000;
-                        const count =
-                            window.__superliveSourceVideoFrameCount
-                            || 0;
-                        return elapsed > 0
-                            ? count / elapsed
-                            : 0;
-                    })(),
-
-                eventLoopSamples:
-                    window.__superliveEventLoopSamples || 0,
-
-                eventLoopAvgDelayMs:
-                    (() => {
-                        const samples =
-                            window.__superliveEventLoopSamples || 0;
-                        const total =
-                            window.__superliveEventLoopDelayTotalMs || 0;
-                        return samples > 0
-                            ? total / samples
-                            : 0;
-                    })(),
-
-                eventLoopMaxDelayMs:
-                    window.__superliveEventLoopMaxDelayMs || 0,
-
-                longTaskCount:
-                    window.__superliveLongTaskCount || 0,
-
-                longTaskTotalMs:
-                    window.__superliveLongTaskTotalMs || 0,
-
-                streamEnded:
-                    !!(window.__superliveEndState && window.__superliveEndState.ended),
-                streamEndReason:
-                    window.__superliveEndState ? window.__superliveEndState.reason : null,
-                streamNoProgressMs:
-                    window.__superliveEndState ?
-                        Math.max(0, performance.now() - window.__superliveEndState.lastProgressAt) : 0,
-                streamMuted:
-                    !!(window.__preparedVideoTrack && window.__preparedVideoTrack.muted),
-
-                playbackQuality:
-                    (() => {
-                        const video =
-                            window.__superliveVideoElement;
-                        if (!video) {
-                            return null;
-                        }
-                        try {
-                            const q =
-                                video.getVideoPlaybackQuality
-                                ? video.getVideoPlaybackQuality()
-                                : null;
-                            return {
-                                totalVideoFrames:
-                                    q && q.totalVideoFrames != null
-                                    ? q.totalVideoFrames
-                                    : null,
-                                droppedVideoFrames:
-                                    q && q.droppedVideoFrames != null
-                                    ? q.droppedVideoFrames
-                                    : null,
-                                corruptedVideoFrames:
-                                    q && q.corruptedVideoFrames != null
-                                    ? q.corruptedVideoFrames
-                                    : null
-                            };
-                        } catch (e) {
-                            return null;
-                        }
-                    })(),
-
-                finalDataReady:
-                    !!window
-                        .__superliveFinalDataReady
+                    finalDataReady:
+                        !!window
+                            .__superliveFinalDataReady
+                };
             };
+
+        /*
+         * Start recording only after all handlers are installed.
+         */
+
+        recorder.start(timeslice);
+
+        return {
+            mimeType,
+            state: recorder.state
         };
-
-    recorder.start(timeslice);
-
-    return {
-        mimeType,
-        state: recorder.state
     };
-};
 
-window.__superliveWaitChunk =
-    async (timeoutMs) => {
-        const start =
-            performance.now();
+    window.__superliveWaitChunk =
+        async (timeoutMs) => {
+            const start =
+                performance.now();
 
-        while (
-            window.__superliveChunkCount < 1
-        ) {
-            if (
-                performance.now()
-                - start
-                > timeoutMs
+            while (
+                window.__superliveChunkCount < 1
             ) {
-                return false;
+                if (
+                    performance.now()
+                    - start
+                    > timeoutMs
+                ) {
+                    return false;
+                }
+
+                await new Promise(
+                    resolve =>
+                        setTimeout(
+                            resolve,
+                            100
+                        )
+                );
             }
 
-            await new Promise(
-                resolve =>
-                    setTimeout(
-                        resolve,
-                        100
-                    )
-            );
-        }
-
-        return true;
-    };
-
+            return true;
+        };
 })();
 """
 
+
 # ============================================================
-
 # SAFE EVAL
-
 # ============================================================
 
 def safe_eval(value):
@@ -3021,22 +2108,16 @@ def safe_eval(value):
     except Exception:
         return value
 
-    # ============================================================
 
-    # RECORDING
-
-    # ============================================================
+# ============================================================
+# RECORDING
+# ============================================================
 
 async def run_recording(playwright):
-    if AB_TEST_MODE not in ("record", "source_only"):
-        raise RuntimeError(
-            "AB_TEST_MODE must be either 'record' or 'source_only'"
-        )
-
     if not URL:
         raise RuntimeError(
-    "RECORD_URL environment variable is missing"
-    )
+            "RECORD_URL environment variable is missing"
+        )
 
     if not STREAM_ID:
         log(
@@ -3051,6 +2132,7 @@ async def run_recording(playwright):
         "--autoplay-policy=no-user-gesture-required",
         "--no-sandbox",
         "--disable-dev-shm-usage",
+        "--disable-gpu",
     ]
 
     browser = await playwright.chromium.launch(
@@ -3115,6 +2197,7 @@ async def run_recording(playwright):
 
                 if body:
                     webm_file.write(body)
+                    webm_file.flush()
 
                     chunk_count += 1
                     total_bytes += len(body)
@@ -3152,35 +2235,14 @@ async def run_recording(playwright):
             timeout=PAGE_TIMEOUT_MS,
         )
 
-        current_page_url = page.url
-        expected_stream_id = str(STREAM_ID or "").strip()
-        if expected_stream_id:
-            import re
-            page_stream_match = re.search(
-                r"/livestream/([^/?#]+)",
-                current_page_url,
-                re.IGNORECASE,
-            )
-            page_stream_id = (
-                page_stream_match.group(1)
-                if page_stream_match
-                else ""
-            )
-            if page_stream_id != expected_stream_id:
-                raise RuntimeError(
-                    "Target livestream mismatch: "
-                    f"requested={expected_stream_id}, "
-                    f"page={page_stream_id or 'missing'}, "
-                    f"url={current_page_url}"
-                )
-
         log(
             "Page loaded. "
-            f"Target URL verified: {current_page_url}"
-        )
-        log(
             "Waiting for live video..."
         )
+
+        # ----------------------------------------------------
+        # Wait for actual video
+        # ----------------------------------------------------
 
         video_ready = False
 
@@ -3202,27 +2264,56 @@ async def run_recording(playwright):
                                 document.querySelectorAll("video")
                             );
 
-                        const candidates = [];
                         for (const video of videos) {
                             try {
-                                const stream = video.srcObject;
-                                if (!stream) continue;
-                                if (!stream.getVideoTracks().some(t => t.readyState === "live")) continue;
-                                const rect = video.getBoundingClientRect();
-                                const style = getComputedStyle(video);
-                                const visible = style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
-                                const area = Math.max(0, rect.width) * Math.max(0, rect.height);
-                                candidates.push({
-                                    width: video.videoWidth || 0, height: video.videoHeight || 0, area, visible,
-                                    audio: stream.getAudioTracks().some(t => t.readyState === "live")
-                                });
+                                const stream =
+                                    video.srcObject;
+
+                                if (!stream) {
+                                    continue;
+                                }
+
+                                const videoTracks =
+                                    stream.getVideoTracks();
+
+                                const audioTracks =
+                                    stream.getAudioTracks();
+
+                                const liveVideo =
+                                    videoTracks.some(
+                                        t =>
+                                            t.readyState
+                                            === "live"
+                                    );
+
+                                const liveAudio =
+                                    audioTracks.some(
+                                        t =>
+                                            t.readyState
+                                            === "live"
+                                    );
+
+                                if (
+                                    video.videoWidth > 0 &&
+                                    video.videoHeight > 0 &&
+                                    liveVideo
+                                ) {
+                                    return {
+                                        ready: true,
+                                        width:
+                                            video.videoWidth,
+                                        height:
+                                            video.videoHeight,
+                                        audio:
+                                            liveAudio
+                                    };
+                                }
                             } catch (e) {}
                         }
-                        candidates.sort((a,b) => (Number(b.visible)-Number(a.visible)) || (b.area-a.area) || ((b.width*b.height)-(a.width*a.height)));
-                        if (candidates.length && candidates[0].width > 0 && candidates[0].height > 0) {
-                            return { ready: true, width: candidates[0].width, height: candidates[0].height, audio: candidates[0].audio, candidates: candidates.length };
-                        }
-                        return { ready: false, candidates: candidates.length };
+
+                        return {
+                            ready: false
+                        };
                     }
                     """
                 )
@@ -3252,6 +2343,10 @@ async def run_recording(playwright):
                 "Live video was not detected"
             )
 
+        # ----------------------------------------------------
+        # Prepare stream
+        # ----------------------------------------------------
+
         prepared = await page.evaluate(
             """
             () =>
@@ -3267,158 +2362,9 @@ async def run_recording(playwright):
             )
         )
 
-        try:
-            selected_info = await page.evaluate(
-                """
-                () => {
-                    const v = window.__superliveVideoElement;
-                    const t = window.__preparedVideoTrack;
-                    const s = v && v.srcObject;
-                    const r = v ? v.getBoundingClientRect() : null;
-                    return {
-                        videoWidth: v ? v.videoWidth : 0, videoHeight: v ? v.videoHeight : 0,
-                        renderedWidth: r ? r.width : 0, renderedHeight: r ? r.height : 0,
-                        paused: v ? v.paused : null, readyState: v ? v.readyState : null,
-                        videoTrackId: t ? t.id : null,
-                        videoTrackIds: s ? s.getVideoTracks().map(x => x.id) : [],
-                        audioTrackIds: s ? s.getAudioTracks().map(x => x.id) : []
-                    };
-                }
-                """
-            )
-            log("SELECTED TARGET VIDEO: " + json.dumps(selected_info, ensure_ascii=False))
-        except Exception as e:
-            log(f"Selected video diagnostics unavailable: {e}")
-
-        if AB_TEST_MODE == "source_only":
-            log_section(
-                "A/B TEST A - SOURCE + RENDER ONLY (NO MEDIARECORDER)"
-            )
-            log(
-                f"MediaRecorder is DISABLED. Diagnostics will run for "
-                f"{DIAGNOSTIC_SECONDS}s or until the video ends."
-            )
-            log(
-                "IMPORTANT: no WebM, MP4, FFmpeg, Telegram upload, "
-                "or recording chunk route is used in this mode."
-            )
-
-            diagnostic_started = time.monotonic()
-            last_diag_log = diagnostic_started
-
-            while True:
-                elapsed = time.monotonic() - diagnostic_started
-
-                if elapsed >= DIAGNOSTIC_SECONDS:
-                    log(
-                        "A/B source-only diagnostic duration reached."
-                    )
-                    break
-
-                try:
-                    diag = await page.evaluate(
-                        """
-                        () => window.__superliveGetDiagnostics()
-                        """
-                    )
-
-                    # HTMLMediaElement.readyState == 4 means HAVE_ENOUGH_DATA;
-                    # it does NOT mean playback has ended.  The previous check
-                    # incorrectly treated normal readyState=4 as end-of-video,
-                    # causing Test A to stop after about one second.
-                    if diag.get("videoEnded"):
-                        log(
-                            "Video playback ended during source-only test."
-                        )
-                        break
-
-                    if (
-                        time.monotonic() - last_diag_log >= 10
-                    ):
-                        quality = diag.get("playbackQuality") or {}
-                        log(
-                            "A/B SOURCE-ONLY status: "
-                            f"elapsed={diag.get('elapsedSeconds', 0):.1f}s "
-                            f"source_fps={diag.get('sourceFpsSinceStatus', 0):.2f} "
-                            f"rendered_fps={diag.get('renderedFpsSinceStatus', 0):.2f} "
-                            f"source_overall={diag.get('sourceFpsOverall', 0):.2f} "
-                            f"rendered_overall={diag.get('renderedFpsOverall', 0):.2f} "
-                            f"source_frames={diag.get('sourceVideoFrameCount', 0)} "
-                            f"rendered_frames={diag.get('renderedVideoFrameCount', 0)} "
-                            f"dropped={quality.get('droppedVideoFrames')} "
-                            f"eventloop_avg_delay_ms={diag.get('eventLoopAvgDelayMs', 0):.2f} "
-                            f"eventloop_max_delay_ms={diag.get('eventLoopMaxDelayMs', 0):.2f} "
-                            f"longtasks={diag.get('longTaskCount', 0)}"
-                        )
-                        last_diag_log = time.monotonic()
-
-                except Exception as e:
-                    log(
-                        f"A/B source-only diagnostic error: {e}"
-                    )
-
-                await asyncio.sleep(1)
-
-            final_diag = await page.evaluate(
-                """
-                () => window.__superliveGetDiagnostics()
-                """
-            )
-
-            log_section(
-                "A/B TEST A - FINAL SOURCE/RENDER DIAGNOSTICS"
-            )
-            log(
-                "FINAL A/B A: "
-                + json.dumps(
-                    final_diag,
-                    ensure_ascii=False,
-                )
-            )
-            log(
-                "A/B conclusion helper: compare this run against the "
-                "AB_TEST_MODE=record run. If source/render remain near "
-                "30 FPS here but recording mode shows a much lower WebM "
-                "cadence, MediaRecorder/encoding is implicated. If the "
-                "same source/render FPS dips occur here, the issue exists "
-                "before MediaRecorder."
-            )
-
-            try:
-                await page.unroute(
-                    "**/__slr_chunk",
-                    handle_chunk,
-                )
-            except Exception:
-                pass
-
-            try:
-                if webm_file is not None:
-                    webm_file.close()
-                    webm_file = None
-            except Exception:
-                pass
-
-            try:
-                if webm_path.exists():
-                    webm_path.unlink()
-            except Exception:
-                pass
-
-            try:
-                await browser.close()
-            except Exception:
-                pass
-
-            return True
-
-        log_section(
-            "A/B TEST B - SOURCE + RENDER + MEDIARECORDER"
-        )
-        log(
-            "MediaRecorder is ENABLED. This is the recording-side run "
-            "for comparison with AB_TEST_MODE=source_only."
-        )
+        # ----------------------------------------------------
+        # Start MediaRecorder
+        # ----------------------------------------------------
 
         start_result = await page.evaluate(
             """
@@ -3432,7 +2378,7 @@ async def run_recording(playwright):
             [
                 VIDEO_BITRATE,
                 AUDIO_BITRATE,
-                2000,
+                1000,
             ],
         )
 
@@ -3443,6 +2389,10 @@ async def run_recording(playwright):
                 ensure_ascii=False,
             )
         )
+
+        # ----------------------------------------------------
+        # Wait for first chunk
+        # ----------------------------------------------------
 
         first_chunk = await page.evaluate(
             """
@@ -3461,6 +2411,10 @@ async def run_recording(playwright):
         log(
             "First recording chunk received"
         )
+
+        # ----------------------------------------------------
+        # Main recording loop
+        # ----------------------------------------------------
 
         last_status_log = (
             time.monotonic()
@@ -3493,28 +2447,6 @@ async def run_recording(playwright):
                 break
 
             try:
-                current_page_url = page.url
-                import re
-                page_stream_match = re.search(
-                    r"/livestream/([^/?#]+)",
-                    current_page_url,
-                    re.IGNORECASE,
-                )
-                page_stream_id = (
-                    page_stream_match.group(1)
-                    if page_stream_match
-                    else ""
-                )
-                if STREAM_ID and page_stream_id != STREAM_ID:
-                    log(
-                        "Target livestream changed/redirected; stopping safely: "
-                        f"expected={STREAM_ID} actual={page_stream_id or 'missing'}"
-                    )
-                    break
-            except Exception as e:
-                log(f"Target URL check error: {e}")
-
-            try:
                 status = await page.evaluate(
                     """
                     () =>
@@ -3543,13 +2475,6 @@ async def run_recording(playwright):
                     )
                     break
 
-                if status.get("streamEnded"):
-                    log(
-                        "LIVE STREAM ENDED: "
-                        f"{status.get('streamEndReason')}"
-                    )
-                    break
-
                 if (
                     idle_ms
                     > STREAM_IDLE_TIMEOUT * 1000
@@ -3570,30 +2495,6 @@ async def run_recording(playwright):
                         "videoSettings"
                     )
 
-                    rendered_fps = status.get(
-                        "renderedVideoFpsSinceStatus"
-                    ) or 0.0
-
-                    rendered_count = status.get(
-                        "renderedVideoFrameCount"
-                    ) or 0
-
-                    source_fps = status.get(
-                        "sourceVideoFpsSinceStatus"
-                    ) or 0.0
-
-                    source_count = status.get(
-                        "sourceVideoFrameCount"
-                    ) or 0
-
-                    rendered_overall = status.get(
-                        "renderedVideoFpsOverall"
-                    ) or 0.0
-
-                    source_overall = status.get(
-                        "sourceVideoFpsOverall"
-                    ) or 0.0
-
                     log(
                         "Recording status: "
                         f"chunks="
@@ -3612,13 +2513,7 @@ async def run_recording(playwright):
                         f"video="
                         f"{video_state} "
                         f"settings="
-                        f"{settings} "
-                        f"source_fps={source_fps:.2f} "
-                        f"source_frames={source_count} "
-                        f"rendered_fps={rendered_fps:.2f} "
-                        f"rendered_frames={rendered_count} "
-                        f"source_overall_fps={source_overall:.2f} "
-                        f"rendered_overall_fps={rendered_overall:.2f}"
+                        f"{settings}"
                     )
 
                     log(
@@ -3638,6 +2533,10 @@ async def run_recording(playwright):
             await asyncio.sleep(
                 STOP_CHECK_INTERVAL
             )
+
+        # ----------------------------------------------------
+        # Stop MediaRecorder
+        # ----------------------------------------------------
 
         log(
             "Stopping MediaRecorder..."
@@ -3660,6 +2559,10 @@ async def run_recording(playwright):
             log(
                 f"MediaRecorder stop error: {e}"
             )
+
+        # ----------------------------------------------------
+        # WAIT FOR ACTUAL FINAL DATAAVAILABLE
+        # ----------------------------------------------------
 
         log(
             "Waiting for MediaRecorder final "
@@ -3696,6 +2599,19 @@ async def run_recording(playwright):
                 "Timed out waiting for MediaRecorder "
                 "final dataavailable event"
             )
+
+        # ----------------------------------------------------
+        # DRAIN ALL QUEUED CHUNKS
+        # ----------------------------------------------------
+        #
+        # We now wait for:
+        #
+        #   queue = 0
+        #   uploading = false
+        #   uploaded == recorder chunk count
+        #
+        # We do NOT accept a partially assembled WebM.
+        # ----------------------------------------------------
 
         log(
             "Waiting for ALL recording chunks "
@@ -3845,6 +2761,10 @@ async def run_recording(playwright):
                 0.25
             )
 
+        # ----------------------------------------------------
+        # FINAL STATUS
+        # ----------------------------------------------------
+
         final_status = {}
 
         try:
@@ -3868,28 +2788,6 @@ async def run_recording(playwright):
                 "Unable to obtain final recorder status: "
                 + str(e)
             )
-
-        # Freeze the final browser diagnostics now. Do not call the status
-        # endpoint again before the A/B comparison, because the windowed
-        # counters are intentionally updated by status reads.
-        final_source_fps = float(
-            final_status.get("sourceVideoFpsOverall", 0) or 0
-        )
-        final_rendered_fps = float(
-            final_status.get("renderedVideoFpsOverall", 0) or 0
-        )
-
-        log(
-            "FINAL A/B B diagnostics snapshot: "
-            f"source_overall={final_source_fps:.3f} FPS "
-            f"rendered_overall={final_rendered_fps:.3f} FPS "
-            f"source_frames={final_status.get('sourceVideoFrameCount', 0)} "
-            f"rendered_frames={final_status.get('renderedVideoFrameCount', 0)} "
-            f"eventloop_avg_delay_ms={float(final_status.get('eventLoopAvgDelayMs', 0) or 0):.2f} "
-            f"eventloop_max_delay_ms={float(final_status.get('eventLoopMaxDelayMs', 0) or 0):.2f} "
-            f"longtasks={final_status.get('longTaskCount', 0)} "
-            f"playback_quality={json.dumps(final_status.get('playbackQuality'), ensure_ascii=False)}"
-        )
 
         recorder_chunk_count = int(
             final_status.get(
@@ -3935,6 +2833,10 @@ async def run_recording(playwright):
             handle_chunk,
         )
 
+        # ----------------------------------------------------
+        # Close WebM safely
+        # ----------------------------------------------------
+
         webm_file.flush()
 
         os.fsync(
@@ -3944,21 +2846,11 @@ async def run_recording(playwright):
         webm_file.close()
         webm_file = None
 
-        try:
-            await page.evaluate(
-                """
-                () => {
-                    if (window.__superliveEndState && window.__superliveEndState.monitorTimer) {
-                        clearInterval(window.__superliveEndState.monitorTimer);
-                        window.__superliveEndState.monitorTimer = null;
-                    }
-                }
-                """
-            )
-        except Exception:
-            pass
-
         await browser.close()
+
+        # ----------------------------------------------------
+        # Verify WebM BEFORE conversion
+        # ----------------------------------------------------
 
         log_section(
             "VERIFY ORIGINAL WEBM"
@@ -3972,35 +2864,43 @@ async def run_recording(playwright):
                 "Original WebM failed verification"
             )
 
+        # ----------------------------------------------------
+        # Convert WebM -> MP4
+        # ----------------------------------------------------
+
         convert_webm_to_mp4(
             webm_path,
             mp4_path,
-            source_overall_fps=final_source_fps,
-            rendered_overall_fps=final_rendered_fps,
         )
 
-        if KEEP_SOURCE_WEBM:
+        # ----------------------------------------------------
+        # Remove WebM only after successful conversion
+        # ----------------------------------------------------
+
+        try:
+            webm_path.unlink()
+
             log(
-                f"KEEP_SOURCE_WEBM is enabled; source WebM retained: "
+                f"Removed temporary WebM: "
                 f"{webm_path}"
             )
-        else:
-            try:
-                webm_path.unlink()
 
-                log(
-                    f"Removed temporary WebM: "
-                    f"{webm_path}"
-                )
+        except Exception as e:
+            log(
+                f"Could not remove WebM: {e}"
+            )
 
-            except Exception as e:
-                log(
-                    f"Could not remove WebM: {e}"
-                )
+        # ----------------------------------------------------
+        # Split if necessary
+        # ----------------------------------------------------
 
         parts = split_mp4_if_needed(
             mp4_path
         )
+
+        # ----------------------------------------------------
+        # Upload
+        # ----------------------------------------------------
 
         log_section(
             "UPLOADING VIDEO"
@@ -4041,6 +2941,10 @@ async def run_recording(playwright):
                 f"{index}/{total_parts}"
             )
 
+        # ----------------------------------------------------
+        # Cleanup split parts
+        # ----------------------------------------------------
+
         for part in parts:
             if part != mp4_path:
                 try:
@@ -4060,6 +2964,10 @@ async def run_recording(playwright):
             log(
                 f"Could not remove MP4: {e}"
             )
+
+        # ----------------------------------------------------
+        # State update
+        # ----------------------------------------------------
 
         if STREAM_ID:
             kv_update_state(
@@ -4099,26 +3007,15 @@ async def run_recording(playwright):
 
         raise
 
-    # ============================================================
 
-    # MAIN
-
-    # ============================================================
+# ============================================================
+# MAIN
+# ============================================================
 
 async def main():
     log_section(
-    "SUPERLIVE RECORDER / A-B DIAGNOSTIC "
-    f"(MODE={AB_TEST_MODE})"
-    )
-
-    if AB_TEST_MODE == "source_only":
-        log("A/B TEST A selected: NO MediaRecorder / NO encoding / NO upload")
-    else:
-        log("A/B TEST B selected: normal MediaRecorder recording pipeline")
-
-    log(
-        f"AB_TEST_MODE={AB_TEST_MODE}; "
-        f"DIAGNOSTIC_SECONDS={DIAGNOSTIC_SECONDS}"
+        "SUPERLIVE RECORDER "
+        "(ORDERED CHUNKS + STABLE VFR MP4)"
     )
 
     from playwright.async_api import (
@@ -4131,15 +3028,20 @@ async def main():
             timeout=GLOBAL_WATCHDOG_SECONDS,
         )
 
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
+
     except Exception as e:
         log(
             f"FATAL ERROR: {e}"
         )
+
         import traceback
+
         traceback.print_exc()
+
         try:
             if STREAM_ID:
                 kv_update_state(
@@ -4147,9 +3049,12 @@ if __name__ == "__main__":
                     "failed",
                     error=str(e),
                 )
+
                 kv_delete_state(
                     STREAM_ID
                 )
+
         except Exception:
             pass
+
         sys.exit(1)
