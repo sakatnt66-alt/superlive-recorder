@@ -1176,6 +1176,8 @@ def send_to_telegram_with_retry(
 def convert_webm_to_mp4(
     webm_path,
     mp4_path,
+    source_overall_fps=0.0,
+    rendered_overall_fps=0.0,
     ):
     """
     Convert a COMPLETE MediaRecorder WebM into H.264/AAC MP4.
@@ -1257,8 +1259,13 @@ def convert_webm_to_mp4(
     # Use the frozen values captured immediately after the final recorder
     # status. This prevents a later diagnostic status read from resetting
     # the window counters and producing misleading 0.000 FPS values.
-    source_overall_fps = final_source_fps
-    rendered_overall_fps = final_rendered_fps
+    # Diagnostics are intentionally disabled in the production recording
+    # path to avoid adding CPU/main-thread pressure to Chromium.  The caller
+    # passes the frozen values captured before browser shutdown; keep safe
+    # numeric defaults so conversion can never fail because diagnostics are
+    # unavailable.
+    source_overall_fps = float(source_overall_fps or 0.0)
+    rendered_overall_fps = float(rendered_overall_fps or 0.0)
 
     recorded_webm_fps = None
     if webm_timestamp_info:
@@ -3804,6 +3811,8 @@ async def run_recording(playwright):
         convert_webm_to_mp4(
             webm_path,
             mp4_path,
+            source_overall_fps=final_source_fps,
+            rendered_overall_fps=final_rendered_fps,
         )
 
         if KEEP_SOURCE_WEBM:
