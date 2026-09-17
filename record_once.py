@@ -255,6 +255,23 @@ KEEP_SOURCE_WEBM = os.environ.get(
     "1", "true", "yes", "on"
 )
 
+# Diagnostic A/B mode:
+#   record      = normal recording pipeline (MediaRecorder enabled)
+#   source_only = same browser/page/stream diagnostics, but NO MediaRecorder
+#
+# For the decisive A/B test, run this same file twice:
+#   1) AB_TEST_MODE=source_only
+#   2) AB_TEST_MODE=record
+#
+# In source_only mode the script does not create WebM/MP4 and does not upload.
+AB_TEST_MODE = os.environ.get(
+    "AB_TEST_MODE", "record"
+).strip().lower()
+
+DIAGNOSTIC_SECONDS = int(
+    os.environ.get("DIAGNOSTIC_SECONDS", "300")
+)
+
 USER_AGENT = (
 "Mozilla/5.0 (X11; Linux x86_64) "
 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1241,25 +1258,11 @@ def convert_webm_to_mp4(
     # timestamps, so it is the best available measurement of the
     # encoded/recorded frame cadence.
     # --------------------------------------------------------
-    try:
-        source_overall_fps = float(
-            final_status.get(
-                "sourceVideoFpsOverall",
-                0,
-            ) or 0
-        )
-    except Exception:
-        source_overall_fps = 0.0
-
-    try:
-        rendered_overall_fps = float(
-            final_status.get(
-                "renderedVideoFpsOverall",
-                0,
-            ) or 0
-        )
-    except Exception:
-        rendered_overall_fps = 0.0
+    # Use the frozen values captured immediately after the final recorder
+    # status. This prevents a later diagnostic status read from resetting
+    # the window counters and producing misleading 0.000 FPS values.
+    source_overall_fps = final_source_fps
+    rendered_overall_fps = final_rendered_fps
 
     recorded_webm_fps = None
     if webm_timestamp_info:
@@ -2109,6 +2112,19 @@ window.__superlivePrepare = () => {
     window.__preparedAudioTrack =
         selectedAudioTrack;
 
+    // Initialize recording-state fields even when MediaRecorder is not used.
+    window.__superliveRecorder = null;
+    window.__superliveChunkCount = 0;
+    window.__superliveUploadedChunkCount = 0;
+    window.__superliveLastChunkAt = performance.now();
+    window.__superliveLastChunkSize = 0;
+    window.__superliveUploadQueue = [];
+    window.__superliveIsUploading = false;
+    window.__superliveUploadError = null;
+    window.__superlivePendingDataTasks = 0;
+    window.__superliveRecorderStopFired = false;
+    window.__superliveFinalDataReady = false;
+
     window.__superliveVideoElement = null;
 
     for (const video of videos) {
@@ -2203,6 +2219,49 @@ window.__superlivePrepare = () => {
     window.__superliveRenderedVideoFrameCallbackActive = false;
     window.__superliveDiagnosticsStartedAt = performance.now();
 
+    // --------------------------------------------------------
+    // EVENT-LOOP / MAIN-THREAD DIAGNOSTICS
+    // --------------------------------------------------------
+    // This does not attempt to measure CPU percentage. Instead it measures
+    // how much the page's main-thread timer is delayed, which can expose
+    // browser-side contention without changing the media pipeline.
+    window.__superliveEventLoopSamples = 0;
+    window.__superliveEventLoopDelayTotalMs = 0;
+    window.__superliveEventLoopMaxDelayMs = 0;
+    window.__superliveLongTaskCount = 0;
+    window.__superliveLongTaskTotalMs = 0;
+    window.__superliveEventLoopTimer = null;
+
+    try {
+        const longTaskObserver =
+            new PerformanceObserver((list) => {
+                for (const entry of list.getEntries()) {
+                    window.__superliveLongTaskCount += 1;
+                    window.__superliveLongTaskTotalMs += entry.duration || 0;
+                }
+            });
+        longTaskObserver.observe({type: "longtask", buffered: true});
+        window.__superliveLongTaskObserver = longTaskObserver;
+    } catch (e) {
+        window.__superliveLongTaskObserver = null;
+    }
+
+    const eventLoopTickExpected = performance.now() + 1000;
+    let nextExpected = eventLoopTickExpected;
+    window.__superliveEventLoopTimer = setInterval(() => {
+        const now = performance.now();
+        const delay = Math.max(0, now - nextExpected);
+        window.__superliveEventLoopSamples += 1;
+        window.__superliveEventLoopDelayTotalMs += delay;
+        if (delay > window.__superliveEventLoopMaxDelayMs) {
+            window.__superliveEventLoopMaxDelayMs = delay;
+        }
+        nextExpected += 1000;
+        if (now - nextExpected > 5000) {
+            nextExpected = now + 1000;
+        }
+    }, 1000);
+
     const videoElement = window.__superliveVideoElement;
 
     if (videoElement &&
@@ -2243,6 +2302,85 @@ window.__superlivePrepare = () => {
             selectedAudioTrack
                 ? selectedAudioTrack.readyState
                 : null
+    };
+};
+
+window.__superliveGetDiagnostics = () => {
+    const now = performance.now();
+    const start = window.__superliveDiagnosticsStartedAt || now;
+    const elapsed = Math.max(0, (now - start) / 1000);
+
+    const sourceCount = window.__superliveSourceVideoFrameCount || 0;
+    const renderedCount = window.__superliveRenderedVideoFrameCount || 0;
+
+    const sourcePreviousTime =
+        window.__superliveSourceVideoFrameLastStatusAt || now;
+    const renderedPreviousTime =
+        window.__superliveRenderedVideoFrameLastStatusAt || now;
+
+    const sourcePreviousCount =
+        window.__superliveSourceVideoFrameCountAtLastStatus || 0;
+    const renderedPreviousCount =
+        window.__superliveRenderedVideoFrameCountAtLastStatus || 0;
+
+    const sourceElapsed = Math.max(0, (now - sourcePreviousTime) / 1000);
+    const renderedElapsed = Math.max(0, (now - renderedPreviousTime) / 1000);
+
+    const sourceFps = sourceElapsed > 0
+        ? (sourceCount - sourcePreviousCount) / sourceElapsed
+        : 0;
+    const renderedFps = renderedElapsed > 0
+        ? (renderedCount - renderedPreviousCount) / renderedElapsed
+        : 0;
+
+    window.__superliveSourceVideoFrameLastStatusAt = now;
+    window.__superliveSourceVideoFrameCountAtLastStatus = sourceCount;
+    window.__superliveRenderedVideoFrameLastStatusAt = now;
+    window.__superliveRenderedVideoFrameCountAtLastStatus = renderedCount;
+
+    let playbackQuality = null;
+    const video = window.__superliveVideoElement;
+    if (video) {
+        try {
+            const q = video.getVideoPlaybackQuality
+                ? video.getVideoPlaybackQuality()
+                : null;
+            playbackQuality = {
+                totalVideoFrames: q && q.totalVideoFrames != null
+                    ? q.totalVideoFrames : null,
+                droppedVideoFrames: q && q.droppedVideoFrames != null
+                    ? q.droppedVideoFrames : null,
+                corruptedVideoFrames: q && q.corruptedVideoFrames != null
+                    ? q.corruptedVideoFrames : null
+            };
+        } catch (e) {}
+    }
+
+    const eventSamples = window.__superliveEventLoopSamples || 0;
+    const eventTotal = window.__superliveEventLoopDelayTotalMs || 0;
+
+    return {
+        elapsedSeconds: elapsed,
+        sourceVideoFrameCount: sourceCount,
+        renderedVideoFrameCount: renderedCount,
+        sourceFpsSinceStatus: sourceFps,
+        renderedFpsSinceStatus: renderedFps,
+        sourceFpsOverall: elapsed > 0 ? sourceCount / elapsed : 0,
+        renderedFpsOverall: elapsed > 0 ? renderedCount / elapsed : 0,
+        sourceCallbackActive: !!window.__superliveSourceVideoFrameCallbackActive,
+        renderedCallbackActive: !!window.__superliveRenderedVideoFrameCallbackActive,
+        videoReadyState: video ? video.readyState : null,
+        videoPaused: video ? video.paused : null,
+        videoEnded: video ? video.ended : null,
+        videoWidth: video ? video.videoWidth : 0,
+        videoHeight: video ? video.videoHeight : 0,
+        videoCurrentTime: video ? video.currentTime : null,
+        playbackQuality: playbackQuality,
+        eventLoopSamples: eventSamples,
+        eventLoopAvgDelayMs: eventSamples > 0 ? eventTotal / eventSamples : 0,
+        eventLoopMaxDelayMs: window.__superliveEventLoopMaxDelayMs || 0,
+        longTaskCount: window.__superliveLongTaskCount || 0,
+        longTaskTotalMs: window.__superliveLongTaskTotalMs || 0
     };
 };
 
@@ -2763,6 +2901,60 @@ window.__superliveStartRec = (
                             : 0;
                     })(),
 
+                eventLoopSamples:
+                    window.__superliveEventLoopSamples || 0,
+
+                eventLoopAvgDelayMs:
+                    (() => {
+                        const samples =
+                            window.__superliveEventLoopSamples || 0;
+                        const total =
+                            window.__superliveEventLoopDelayTotalMs || 0;
+                        return samples > 0
+                            ? total / samples
+                            : 0;
+                    })(),
+
+                eventLoopMaxDelayMs:
+                    window.__superliveEventLoopMaxDelayMs || 0,
+
+                longTaskCount:
+                    window.__superliveLongTaskCount || 0,
+
+                longTaskTotalMs:
+                    window.__superliveLongTaskTotalMs || 0,
+
+                playbackQuality:
+                    (() => {
+                        const video =
+                            window.__superliveVideoElement;
+                        if (!video) {
+                            return null;
+                        }
+                        try {
+                            const q =
+                                video.getVideoPlaybackQuality
+                                ? video.getVideoPlaybackQuality()
+                                : null;
+                            return {
+                                totalVideoFrames:
+                                    q && q.totalVideoFrames != null
+                                    ? q.totalVideoFrames
+                                    : null,
+                                droppedVideoFrames:
+                                    q && q.droppedVideoFrames != null
+                                    ? q.droppedVideoFrames
+                                    : null,
+                                corruptedVideoFrames:
+                                    q && q.corruptedVideoFrames != null
+                                    ? q.corruptedVideoFrames
+                                    : null
+                            };
+                        } catch (e) {
+                            return null;
+                        }
+                    })(),
+
                 finalDataReady:
                     !!window
                         .__superliveFinalDataReady
@@ -2827,6 +3019,11 @@ def safe_eval(value):
     # ============================================================
 
 async def run_recording(playwright):
+    if AB_TEST_MODE not in ("record", "source_only"):
+        raise RuntimeError(
+            "AB_TEST_MODE must be either 'record' or 'source_only'"
+        )
+
     if not URL:
         raise RuntimeError(
     "RECORD_URL environment variable is missing"
@@ -3064,6 +3261,134 @@ async def run_recording(playwright):
                 prepared,
                 ensure_ascii=False,
             )
+        )
+
+        if AB_TEST_MODE == "source_only":
+            log_section(
+                "A/B TEST A - SOURCE + RENDER ONLY (NO MEDIARECORDER)"
+            )
+            log(
+                f"MediaRecorder is DISABLED. Diagnostics will run for "
+                f"{DIAGNOSTIC_SECONDS}s or until the video ends."
+            )
+            log(
+                "IMPORTANT: no WebM, MP4, FFmpeg, Telegram upload, "
+                "or recording chunk route is used in this mode."
+            )
+
+            diagnostic_started = time.monotonic()
+            last_diag_log = diagnostic_started
+
+            while True:
+                elapsed = time.monotonic() - diagnostic_started
+
+                if elapsed >= DIAGNOSTIC_SECONDS:
+                    log(
+                        "A/B source-only diagnostic duration reached."
+                    )
+                    break
+
+                try:
+                    diag = await page.evaluate(
+                        """
+                        () => window.__superliveGetDiagnostics()
+                        """
+                    )
+
+                    video_state = diag.get("videoReadyState")
+
+                    if video_state == 4 or diag.get("videoEnded"):
+                        log(
+                            "Video playback ended during source-only test."
+                        )
+                        break
+
+                    if (
+                        time.monotonic() - last_diag_log >= 10
+                    ):
+                        quality = diag.get("playbackQuality") or {}
+                        log(
+                            "A/B SOURCE-ONLY status: "
+                            f"elapsed={diag.get('elapsedSeconds', 0):.1f}s "
+                            f"source_fps={diag.get('sourceFpsSinceStatus', 0):.2f} "
+                            f"rendered_fps={diag.get('renderedFpsSinceStatus', 0):.2f} "
+                            f"source_overall={diag.get('sourceFpsOverall', 0):.2f} "
+                            f"rendered_overall={diag.get('renderedFpsOverall', 0):.2f} "
+                            f"source_frames={diag.get('sourceVideoFrameCount', 0)} "
+                            f"rendered_frames={diag.get('renderedVideoFrameCount', 0)} "
+                            f"dropped={quality.get('droppedVideoFrames')} "
+                            f"eventloop_avg_delay_ms={diag.get('eventLoopAvgDelayMs', 0):.2f} "
+                            f"eventloop_max_delay_ms={diag.get('eventLoopMaxDelayMs', 0):.2f} "
+                            f"longtasks={diag.get('longTaskCount', 0)}"
+                        )
+                        last_diag_log = time.monotonic()
+
+                except Exception as e:
+                    log(
+                        f"A/B source-only diagnostic error: {e}"
+                    )
+
+                await asyncio.sleep(1)
+
+            final_diag = await page.evaluate(
+                """
+                () => window.__superliveGetDiagnostics()
+                """
+            )
+
+            log_section(
+                "A/B TEST A - FINAL SOURCE/RENDER DIAGNOSTICS"
+            )
+            log(
+                "FINAL A/B A: "
+                + json.dumps(
+                    final_diag,
+                    ensure_ascii=False,
+                )
+            )
+            log(
+                "A/B conclusion helper: compare this run against the "
+                "AB_TEST_MODE=record run. If source/render remain near "
+                "30 FPS here but recording mode shows a much lower WebM "
+                "cadence, MediaRecorder/encoding is implicated. If the "
+                "same source/render FPS dips occur here, the issue exists "
+                "before MediaRecorder."
+            )
+
+            try:
+                await page.unroute(
+                    "**/__slr_chunk",
+                    handle_chunk,
+                )
+            except Exception:
+                pass
+
+            try:
+                if webm_file is not None:
+                    webm_file.close()
+                    webm_file = None
+            except Exception:
+                pass
+
+            try:
+                if webm_path.exists():
+                    webm_path.unlink()
+            except Exception:
+                pass
+
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+            return True
+
+        log_section(
+            "A/B TEST B - SOURCE + RENDER + MEDIARECORDER"
+        )
+        log(
+            "MediaRecorder is ENABLED. This is the recording-side run "
+            "for comparison with AB_TEST_MODE=source_only."
         )
 
         start_result = await page.evaluate(
@@ -3486,6 +3811,28 @@ async def run_recording(playwright):
                 + str(e)
             )
 
+        # Freeze the final browser diagnostics now. Do not call the status
+        # endpoint again before the A/B comparison, because the windowed
+        # counters are intentionally updated by status reads.
+        final_source_fps = float(
+            final_status.get("sourceVideoFpsOverall", 0) or 0
+        )
+        final_rendered_fps = float(
+            final_status.get("renderedVideoFpsOverall", 0) or 0
+        )
+
+        log(
+            "FINAL A/B B diagnostics snapshot: "
+            f"source_overall={final_source_fps:.3f} FPS "
+            f"rendered_overall={final_rendered_fps:.3f} FPS "
+            f"source_frames={final_status.get('sourceVideoFrameCount', 0)} "
+            f"rendered_frames={final_status.get('renderedVideoFrameCount', 0)} "
+            f"eventloop_avg_delay_ms={float(final_status.get('eventLoopAvgDelayMs', 0) or 0):.2f} "
+            f"eventloop_max_delay_ms={float(final_status.get('eventLoopMaxDelayMs', 0) or 0):.2f} "
+            f"longtasks={final_status.get('longTaskCount', 0)} "
+            f"playback_quality={json.dumps(final_status.get('playbackQuality'), ensure_ascii=False)}"
+        )
+
         recorder_chunk_count = int(
             final_status.get(
                 "chunkCount",
@@ -3686,8 +4033,18 @@ async def run_recording(playwright):
 
 async def main():
     log_section(
-    "SUPERLIVE RECORDER "
-    "(ORDERED CHUNKS + VP8 CAPTURE + STABLE 30FPS CFR MP4)"
+    "SUPERLIVE RECORDER / A-B DIAGNOSTIC "
+    f"(MODE={AB_TEST_MODE})"
+    )
+
+    if AB_TEST_MODE == "source_only":
+        log("A/B TEST A selected: NO MediaRecorder / NO encoding / NO upload")
+    else:
+        log("A/B TEST B selected: normal MediaRecorder recording pipeline")
+
+    log(
+        f"AB_TEST_MODE={AB_TEST_MODE}; "
+        f"DIAGNOSTIC_SECONDS={DIAGNOSTIC_SECONDS}"
     )
 
     from playwright.async_api import (
