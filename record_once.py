@@ -227,7 +227,7 @@ os.environ.get("TEMP_DIR", "tmp_recordings")
 RECORDING_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-VIDEO_BITRATE = 8_000_000
+VIDEO_BITRATE = 5_000_000
 AUDIO_BITRATE = 192_000
 
 VIDEO_WAIT_SECONDS = 60
@@ -248,6 +248,12 @@ MAX_RECORDING_SECONDS + 1800
 )
 
 FINAL_QUEUE_DRAIN_TIMEOUT_SECONDS = 15 * 60
+
+KEEP_SOURCE_WEBM = os.environ.get(
+    "KEEP_SOURCE_WEBM", "1"
+).lower() in (
+    "1", "true", "yes", "on"
+)
 
 USER_AGENT = (
 "Mozilla/5.0 (X11; Linux x86_64) "
@@ -642,6 +648,20 @@ def analyze_video_timestamps(
         largest_pts_gap = 0.0
         largest_dts_gap = 0.0
 
+        largest_pts_gap_index = None
+        largest_pts_gap_previous = None
+        largest_pts_gap_current = None
+
+        largest_dts_gap_index = None
+        largest_dts_gap_previous = None
+        largest_dts_gap_current = None
+
+        pts_gap_count_100ms = 0
+        pts_gap_count_250ms = 0
+        pts_gap_count_500ms = 0
+        pts_gap_count_1s = 0
+        pts_intervals = []
+
         first_pts = None
         last_pts = None
 
@@ -715,8 +735,22 @@ def analyze_video_timestamps(
                                 )
                             )
 
+                    if delta > 0:
+                        pts_intervals.append(delta)
+                    if delta >= 0.100:
+                        pts_gap_count_100ms += 1
+                    if delta >= 0.250:
+                        pts_gap_count_250ms += 1
+                    if delta >= 0.500:
+                        pts_gap_count_500ms += 1
+                    if delta >= 1.000:
+                        pts_gap_count_1s += 1
+
                     if delta > largest_pts_gap:
                         largest_pts_gap = delta
+                        largest_pts_gap_index = index
+                        largest_pts_gap_previous = previous_pts
+                        largest_pts_gap_current = pts_time
 
                 previous_pts = pts_time
                 last_pts = pts_time
@@ -765,6 +799,9 @@ def analyze_video_timestamps(
 
                     if delta > largest_dts_gap:
                         largest_dts_gap = delta
+                        largest_dts_gap_index = index
+                        largest_dts_gap_previous = previous_dts
+                        largest_dts_gap_current = dts_time
 
                 previous_dts = dts_time
                 last_dts = dts_time
@@ -785,6 +822,37 @@ def analyze_video_timestamps(
             f"duplicate_dts={duplicate_dts} "
             f"largest_dts_gap={largest_dts_gap:.6f}s"
         )
+
+        if pts_intervals:
+            avg_interval = sum(pts_intervals) / len(pts_intervals)
+            estimated_fps = (1.0 / avg_interval) if avg_interval > 0 else 0.0
+            log(
+                f"{label} cadence diagnostics: "
+                f"avg_pts_interval={avg_interval:.6f}s "
+                f"estimated_avg_fps={estimated_fps:.3f} "
+                f"gaps>=100ms={pts_gap_count_100ms} "
+                f"gaps>=250ms={pts_gap_count_250ms} "
+                f"gaps>=500ms={pts_gap_count_500ms} "
+                f"gaps>=1s={pts_gap_count_1s}"
+            )
+
+        if largest_pts_gap_index is not None:
+            log(
+                f"{label} largest PTS gap location: "
+                f"packet={largest_pts_gap_index} "
+                f"previous_pts={largest_pts_gap_previous:.6f} "
+                f"current_pts={largest_pts_gap_current:.6f} "
+                f"gap={largest_pts_gap:.6f}s"
+            )
+
+        if largest_dts_gap_index is not None:
+            log(
+                f"{label} largest DTS gap location: "
+                f"packet={largest_dts_gap_index} "
+                f"previous_dts={largest_dts_gap_previous:.6f} "
+                f"current_dts={largest_dts_gap_current:.6f} "
+                f"gap={largest_dts_gap:.6f}s"
+            )
 
         if pts_anomalies:
             log(
@@ -835,6 +903,22 @@ def analyze_video_timestamps(
             "backward_pts": backward_pts,
             "duplicate_pts": duplicate_pts,
             "largest_pts_gap": largest_pts_gap,
+            "largest_pts_gap_index": largest_pts_gap_index,
+            "largest_pts_gap_previous": largest_pts_gap_previous,
+            "largest_pts_gap_current": largest_pts_gap_current,
+            "pts_gap_count_100ms": pts_gap_count_100ms,
+            "pts_gap_count_250ms": pts_gap_count_250ms,
+            "pts_gap_count_500ms": pts_gap_count_500ms,
+            "pts_gap_count_1s": pts_gap_count_1s,
+            "avg_pts_interval": (
+                sum(pts_intervals) / len(pts_intervals)
+                if pts_intervals else None
+            ),
+            "estimated_avg_fps": (
+                1.0 / (sum(pts_intervals) / len(pts_intervals))
+                if pts_intervals and sum(pts_intervals) > 0
+                else None
+            ),
             "first_dts": first_dts,
             "last_dts": last_dts,
             "backward_dts": backward_dts,
@@ -1947,19 +2031,19 @@ window.__superliveStartRec = (
 
     if (
         MediaRecorder.isTypeSupported(
-            "video/webm;codecs=vp9,opus"
-        )
-    ) {
-        mimeType =
-            "video/webm;codecs=vp9,opus";
-
-    } else if (
-        MediaRecorder.isTypeSupported(
             "video/webm;codecs=vp8,opus"
         )
     ) {
         mimeType =
             "video/webm;codecs=vp8,opus";
+
+    } else if (
+        MediaRecorder.isTypeSupported(
+            "video/webm;codecs=vp9,opus"
+        )
+    ) {
+        mimeType =
+            "video/webm;codecs=vp9,opus";
 
     } else if (
         MediaRecorder.isTypeSupported(
@@ -3091,18 +3175,24 @@ async def run_recording(playwright):
             mp4_path,
         )
 
-        try:
-            webm_path.unlink()
-
+        if KEEP_SOURCE_WEBM:
             log(
-                f"Removed temporary WebM: "
+                f"KEEP_SOURCE_WEBM is enabled; source WebM retained: "
                 f"{webm_path}"
             )
+        else:
+            try:
+                webm_path.unlink()
 
-        except Exception as e:
-            log(
-                f"Could not remove WebM: {e}"
-            )
+                log(
+                    f"Removed temporary WebM: "
+                    f"{webm_path}"
+                )
+
+            except Exception as e:
+                log(
+                    f"Could not remove WebM: {e}"
+                )
 
         parts = split_mp4_if_needed(
             mp4_path
@@ -3214,7 +3304,7 @@ async def run_recording(playwright):
 async def main():
     log_section(
     "SUPERLIVE RECORDER "
-    "(ORDERED CHUNKS + STABLE VFR MP4)"
+    "(ORDERED CHUNKS + STABLE 30FPS CFR MP4)"
     )
 
     from playwright.async_api import (
