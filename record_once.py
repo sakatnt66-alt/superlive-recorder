@@ -2077,11 +2077,17 @@ WEBRTC_HOOK = r"""
                 const stats = await pc.getStats();
 
                 stats.forEach(report => {
-                    if (report.type !== "inbound-rtp" || report.kind !== "video") {
+                    if (report.type !== "inbound-rtp") {
+                        return;
+                    }
+
+                    const kind = report.kind || report.mediaType || null;
+                    if (kind !== "video" && kind !== "audio") {
                         return;
                     }
 
                     results.push({
+                        kind,
                         trackIdentifier: report.trackIdentifier || null,
                         ssrc: report.ssrc || null,
                         framesReceived: report.framesReceived ?? null,
@@ -2092,6 +2098,8 @@ WEBRTC_HOOK = r"""
                         packetsLost: report.packetsLost ?? null,
                         jitter: report.jitter ?? null,
                         bytesReceived: report.bytesReceived ?? null,
+                        totalSamplesReceived: report.totalSamplesReceived ?? null,
+                        totalSamplesDuration: report.totalSamplesDuration ?? null,
                     });
                 });
             } catch (e) {
@@ -2102,11 +2110,23 @@ WEBRTC_HOOK = r"""
 
         const selectedTrack =
             window.__superliveSelectedVideoTrack || null;
+        const selectedAudioTrack =
+            window.__preparedAudioTrack
+            || null;
 
         const matching = selectedTrack
             ? results.filter(
                 item =>
-                    item.trackIdentifier === selectedTrack.id
+                    item.kind === "video"
+                    && item.trackIdentifier === selectedTrack.id
+            )
+            : [];
+
+        const matchingAudio = selectedAudioTrack
+            ? results.filter(
+                item =>
+                    item.kind === "audio"
+                    && item.trackIdentifier === selectedAudioTrack.id
             )
             : [];
 
@@ -2114,8 +2134,17 @@ WEBRTC_HOOK = r"""
             selectedTrackId: selectedTrack
                 ? selectedTrack.id
                 : null,
+            selectedAudioTrackId: selectedAudioTrack
+                ? selectedAudioTrack.id
+                : null,
             matching,
-            inboundVideo: results,
+            matchingAudio,
+            inboundVideo: results.filter(
+                item => item.kind === "video"
+            ),
+            inboundAudio: results.filter(
+                item => item.kind === "audio"
+            ),
         };
     };
 
@@ -2218,31 +2247,50 @@ WEBRTC_HOOK = r"""
             throw new Error("No live video track found");
         }
 
-        let selectedAudioTrack = null;
+        /*
+         * Prefer an audio track that is both live and currently
+         * unmuted.  A live-but-muted track can exist in a MediaStream
+         * while another audio receiver track is the one actually
+         * carrying the broadcaster's audio.  Previously we stopped at
+         * the first live track, which caused a false fatal error here.
+         *
+         * Keep the selected/linked tracks first so we never change the
+         * stream association unless the first candidate is only muted.
+         */
+        const audioCandidates = [];
+
+        const addAudioCandidate = (track) => {
+            if (!track || audioCandidates.includes(track)) {
+                return;
+            }
+            if (track.readyState === "live") {
+                audioCandidates.push(track);
+            }
+        };
 
         if (selectedStream) {
-            selectedAudioTrack = selectedStream
-                .getAudioTracks()
-                .find(t => t.readyState === "live");
-        }
-
-        if (!selectedAudioTrack) {
-            const linkedStream = window.__superliveTrackLinks.get(
-                selectedVideoTrack
-            );
-
-            if (linkedStream) {
-                selectedAudioTrack = linkedStream
-                    .getAudioTracks()
-                    .find(t => t.readyState === "live");
+            for (const track of selectedStream.getAudioTracks()) {
+                addAudioCandidate(track);
             }
         }
 
-        if (!selectedAudioTrack) {
-            selectedAudioTrack = window.__superliveAudioTracks.find(
-                t => t.readyState === "live"
-            );
+        const linkedStream =
+            window.__superliveTrackLinks.get(selectedVideoTrack);
+
+        if (linkedStream) {
+            for (const track of linkedStream.getAudioTracks()) {
+                addAudioCandidate(track);
+            }
         }
+
+        for (const track of window.__superliveAudioTracks) {
+            addAudioCandidate(track);
+        }
+
+        let selectedAudioTrack =
+            audioCandidates.find(t => !t.muted)
+            || audioCandidates[0]
+            || null;
 
         let captureStream = null;
         let captureVideoTrack = null;
@@ -2660,6 +2708,12 @@ WEBRTC_HOOK = r"""
             recordedVideoTrackId: captureVideoTrack.id,
             sourceVideoTrackMuted: selectedVideoTrack.muted,
             recordedVideoTrackMuted: captureVideoTrack.muted,
+            sourceAudioTrackId: selectedAudioTrack
+                ? selectedAudioTrack.id
+                : null,
+            sourceAudioTrackMuted: selectedAudioTrack
+                ? selectedAudioTrack.muted
+                : null,
         };
     };
 
@@ -3230,12 +3284,21 @@ WEBRTC_HOOK = r"""
         if (
             !sourceAudioTrack
             || sourceAudioTrack.readyState !== "live"
-            || sourceAudioTrack.muted
         ) {
             throw new Error(
-                "Selected audio track is not live/unmuted"
+                "Selected audio track is not live"
             );
         }
+
+        /*
+         * MediaStreamTrack.muted means the source is temporarily not
+         * providing media; it is NOT equivalent to readyState=ended.
+         * A receiver can begin muted and become unmuted shortly after
+         * the recorder starts.  Starting the recorder in that state is
+         * therefore valid.  The Python side still requires actual
+         * audio chunks before the file can be uploaded.
+         */
+        const sourceAudioTrackMuted = !!sourceAudioTrack.muted;
 
         let audioTrack = sourceAudioTrack;
 
@@ -3439,7 +3502,10 @@ WEBRTC_HOOK = r"""
             mimeType,
             state: recorder.state,
             trackId: audioTrack.id,
-            sourceTrackId: sourceAudioTrack.id
+            sourceTrackId: sourceAudioTrack.id,
+            sourceTrackMuted: sourceAudioTrackMuted,
+            recordedTrackMuted: !!audioTrack.muted,
+            readyState: audioTrack.readyState
         };
     };
 
@@ -4233,7 +4299,7 @@ async def run_recording(playwright):
                 audio_first_chunk = await page.evaluate(
                     """
                     () =>
-                        window.__superliveWaitAudioChunk(5000)
+                        window.__superliveWaitAudioChunk(15000)
                     """
                 )
 
@@ -4246,6 +4312,33 @@ async def run_recording(playwright):
                 )
 
                 if not audio_first_chunk.get("ok"):
+                    audio_diag = None
+                    try:
+                        audio_diag = await page.evaluate(
+                            """
+                            async () => ({
+                                audioStatus: window.__superliveGetAudioStatus
+                                    ? window.__superliveGetAudioStatus()
+                                    : null,
+                                webrtcStats: window.__superliveGetWebRTCStats
+                                    ? await window.__superliveGetWebRTCStats()
+                                    : null
+                            })
+                            """
+                        )
+                    except Exception as diag_error:
+                        audio_diag = {
+                            "diagnosticError": str(diag_error)
+                        }
+
+                    log(
+                        "Independent audio diagnostics after first-chunk failure: "
+                        + json.dumps(
+                            audio_diag,
+                            ensure_ascii=False,
+                        )
+                    )
+
                     raise RuntimeError(
                         "Independent audio recorder failed to produce data"
                     )
@@ -4255,7 +4348,9 @@ async def run_recording(playwright):
                     await page.evaluate(
                         """
                         () =>
-                            window.__superliveStopRec()
+                            window.__superliveStopAudioRec
+                                ? window.__superliveStopAudioRec()
+                                : false
                         """
                     )
                 except Exception:
