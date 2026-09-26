@@ -2604,14 +2604,13 @@ async def run_recording(playwright):
             )
 
         # ----------------------------------------------------
-        # Temporary WebRTC diagnostics
+        # Temporary WebRTC diagnostics (compact, one item/line)
         # ----------------------------------------------------
 
         try:
             diagnostics = await page.evaluate(
                 """
-                () =>
-                    window.__superliveDiagnostics()
+                () => window.__superliveDiagnostics()
                 """
             )
 
@@ -2620,8 +2619,62 @@ async def run_recording(playwright):
             )
 
             log(
-                json.dumps(
-                    diagnostics,
+                f"URL={diagnostics.get('url', '')}"
+            )
+            log(
+                f"STREAM_ID={diagnostics.get('streamId', '')}"
+            )
+
+            for video in diagnostics.get(
+                "videos", []
+            ):
+                log(
+                    "VIDEO "
+                    + json.dumps(
+                        video,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+
+            for pc in diagnostics.get(
+                "peerConnections", []
+            ):
+                log(
+                    "PEER_CONNECTION "
+                    + json.dumps(
+                        pc,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+
+            log(
+                "REMEMBERED_VIDEO_TRACKS "
+                + json.dumps(
+                    diagnostics.get(
+                        "rememberedVideoTracks", []
+                    ),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+            log(
+                "REMEMBERED_AUDIO_TRACKS "
+                + json.dumps(
+                    diagnostics.get(
+                        "rememberedAudioTracks", []
+                    ),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+            log(
+                "REMEMBERED_STREAMS "
+                + json.dumps(
+                    diagnostics.get(
+                        "rememberedStreams", []
+                    ),
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
