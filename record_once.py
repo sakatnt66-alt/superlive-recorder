@@ -1661,7 +1661,7 @@ WEBRTC_HOOK = r"""
         );
 
         let best = null;
-        let bestArea = 0;
+        let bestVisibleArea = 0;
 
         for (const video of videos) {
             try {
@@ -1705,21 +1705,42 @@ WEBRTC_HOOK = r"""
                 const rect =
                     video.getBoundingClientRect();
 
-                const area =
-                    Math.max(0, rect.width) *
-                    Math.max(0, rect.height);
+                const viewportWidth =
+                    window.innerWidth ||
+                    document.documentElement.clientWidth;
 
-                if (area <= 0) {
+                const viewportHeight =
+                    window.innerHeight ||
+                    document.documentElement.clientHeight;
+
+                const visibleLeft =
+                    Math.max(0, rect.left);
+                const visibleTop =
+                    Math.max(0, rect.top);
+                const visibleRight =
+                    Math.min(viewportWidth, rect.right);
+                const visibleBottom =
+                    Math.min(viewportHeight, rect.bottom);
+
+                const visibleWidth =
+                    Math.max(0, visibleRight - visibleLeft);
+                const visibleHeight =
+                    Math.max(0, visibleBottom - visibleTop);
+
+                const visibleArea =
+                    visibleWidth * visibleHeight;
+
+                if (visibleArea <= 0) {
                     continue;
                 }
 
-                if (area > bestArea) {
+                if (visibleArea > bestVisibleArea) {
                     best = {
                         video,
                         stream,
                         videoTrack: liveVideoTrack,
                     };
-                    bestArea = area;
+                    bestVisibleArea = visibleArea;
                 }
             } catch (e) {
                 console.warn(
@@ -2604,13 +2625,14 @@ async def run_recording(playwright):
             )
 
         # ----------------------------------------------------
-        # Temporary WebRTC diagnostics (compact, one item/line)
+        # Temporary WebRTC diagnostics
         # ----------------------------------------------------
 
         try:
             diagnostics = await page.evaluate(
                 """
-                () => window.__superliveDiagnostics()
+                () =>
+                    window.__superliveDiagnostics()
                 """
             )
 
@@ -2619,62 +2641,8 @@ async def run_recording(playwright):
             )
 
             log(
-                f"URL={diagnostics.get('url', '')}"
-            )
-            log(
-                f"STREAM_ID={diagnostics.get('streamId', '')}"
-            )
-
-            for video in diagnostics.get(
-                "videos", []
-            ):
-                log(
-                    "VIDEO "
-                    + json.dumps(
-                        video,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                )
-
-            for pc in diagnostics.get(
-                "peerConnections", []
-            ):
-                log(
-                    "PEER_CONNECTION "
-                    + json.dumps(
-                        pc,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                )
-
-            log(
-                "REMEMBERED_VIDEO_TRACKS "
-                + json.dumps(
-                    diagnostics.get(
-                        "rememberedVideoTracks", []
-                    ),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-            )
-            log(
-                "REMEMBERED_AUDIO_TRACKS "
-                + json.dumps(
-                    diagnostics.get(
-                        "rememberedAudioTracks", []
-                    ),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-            )
-            log(
-                "REMEMBERED_STREAMS "
-                + json.dumps(
-                    diagnostics.get(
-                        "rememberedStreams", []
-                    ),
+                json.dumps(
+                    diagnostics,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
