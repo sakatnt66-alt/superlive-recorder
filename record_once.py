@@ -1703,7 +1703,28 @@ WEBRTC_HOOK = r"""
             }
         }
 
-        if (!captureVideoTrack) {
+        /*
+         * captureStream() can return a LIVE track that is MUTED
+         * when the rendered <video> is not actually producing
+         * frames.  MediaRecorder can then stay in "recording"
+         * forever without producing a single dataavailable event.
+         *
+         * In that case, use the original WebRTC track instead.
+         * This keeps captureStream() as the preferred path when
+         * it is genuinely carrying video, while avoiding the
+         * zero-frame failure mode.
+         */
+        if (
+            !captureVideoTrack
+            || captureVideoTrack.readyState !== "live"
+            || captureVideoTrack.muted
+        ) {
+            if (captureVideoTrack && captureVideoTrack.muted) {
+                console.warn(
+                    "superlive captureStream track is muted; falling back to source WebRTC track"
+                );
+            }
+
             captureVideoTrack = selectedVideoTrack;
         }
 
@@ -1727,6 +1748,8 @@ WEBRTC_HOOK = r"""
                 : null,
             sourceVideoTrackId: selectedVideoTrack.id,
             recordedVideoTrackId: captureVideoTrack.id,
+            sourceVideoTrackMuted: selectedVideoTrack.muted,
+            recordedVideoTrackMuted: captureVideoTrack.muted,
         };
     };
 
