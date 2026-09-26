@@ -1437,15 +1437,15 @@ WEBRTC_HOOK = r"""
     window.RTCPeerConnection =
         WrappedRTCPeerConnection;
 
-    window.__superlivePrepare = () => {
+    window.__superliveSelectTargetVideo = () => {
         const videos = Array.from(
             document.querySelectorAll(
                 "video"
             )
         );
 
-        let selectedVideoTrack = null;
-        let selectedStream = null;
+        let best = null;
+        let bestArea = 0;
 
         for (const video of videos) {
             try {
@@ -1466,14 +1466,44 @@ WEBRTC_HOOK = r"""
                             === "live"
                     );
 
-                if (liveVideoTrack) {
-                    selectedVideoTrack =
-                        liveVideoTrack;
+                if (
+                    !liveVideoTrack ||
+                    video.videoWidth <= 0 ||
+                    video.videoHeight <= 0 ||
+                    video.readyState < 2
+                ) {
+                    continue;
+                }
 
-                    selectedStream =
-                        stream;
+                const style =
+                    window.getComputedStyle(video);
 
-                    break;
+                if (
+                    style.display === "none" ||
+                    style.visibility === "hidden" ||
+                    Number(style.opacity) === 0
+                ) {
+                    continue;
+                }
+
+                const rect =
+                    video.getBoundingClientRect();
+
+                const area =
+                    Math.max(0, rect.width) *
+                    Math.max(0, rect.height);
+
+                if (area <= 0) {
+                    continue;
+                }
+
+                if (area > bestArea) {
+                    best = {
+                        video,
+                        stream,
+                        videoTrack: liveVideoTrack,
+                    };
+                    bestArea = area;
                 }
             } catch (e) {
                 console.warn(
@@ -1483,20 +1513,82 @@ WEBRTC_HOOK = r"""
             }
         }
 
-        if (!selectedVideoTrack) {
-            selectedVideoTrack =
-                window.__superliveVideoTracks.find(
-                    t =>
-                        t.readyState
-                        === "live"
-                );
+        if (!best) {
+            window.__superliveSelectedVideo = null;
+            window.__superliveSelectedStream = null;
+            window.__superliveSelectedVideoTrack = null;
+            return null;
         }
 
-        if (!selectedVideoTrack) {
+        window.__superliveSelectedVideo = best.video;
+        window.__superliveSelectedStream = best.stream;
+        window.__superliveSelectedVideoTrack =
+            best.videoTrack;
+
+        return {
+            width: best.video.videoWidth,
+            height: best.video.videoHeight,
+            audio: best.stream
+                .getAudioTracks()
+                .some(
+                    t => t.readyState === "live"
+                )
+        };
+    };
+
+    window.__superlivePrepare = () => {
+        let selected = null;
+
+        const storedVideo =
+            window.__superliveSelectedVideo;
+
+        const storedStream =
+            window.__superliveSelectedStream;
+
+        const storedVideoTrack =
+            window.__superliveSelectedVideoTrack;
+
+        if (
+            storedVideo &&
+            storedStream &&
+            storedVideoTrack &&
+            storedVideo.srcObject === storedStream &&
+            storedVideoTrack.readyState === "live" &&
+            storedVideo.videoWidth > 0 &&
+            storedVideo.videoHeight > 0
+        ) {
+            selected = {
+                video: storedVideo,
+                stream: storedStream,
+                videoTrack: storedVideoTrack,
+            };
+        } else {
+            const target =
+                window.__superliveSelectTargetVideo();
+
+            if (target) {
+                selected = {
+                    video:
+                        window.__superliveSelectedVideo,
+                    stream:
+                        window.__superliveSelectedStream,
+                    videoTrack:
+                        window.__superliveSelectedVideoTrack,
+                };
+            }
+        }
+
+        if (!selected) {
             throw new Error(
-                "No live video track found"
+                "No visible live video track found"
             );
         }
+
+        const selectedVideoTrack =
+            selected.videoTrack;
+
+        const selectedStream =
+            selected.stream;
 
         let selectedAudioTrack = null;
 
@@ -1529,14 +1621,6 @@ WEBRTC_HOOK = r"""
             }
         }
 
-        if (!selectedAudioTrack) {
-            selectedAudioTrack =
-                window.__superliveAudioTracks.find(
-                    t =>
-                        t.readyState
-                        === "live"
-                );
-        }
 
         const tracks = [
             selectedVideoTrack
@@ -2259,60 +2343,20 @@ async def run_recording(playwright):
                 result = await page.evaluate(
                     """
                     () => {
-                        const videos =
-                            Array.from(
-                                document.querySelectorAll("video")
-                            );
+                        const target =
+                            window.__superliveSelectTargetVideo();
 
-                        for (const video of videos) {
-                            try {
-                                const stream =
-                                    video.srcObject;
-
-                                if (!stream) {
-                                    continue;
-                                }
-
-                                const videoTracks =
-                                    stream.getVideoTracks();
-
-                                const audioTracks =
-                                    stream.getAudioTracks();
-
-                                const liveVideo =
-                                    videoTracks.some(
-                                        t =>
-                                            t.readyState
-                                            === "live"
-                                    );
-
-                                const liveAudio =
-                                    audioTracks.some(
-                                        t =>
-                                            t.readyState
-                                            === "live"
-                                    );
-
-                                if (
-                                    video.videoWidth > 0 &&
-                                    video.videoHeight > 0 &&
-                                    liveVideo
-                                ) {
-                                    return {
-                                        ready: true,
-                                        width:
-                                            video.videoWidth,
-                                        height:
-                                            video.videoHeight,
-                                        audio:
-                                            liveAudio
-                                    };
-                                }
-                            } catch (e) {}
+                        if (!target) {
+                            return {
+                                ready: false
+                            };
                         }
 
                         return {
-                            ready: false
+                            ready: true,
+                            width: target.width,
+                            height: target.height,
+                            audio: target.audio
                         };
                     }
                     """
