@@ -451,10 +451,11 @@ def get_video_info(path):
         "-hide_banner",
         "-v",
         "error",
+        "-count_packets",
         "-show_entries",
         "stream=index,codec_type,codec_name,width,height,"
         "r_frame_rate,avg_frame_rate,time_base,start_time,duration,"
-        "nb_frames",
+        "nb_frames,nb_read_packets",
         "-show_entries",
         "format=format_name,duration,size",
         "-of",
@@ -500,6 +501,23 @@ def get_duration(info):
         return 0.0
 
 
+def get_stream_packet_count(stream):
+    """Return ffprobe's actual packet count for one stream."""
+    if not stream:
+        return 0
+
+    for key in ("nb_read_packets", "nb_frames"):
+        try:
+            value = int(stream.get(key) or 0)
+        except Exception:
+            value = 0
+
+        if value > 0:
+            return value
+
+    return 0
+
+
 def get_video_packet_count(info):
     if not info:
         return 0
@@ -508,15 +526,31 @@ def get_video_packet_count(info):
         if stream.get("codec_type") != "video":
             continue
 
-        try:
-            return int(
-                stream.get("nb_frames")
-                or 0
-            )
-        except Exception:
-            return 0
+        return get_stream_packet_count(stream)
 
     return 0
+
+
+def get_audio_packet_count(info):
+    if not info:
+        return 0
+
+    total = 0
+    found_audio = False
+
+    for stream in info.get("streams", []):
+        if stream.get("codec_type") != "audio":
+            continue
+
+        found_audio = True
+        count = get_stream_packet_count(stream)
+
+        if count <= 0:
+            return 0
+
+        total += count
+
+    return total if found_audio else 0
 
 
 def log_video_info(label, path):
@@ -1106,11 +1140,15 @@ def convert_webm_to_mp4(
 
 def split_webm_if_needed(webm_path):
     """
-    Split WebM by remuxing only; never re-encode and never accept
-    a split if any source video/audio packet disappears.
+    Split WebM by remuxing only.
 
-    The local limit is intentionally below Telegram's 50 MB limit
-    so HTTP/multipart overhead cannot push a part over the API limit.
+    Safety rules:
+      * Every output part must remain below the absolute Telegram limit.
+      * Video packet count must match the source exactly.
+      * If the source has audio, audio packet count must also match exactly.
+      * Unknown source packet counts are a hard failure; 0/0 is never treated
+        as successful integrity verification.
+      * The source WebM is never modified.
     """
     webm_path = Path(webm_path)
 
@@ -1124,24 +1162,31 @@ def split_webm_if_needed(webm_path):
     duration = get_duration(info)
 
     source_video_packets = get_video_packet_count(info)
-    source_audio_packets = 0
-
-    if info:
-        for stream in info.get("streams", []):
-            if stream.get("codec_type") != "audio":
-                continue
-            try:
-                source_audio_packets += int(
-                    stream.get("nb_frames") or 0
-                )
-            except Exception:
-                pass
+    source_audio_packets = get_audio_packet_count(info)
+    has_audio_stream = any(
+        stream.get("codec_type") == "audio"
+        for stream in (info or {}).get("streams", [])
+    )
 
     log(
         "Source WebM packets: "
         f"video={source_video_packets} "
         f"audio={source_audio_packets}"
     )
+
+    # Do not continue if ffprobe cannot count the source packets.
+    # A 0/0 comparison is not an integrity check.
+    if source_video_packets <= 0:
+        raise RuntimeError(
+            "Unable to determine source WebM video packet count; "
+            "refusing to split/upload because packet loss cannot be verified"
+        )
+
+    if has_audio_stream and source_audio_packets <= 0:
+        raise RuntimeError(
+            "Unable to determine source WebM audio packet count; "
+            "refusing to split/upload because audio packet loss cannot be verified"
+        )
 
     # MediaRecorder WebM can have missing container duration metadata.
     if duration <= 1:
@@ -1155,7 +1200,6 @@ def split_webm_if_needed(webm_path):
             f"using estimated duration={duration:.1f}s for splitting"
         )
 
-    # Keep the target comfortably below Telegram's 50 MB limit.
     target_bytes = TELEGRAM_TARGET_SIZE_MB * 1024 * 1024
     current_bytes = webm_path.stat().st_size
 
@@ -1205,9 +1249,6 @@ def split_webm_if_needed(webm_path):
             "0:a:0?",
             "-c",
             "copy",
-            "-copyts",
-            "-avoid_negative_ts",
-            "disabled",
             "-f",
             "segment",
             "-segment_time",
@@ -1289,16 +1330,16 @@ def split_webm_if_needed(webm_path):
             )
             total_video_packets += part_video_packets
 
-            if part_info:
-                for stream in part_info.get("streams", []):
-                    if stream.get("codec_type") != "audio":
-                        continue
-                    try:
-                        total_audio_packets += int(
-                            stream.get("nb_frames") or 0
-                        )
-                    except Exception:
-                        pass
+            part_audio_packets = get_audio_packet_count(
+                part_info
+            )
+
+            if has_audio_stream and part_audio_packets <= 0:
+                raise RuntimeError(
+                    f"Unable to count audio packets in split part: {part}"
+                )
+
+            total_audio_packets += part_audio_packets
 
             valid_parts.append(part)
 
@@ -1315,16 +1356,11 @@ def split_webm_if_needed(webm_path):
         # ----------------------------------------------------
         # HARD INTEGRITY CHECK
         # ----------------------------------------------------
-        # Stream-copy splitting must not lose packets. If ffprobe
-        # can count them, require an exact aggregate match before
-        # anything is uploaded to Telegram.
+        # Exact packet-count equality is required.
+        # Never accept an unknown/zero source count.
         # ----------------------------------------------------
 
-        if (
-            source_video_packets > 0
-            and total_video_packets
-            != source_video_packets
-        ):
+        if total_video_packets != source_video_packets:
             log(
                 "WebM split integrity failure: "
                 f"source video packets={source_video_packets}, "
@@ -1340,11 +1376,7 @@ def split_webm_if_needed(webm_path):
             segment_time *= 0.85
             continue
 
-        if (
-            source_audio_packets > 0
-            and total_audio_packets
-            != source_audio_packets
-        ):
+        if has_audio_stream and total_audio_packets != source_audio_packets:
             log(
                 "WebM split integrity failure: "
                 f"source audio packets={source_audio_packets}, "
