@@ -1590,19 +1590,19 @@ WEBRTC_HOOK = r"""
 
         if (
             MediaRecorder.isTypeSupported(
-                "video/webm;codecs=vp9,opus"
-            )
-        ) {
-            mimeType =
-                "video/webm;codecs=vp9,opus";
-
-        } else if (
-            MediaRecorder.isTypeSupported(
                 "video/webm;codecs=vp8,opus"
             )
         ) {
             mimeType =
                 "video/webm;codecs=vp8,opus";
+
+        } else if (
+            MediaRecorder.isTypeSupported(
+                "video/webm;codecs=vp9,opus"
+            )
+        ) {
+            mimeType =
+                "video/webm;codecs=vp9,opus";
 
         } else if (
             MediaRecorder.isTypeSupported(
@@ -2399,14 +2399,14 @@ async def run_recording(playwright):
             """
             () =>
                 window.__superliveWaitChunk(
-                    10000
+                    30000
                 )
             """
         )
 
         if not first_chunk:
             raise RuntimeError(
-                "First recording chunk was not received"
+                "First recording chunk was not received within 30 seconds"
             )
 
         log(
