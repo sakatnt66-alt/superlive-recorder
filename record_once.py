@@ -2019,6 +2019,153 @@ WEBRTC_HOOK = r"""
         window.__preparedSourceVideoTrack = selectedVideoTrack;
         window.__preparedAudioTrack = selectedAudioTrack;
 
+        /*
+         * Rendered-frame diagnostic only. This does NOT alter the
+         * selected stream or recording path. It measures the actual
+         * frames presented by the selected <video> element so we can
+         * compare them with the frames that MediaRecorder writes into
+         * the WebM file.
+         */
+        window.__superliveRenderDiag = {
+            supported: false,
+            running: false,
+            callbackCount: 0,
+            firstTimestamp: null,
+            lastTimestamp: null,
+            lastMediaTime: null,
+            largeGaps: 0,
+            maxGap: 0,
+            totalGap: 0,
+            lastGap: 0,
+            callbackId: null,
+        };
+
+        window.__superliveStartRenderDiagnostics = () => {
+            const video = window.__superliveSelectedVideo;
+            const diag = window.__superliveRenderDiag;
+
+            if (!video || typeof video.requestVideoFrameCallback !== "function") {
+                diag.supported = false;
+                return {
+                    supported: false,
+                    reason: "requestVideoFrameCallback_unavailable",
+                };
+            }
+
+            if (diag.running) {
+                return {
+                    supported: true,
+                    running: true,
+                };
+            }
+
+            diag.supported = true;
+            diag.running = true;
+            diag.callbackCount = 0;
+            diag.firstTimestamp = null;
+            diag.lastTimestamp = null;
+            diag.lastMediaTime = null;
+            diag.largeGaps = 0;
+            diag.maxGap = 0;
+            diag.totalGap = 0;
+            diag.lastGap = 0;
+
+            const onFrame = (now, metadata) => {
+                if (!diag.running) {
+                    return;
+                }
+
+                const timestamp = Number.isFinite(metadata && metadata.expectedDisplayTime)
+                    ? metadata.expectedDisplayTime
+                    : now;
+
+                if (diag.firstTimestamp === null) {
+                    diag.firstTimestamp = timestamp;
+                }
+
+                if (diag.lastTimestamp !== null) {
+                    const gap = Math.max(0, (timestamp - diag.lastTimestamp) / 1000);
+                    diag.lastGap = gap;
+                    diag.totalGap += gap;
+
+                    if (gap > diag.maxGap) {
+                        diag.maxGap = gap;
+                    }
+
+                    if (gap > 0.2) {
+                        diag.largeGaps += 1;
+                    }
+                }
+
+                diag.lastTimestamp = timestamp;
+                diag.lastMediaTime = Number.isFinite(metadata && metadata.mediaTime)
+                    ? metadata.mediaTime
+                    : null;
+                diag.callbackCount += 1;
+
+                try {
+                    diag.callbackId = video.requestVideoFrameCallback(onFrame);
+                } catch (e) {
+                    diag.running = false;
+                    console.warn(
+                        "superlive render diagnostic callback error",
+                        e
+                    );
+                }
+            };
+
+            try {
+                diag.callbackId = video.requestVideoFrameCallback(onFrame);
+            } catch (e) {
+                diag.running = false;
+                console.warn(
+                    "superlive render diagnostic start error",
+                    e
+                );
+                return {
+                    supported: true,
+                    running: false,
+                    error: String(e),
+                };
+            }
+
+            return {
+                supported: true,
+                running: true,
+            };
+        };
+
+        window.__superliveStopRenderDiagnostics = () => {
+            const diag = window.__superliveRenderDiag;
+            diag.running = false;
+            return true;
+        };
+
+        window.__superliveGetRenderDiagnostics = () => {
+            const diag = window.__superliveRenderDiag;
+            const duration =
+                diag.firstTimestamp !== null && diag.lastTimestamp !== null
+                    ? Math.max(0, (diag.lastTimestamp - diag.firstTimestamp) / 1000)
+                    : 0;
+
+            const fps =
+                duration > 0 && diag.callbackCount > 1
+                    ? (diag.callbackCount - 1) / duration
+                    : 0;
+
+            return {
+                supported: !!diag.supported,
+                running: !!diag.running,
+                callbackCount: diag.callbackCount,
+                durationSeconds: duration,
+                effectiveFps: fps,
+                largeGaps: diag.largeGaps,
+                maxGapSeconds: diag.maxGap,
+                lastGapSeconds: diag.lastGap,
+                lastMediaTime: diag.lastMediaTime,
+            };
+        };
+
         return {
             hasVideo: !!captureVideoTrack,
             hasAudio: !!selectedAudioTrack,
@@ -2498,6 +2645,13 @@ WEBRTC_HOOK = r"""
                         :
                         null,
 
+                    renderDiagnostics:
+                        window.__superliveGetRenderDiagnostics
+                        ?
+                        window.__superliveGetRenderDiagnostics()
+                        :
+                        null,
+
                     recorderState:
                         window
                             .__superliveRecorder
@@ -2911,6 +3065,25 @@ async def run_recording(playwright):
         )
 
         # ----------------------------------------------------
+        # Start rendered-frame diagnostic
+        # ----------------------------------------------------
+
+        render_diag_start = await page.evaluate(
+            """
+            () =>
+                window.__superliveStartRenderDiagnostics()
+            """
+        )
+
+        log(
+            "Rendered-frame diagnostic started: "
+            + json.dumps(
+                render_diag_start,
+                ensure_ascii=False,
+            )
+        )
+
+        # ----------------------------------------------------
         # Start MediaRecorder
         # ----------------------------------------------------
 
@@ -3088,6 +3261,18 @@ async def run_recording(playwright):
                         f"{total_bytes / 1024 / 1024:.2f} MB"
                     )
 
+                    render_diag = status.get(
+                        "renderDiagnostics"
+                    )
+
+                    log(
+                        "Rendered-frame status: "
+                        + json.dumps(
+                            render_diag,
+                            ensure_ascii=False,
+                        )
+                    )
+
                     last_status_log = (
                         time.monotonic()
                     )
@@ -3104,6 +3289,27 @@ async def run_recording(playwright):
         # ----------------------------------------------------
         # Stop MediaRecorder
         # ----------------------------------------------------
+
+        final_render_diag = await page.evaluate(
+            """
+            () => {
+                if (window.__superliveStopRenderDiagnostics) {
+                    window.__superliveStopRenderDiagnostics();
+                }
+                return window.__superliveGetRenderDiagnostics
+                    ? window.__superliveGetRenderDiagnostics()
+                    : null;
+            }
+            """
+        )
+
+        log(
+            "Final rendered-frame diagnostics: "
+            + json.dumps(
+                final_render_diag,
+                ensure_ascii=False,
+            )
+        )
 
         log(
             "Stopping MediaRecorder..."
