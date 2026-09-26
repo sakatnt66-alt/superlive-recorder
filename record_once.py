@@ -2554,14 +2554,14 @@ async def run_recording(playwright):
             """
             () =>
                 window.__superliveWaitChunk(
-                    30000
+                    90000
                 )
             """
         )
 
         if not first_chunk:
             raise RuntimeError(
-                "First recording chunk was not received within 30 seconds"
+                "First recording chunk was not received within 90 seconds"
             )
 
         log(
