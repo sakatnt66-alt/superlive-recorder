@@ -1247,6 +1247,13 @@ def split_webm_if_needed(webm_path):
             "0:v:0",
             "-map",
             "0:a:0?",
+            # Regenerate missing presentation timestamps before the
+            # segment muxer. MediaRecorder WebM can contain duplicate
+            # DTS values; without a monotonic timestamp timeline FFmpeg
+            # has to rewrite DTS while splitting, which is exactly what
+            # produced the non-monotonic-DTS warnings seen in the logs.
+            "-fflags",
+            "+genpts",
             "-c",
             "copy",
             "-f",
