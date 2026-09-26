@@ -1910,19 +1910,19 @@ WEBRTC_HOOK = r"""
 
         if (
             MediaRecorder.isTypeSupported(
-                "video/webm;codecs=vp9,opus"
-            )
-        ) {
-            mimeType =
-                "video/webm;codecs=vp9,opus";
-
-        } else if (
-            MediaRecorder.isTypeSupported(
                 "video/webm;codecs=vp8,opus"
             )
         ) {
             mimeType =
                 "video/webm;codecs=vp8,opus";
+
+        } else if (
+            MediaRecorder.isTypeSupported(
+                "video/webm;codecs=vp9,opus"
+            )
+        ) {
+            mimeType =
+                "video/webm;codecs=vp9,opus";
 
         } else if (
             MediaRecorder.isTypeSupported(
