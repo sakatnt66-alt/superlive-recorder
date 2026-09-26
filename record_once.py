@@ -1665,6 +1665,7 @@ WEBRTC_HOOK = r"""
     window.__superliveAudioTracks = [];
     window.__superliveStreams = [];
     window.__superliveTrackLinks = new Map();
+    window.__superlivePeerConnections = [];
 
     const OriginalRTCPeerConnection =
         window.RTCPeerConnection;
@@ -1731,6 +1732,8 @@ WEBRTC_HOOK = r"""
 
         constructor(...args) {
             super(...args);
+
+            window.__superlivePeerConnections.push(this);
 
             this.addEventListener(
                 "track",
@@ -1852,6 +1855,119 @@ WEBRTC_HOOK = r"""
                 height: best.rect.height,
             },
             trackId: best.videoTrack.id,
+        };
+    };
+
+    window.__superliveGetWebRTCStats = async () => {
+        const results = [];
+
+        for (const pc of window.__superlivePeerConnections) {
+            try {
+                const stats = await pc.getStats();
+
+                stats.forEach(report => {
+                    if (report.type !== "inbound-rtp" || report.kind !== "video") {
+                        return;
+                    }
+
+                    results.push({
+                        trackIdentifier: report.trackIdentifier || null,
+                        ssrc: report.ssrc || null,
+                        framesReceived: report.framesReceived ?? null,
+                        framesDecoded: report.framesDecoded ?? null,
+                        framesDropped: report.framesDropped ?? null,
+                        framesPerSecond: report.framesPerSecond ?? null,
+                        packetsReceived: report.packetsReceived ?? null,
+                        packetsLost: report.packetsLost ?? null,
+                        jitter: report.jitter ?? null,
+                        bytesReceived: report.bytesReceived ?? null,
+                    });
+                });
+            } catch (e) {
+                // A peer connection can disappear while the page is switching
+                // receivers. Ignore that connection for this diagnostic.
+            }
+        }
+
+        const selectedTrack =
+            window.__superliveSelectedVideoTrack || null;
+
+        const matching = selectedTrack
+            ? results.filter(
+                item =>
+                    item.trackIdentifier === selectedTrack.id
+            )
+            : [];
+
+        return {
+            selectedTrackId: selectedTrack
+                ? selectedTrack.id
+                : null,
+            matching,
+            inboundVideo: results,
+        };
+    };
+
+    window.__superliveEnsureSelectedVideoPlaying = async () => {
+        const video = window.__superliveSelectedVideo;
+
+        if (!video) {
+            return {
+                ok: false,
+                reason: "no_selected_video",
+            };
+        }
+
+        const start = performance.now();
+        let playResult = "not_needed";
+
+        try {
+            if (
+                video.paused
+                || video.readyState < 2
+                || video.videoWidth === 0
+                || video.videoHeight === 0
+            ) {
+                try {
+                    await video.play();
+                    playResult = "played";
+                } catch (e) {
+                    playResult = "play_rejected";
+                }
+            }
+        } catch (e) {
+            playResult = "play_error";
+        }
+
+        while (performance.now() - start < 10000) {
+            if (
+                !video.paused
+                && video.readyState >= 2
+                && video.videoWidth > 0
+                && video.videoHeight > 0
+            ) {
+                return {
+                    ok: true,
+                    playResult,
+                    readyState: video.readyState,
+                    paused: video.paused,
+                    currentTime: video.currentTime,
+                    width: video.videoWidth,
+                    height: video.videoHeight,
+                };
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 250));
+        }
+
+        return {
+            ok: false,
+            playResult,
+            readyState: video.readyState,
+            paused: video.paused,
+            currentTime: video.currentTime,
+            width: video.videoWidth,
+            height: video.videoHeight,
         };
     };
 
@@ -2745,7 +2861,15 @@ WEBRTC_HOOK = r"""
                         recorderState:
                             recorder.state,
                         uploadError:
-                            window.__superliveUploadError
+                            window.__superliveUploadError,
+                        renderDiagnostics:
+                            window.__superliveGetRenderDiagnostics
+                            ? window.__superliveGetRenderDiagnostics()
+                            : null,
+                        webrtcDiagnostics:
+                            window.__superliveGetWebRTCStats
+                            ? await window.__superliveGetWebRTCStats()
+                            : null
                     };
                 }
 
@@ -3096,6 +3220,27 @@ async def run_recording(playwright):
             "Prepared stream: "
             + json.dumps(
                 prepared,
+                ensure_ascii=False,
+            )
+        )
+
+        # ----------------------------------------------------
+        # Ensure selected video is actually playing
+        # ----------------------------------------------------
+
+        play_result = await page.evaluate(
+            """
+            () =>
+                window.__superliveEnsureSelectedVideoPlaying
+                    ? window.__superliveEnsureSelectedVideoPlaying()
+                    : null
+            """
+        )
+
+        log(
+            "Selected video playback check: "
+            + json.dumps(
+                play_result,
                 ensure_ascii=False,
             )
         )
