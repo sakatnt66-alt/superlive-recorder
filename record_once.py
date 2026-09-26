@@ -531,6 +531,240 @@ def get_video_packet_count(info):
     return 0
 
 
+def analyze_webm_video_timing(path):
+    """
+    Analyze the original WebM video packet timeline without decoding or
+    re-encoding it.
+
+    This is intentionally performed before splitting/uploading so we can
+    distinguish a bad source timeline from a split/upload problem.
+
+    Strict failures:
+      * missing/unparseable video timestamps
+      * non-finite timestamps
+      * duplicate PTS values
+      * backwards PTS values
+      * backwards DTS values
+
+    A low effective FPS or a large positive gap is reported as a diagnostic,
+    not treated as packet loss by itself. Variable frame rate can be valid.
+    """
+    path = Path(path)
+
+    command = [
+        "ffprobe",
+        "-hide_banner",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_packets",
+        "-show_entries",
+        "packet=pts_time,dts_time,duration_time",
+        "-of",
+        "csv=p=0",
+        str(path),
+    ]
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=120,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Unable to inspect original WebM video timestamps:\n"
+            + result.stderr.strip()
+        )
+
+    import math
+
+    pts_values = []
+    dts_values = []
+    durations = []
+    invalid_rows = 0
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+
+        if not line:
+            continue
+
+        fields = [field.strip() for field in line.split(",")]
+
+        if len(fields) < 2:
+            invalid_rows += 1
+            continue
+
+        def parse_timestamp(value):
+            if value in ("", "N/A", "NULL"):
+                return None
+            try:
+                number = float(value)
+            except Exception:
+                return None
+            if not math.isfinite(number):
+                return None
+            return number
+
+        pts = parse_timestamp(fields[0])
+        dts = parse_timestamp(fields[1])
+        duration = (
+            parse_timestamp(fields[2])
+            if len(fields) >= 3
+            else None
+        )
+
+        if pts is None:
+            invalid_rows += 1
+        else:
+            pts_values.append(pts)
+
+        if dts is not None:
+            dts_values.append(dts)
+
+        if duration is not None and duration >= 0:
+            durations.append(duration)
+
+    if not pts_values:
+        raise RuntimeError(
+            "Original WebM contains no usable video PTS timestamps; "
+            "refusing to upload because video timing cannot be verified"
+        )
+
+    duplicate_pts = 0
+    backwards_pts = 0
+    duplicate_dts = 0
+    backwards_dts = 0
+
+    positive_deltas = []
+    large_gaps = []
+
+    previous = None
+    for index, current in enumerate(pts_values):
+        if previous is not None:
+            delta = current - previous
+
+            if delta == 0:
+                duplicate_pts += 1
+            elif delta < 0:
+                backwards_pts += 1
+            else:
+                positive_deltas.append(delta)
+
+                if delta > 0.200:
+                    large_gaps.append(
+                        (index, previous, current, delta)
+                    )
+
+        previous = current
+
+    previous = None
+    for current in dts_values:
+        if previous is not None:
+            delta = current - previous
+
+            if delta == 0:
+                duplicate_dts += 1
+            elif delta < 0:
+                backwards_dts += 1
+
+        previous = current
+
+    first_pts = pts_values[0]
+    last_pts = pts_values[-1]
+    timeline_span = max(0.0, last_pts - first_pts)
+
+    effective_fps = 0.0
+    if timeline_span > 0 and len(pts_values) > 1:
+        effective_fps = (
+            (len(pts_values) - 1)
+            / timeline_span
+        )
+
+    min_delta = min(positive_deltas) if positive_deltas else 0.0
+    max_delta = max(positive_deltas) if positive_deltas else 0.0
+
+    average_delta = 0.0
+    if positive_deltas:
+        average_delta = sum(positive_deltas) / len(positive_deltas)
+
+    log(
+        "WebM video timing analysis: "
+        f"packets={len(pts_values)} "
+        f"first_pts={first_pts:.6f}s "
+        f"last_pts={last_pts:.6f}s "
+        f"timeline={timeline_span:.3f}s "
+        f"effective_fps={effective_fps:.3f}"
+    )
+
+    log(
+        "WebM video timestamp diagnostics: "
+        f"duplicate_pts={duplicate_pts} "
+        f"backwards_pts={backwards_pts} "
+        f"duplicate_dts={duplicate_dts} "
+        f"backwards_dts={backwards_dts} "
+        f"invalid_rows={invalid_rows}"
+    )
+
+    log(
+        "WebM video frame intervals: "
+        f"min={min_delta:.6f}s "
+        f"avg={average_delta:.6f}s "
+        f"max={max_delta:.6f}s "
+        f"large_gaps_gt_200ms={len(large_gaps)}"
+    )
+
+    if large_gaps:
+        preview = large_gaps[:10]
+        formatted = "; ".join(
+            f"#{index}: {delta:.3f}s"
+            for index, _, _, delta in preview
+        )
+        log(
+            "Largest video timing gaps (first 10): "
+            + formatted
+        )
+
+    if invalid_rows:
+        raise RuntimeError(
+            "Original WebM contains video packets with invalid/missing "
+            f"PTS values: {invalid_rows}; refusing to upload"
+        )
+
+    if duplicate_pts or backwards_pts:
+        raise RuntimeError(
+            "Original WebM video PTS timeline is not strictly increasing: "
+            f"duplicate_pts={duplicate_pts}, "
+            f"backwards_pts={backwards_pts}; refusing to upload"
+        )
+
+    if backwards_dts:
+        raise RuntimeError(
+            "Original WebM video DTS timeline moves backwards: "
+            f"backwards_dts={backwards_dts}; refusing to upload"
+        )
+
+    return {
+        "packet_count": len(pts_values),
+        "first_pts": first_pts,
+        "last_pts": last_pts,
+        "timeline_span": timeline_span,
+        "effective_fps": effective_fps,
+        "duplicate_pts": duplicate_pts,
+        "backwards_pts": backwards_pts,
+        "duplicate_dts": duplicate_dts,
+        "backwards_dts": backwards_dts,
+        "large_gaps": len(large_gaps),
+        "min_delta": min_delta,
+        "average_delta": average_delta,
+        "max_delta": max_delta,
+    }
+
+
 def get_audio_packet_count(info):
     if not info:
         return 0
@@ -3196,6 +3430,33 @@ async def run_recording(playwright):
             raise RuntimeError(
                 "Original WebM failed verification"
             )
+
+        # ----------------------------------------------------
+        # STRICT VIDEO TIMING ANALYSIS
+        # ----------------------------------------------------
+        #
+        # Read the original WebM packet timestamps before any
+        # split or Telegram upload. This does not decode or
+        # re-encode the video and therefore cannot alter it.
+        #
+        # A low effective FPS or a positive timing gap is only
+        # diagnostic. Duplicate/backwards timestamps are a hard
+        # failure because they make the source timeline unsafe.
+        # ----------------------------------------------------
+
+        timing_info = analyze_webm_video_timing(
+            webm_path
+        )
+
+        log(
+            "Original WebM timing verified: "
+            f"effective_fps="
+            f"{timing_info['effective_fps']:.3f}, "
+            f"timeline="
+            f"{timing_info['timeline_span']:.3f}s, "
+            f"large_gaps="
+            f"{timing_info['large_gaps']}"
+        )
 
         # ----------------------------------------------------
         # DIRECT WEBM TEST
