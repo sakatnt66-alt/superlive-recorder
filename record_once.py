@@ -227,7 +227,7 @@ TEMP_DIR = Path(
 RECORDING_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-VIDEO_BITRATE = 8_000_000
+VIDEO_BITRATE = 5_000_000
 AUDIO_BITRATE = 192_000
 
 VIDEO_WAIT_SECONDS = 60
