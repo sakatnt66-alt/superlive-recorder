@@ -2171,6 +2171,105 @@ WEBRTC_HOOK = r"""
         window.__preparedSourceVideoTrack = selectedVideoTrack;
         window.__preparedAudioTrack = selectedAudioTrack;
 
+        /* Transactional MediaRecorder candidates. A recorder is only
+         * accepted after it emits a real dataavailable chunk. */
+        window.__superliveRecordingCandidates = [];
+
+        const addRecordingCandidate = (
+            name,
+            videoTrack,
+            audioTrack,
+            cloneTracks = false
+        ) => {
+            if (!videoTrack || videoTrack.readyState !== "live") return;
+
+            let recordingVideoTrack = videoTrack;
+            let recordingAudioTrack =
+                audioTrack && audioTrack.readyState === "live"
+                    ? audioTrack
+                    : null;
+
+            if (cloneTracks) {
+                try {
+                    recordingVideoTrack = videoTrack.clone();
+                    if (recordingAudioTrack) {
+                        recordingAudioTrack =
+                            recordingAudioTrack.clone();
+                    }
+                } catch (e) {
+                    console.warn(
+                        "superlive track clone candidate failed",
+                        e
+                    );
+                    return;
+                }
+            }
+
+            const candidateTracks = [recordingVideoTrack];
+            if (recordingAudioTrack) {
+                candidateTracks.push(recordingAudioTrack);
+            }
+
+            window.__superliveRecordingCandidates.push({
+                name,
+                stream: new MediaStream(candidateTracks),
+                videoTrack: recordingVideoTrack,
+                sourceVideoTrack: videoTrack,
+                audioTrack: recordingAudioTrack,
+                sourceAudioTrack: audioTrack || null,
+            });
+        };
+
+        if (
+            captureVideoTrack
+            && captureVideoTrack.readyState === "live"
+            && !captureVideoTrack.muted
+        ) {
+            addRecordingCandidate(
+                "capture-av",
+                captureVideoTrack,
+                selectedAudioTrack
+            );
+        }
+
+        addRecordingCandidate(
+            "webrtc-av",
+            selectedVideoTrack,
+            selectedAudioTrack
+        );
+
+        addRecordingCandidate(
+            "webrtc-av-clone",
+            selectedVideoTrack,
+            selectedAudioTrack,
+            true
+        );
+
+        if (
+            captureVideoTrack
+            && captureVideoTrack.readyState === "live"
+            && !captureVideoTrack.muted
+        ) {
+            addRecordingCandidate(
+                "capture-video-only",
+                captureVideoTrack,
+                null
+            );
+        }
+
+        addRecordingCandidate(
+            "webrtc-video-only",
+            selectedVideoTrack,
+            null
+        );
+
+        addRecordingCandidate(
+            "webrtc-video-only-clone",
+            selectedVideoTrack,
+            null,
+            true
+        );
+
         /*
          * Rendered-frame diagnostic only. This does NOT alter the
          * selected stream or recording path. It measures the actual
@@ -2335,13 +2434,29 @@ WEBRTC_HOOK = r"""
     window.__superliveStartRec = (
         videoBitrate,
         audioBitrate,
-        timeslice
+        timeslice,
+        candidateIndex = 0,
+        attemptId = "default"
     ) => {
-        if (!window.__preparedStream) {
+        const candidate =
+            window.__superliveRecordingCandidates
+            && window.__superliveRecordingCandidates[candidateIndex]
+            ? window.__superliveRecordingCandidates[candidateIndex]
+            : null;
+
+        const recordingStream = candidate
+            ? candidate.stream
+            : window.__preparedStream;
+
+        if (!recordingStream) {
             throw new Error(
-                "Prepared stream is missing"
+                "Prepared recording stream is missing"
             );
         }
+
+        window.__superliveActiveAttemptId = attemptId;
+        window.__superliveActiveCandidateName =
+            candidate ? candidate.name : "prepared";
 
         let mimeType = "";
 
@@ -2385,12 +2500,13 @@ WEBRTC_HOOK = r"""
 
         const recorder =
             new MediaRecorder(
-                window.__preparedStream,
+                recordingStream,
                 recorderOptions
             );
 
         window.__superliveRecorder =
             recorder;
+        window.__superliveRecorderAttemptId = attemptId;
 
         window.__superliveChunkCount = 0;
 
@@ -2574,6 +2690,10 @@ WEBRTC_HOOK = r"""
 
         recorder.ondataavailable =
             (event) => {
+
+                if (attemptId !== window.__superliveActiveAttemptId) {
+                    return;
+                }
 
                 window.__superlivePendingDataTasks++;
 
@@ -2828,7 +2948,14 @@ WEBRTC_HOOK = r"""
 
         return {
             mimeType,
-            state: recorder.state
+            state: recorder.state,
+            candidateIndex,
+            candidateName: candidate ? candidate.name : "prepared",
+            attemptId,
+            videoTrackId: candidate && candidate.videoTrack
+                ? candidate.videoTrack.id
+                : null,
+            hasAudio: !!(candidate && candidate.audioTrack),
         };
     };
 
@@ -2937,7 +3064,17 @@ WEBRTC_HOOK = r"""
                             ? videoTrack.muted
                             : null,
                         uploadError:
-                            window.__superliveUploadError
+                            window.__superliveUploadError,
+                        activeCandidateName:
+                            window.__superliveActiveCandidateName || null,
+                        renderDiagnostics:
+                            window.__superliveGetRenderDiagnostics
+                            ? window.__superliveGetRenderDiagnostics()
+                            : null,
+                        webrtcDiagnostics:
+                            window.__superliveGetWebRTCStats
+                            ? await window.__superliveGetWebRTCStats()
+                            : null
                     };
                 }
 
@@ -3265,72 +3402,133 @@ async def run_recording(playwright):
         )
 
         # ----------------------------------------------------
-        # Start MediaRecorder
+        # Transactional MediaRecorder startup
         # ----------------------------------------------------
-
-        start_result = await page.evaluate(
+        candidates = await page.evaluate(
             """
-            ([videoBitrate, audioBitrate, timeslice]) =>
-                window.__superliveStartRec(
-                    videoBitrate,
-                    audioBitrate,
-                    timeslice
-                )
-            """,
-            [
-                VIDEO_BITRATE,
-                AUDIO_BITRATE,
-                1000,
-            ],
+            () => (window.__superliveRecordingCandidates || []).map(
+                (candidate, index) => ({
+                    index,
+                    name: candidate.name,
+                    hasAudio: !!candidate.audioTrack,
+                    videoTrackId: candidate.videoTrack
+                        ? candidate.videoTrack.id
+                        : null,
+                    sourceVideoTrackId: candidate.sourceVideoTrack
+                        ? candidate.sourceVideoTrack.id
+                        : null,
+                    videoTrackState: candidate.videoTrack
+                        ? candidate.videoTrack.readyState
+                        : null,
+                    videoTrackMuted: candidate.videoTrack
+                        ? candidate.videoTrack.muted
+                        : null,
+                })
+            )
+            """
         )
 
         log(
-            "MediaRecorder started: "
-            + json.dumps(
-                start_result,
-                ensure_ascii=False,
+            "Recorder candidates: "
+            + json.dumps(candidates, ensure_ascii=False)
+        )
+
+        if not candidates:
+            raise RuntimeError(
+                "No usable recording candidates were created"
             )
-        )
 
-        # ----------------------------------------------------
-        # Wait for first chunk
-        # ----------------------------------------------------
+        first_chunk = None
+        accepted_candidate = None
 
-        first_chunk = await page.evaluate(
-            """
-            () =>
-                window.__superliveWaitChunk(
-                    90000
-                )
-            """
-        )
+        for candidate in candidates:
+            attempt_id = f"{candidate['index']}-{time.monotonic_ns()}"
 
-        if (
-            not first_chunk
-            or not first_chunk.get("ok")
-        ):
+            start_result = await page.evaluate(
+                """
+                ([videoBitrate, audioBitrate, timeslice, candidateIndex, attemptId]) =>
+                    window.__superliveStartRec(
+                        videoBitrate,
+                        audioBitrate,
+                        timeslice,
+                        candidateIndex,
+                        attemptId
+                    )
+                """,
+                [
+                    VIDEO_BITRATE,
+                    AUDIO_BITRATE,
+                    1000,
+                    candidate["index"],
+                    attempt_id,
+                ],
+            )
+
             log(
-                "First chunk diagnostics: "
+                "MediaRecorder startup attempt: "
+                + json.dumps(start_result, ensure_ascii=False)
+            )
+
+            attempt_result = await page.evaluate(
+                """
+                () => window.__superliveWaitChunk(10000)
+                """
+            )
+
+            if (
+                attempt_result
+                and attempt_result.get("ok")
+                and attempt_result.get("chunkCount", 0) >= 1
+            ):
+                first_chunk = attempt_result
+                accepted_candidate = candidate
+                log(
+                    "MediaRecorder candidate accepted: "
+                    + json.dumps(
+                        {"candidate": candidate, "result": attempt_result},
+                        ensure_ascii=False,
+                    )
+                )
+                break
+
+            log(
+                "MediaRecorder candidate rejected: "
                 + json.dumps(
-                    first_chunk,
+                    {"candidate": candidate, "result": attempt_result},
                     ensure_ascii=False,
                 )
             )
 
+            try:
+                await page.evaluate(
+                    """
+                    () => window.__superliveStopRec
+                        ? window.__superliveStopRec()
+                        : false
+                    """
+                )
+            except Exception as e:
+                log(
+                    f"Failed to stop rejected recorder candidate: {e}"
+                )
+
+            await asyncio.sleep(1)
+
+        if accepted_candidate is None:
             raise RuntimeError(
-                "First recording chunk was not received; "
+                "All MediaRecorder candidates failed to produce a first chunk; "
                 + json.dumps(
-                    first_chunk,
+                    {
+                        "candidates": candidates,
+                        "lastDiagnostics": first_chunk,
+                    },
                     ensure_ascii=False,
                 )
             )
 
         log(
             "First recording chunk received: "
-            + json.dumps(
-                first_chunk,
-                ensure_ascii=False,
-            )
+            + json.dumps(first_chunk, ensure_ascii=False)
         )
 
         # ----------------------------------------------------
