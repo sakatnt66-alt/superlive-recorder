@@ -227,7 +227,7 @@ TEMP_DIR = Path(
 RECORDING_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-VIDEO_BITRATE = 8_000_000
+VIDEO_BITRATE = 5_000_000
 AUDIO_BITRATE = 192_000
 
 VIDEO_WAIT_SECONDS = 60
@@ -2248,14 +2248,21 @@ WEBRTC_HOOK = r"""
         }
 
         /*
-         * Prefer an audio track that is both live and currently
-         * unmuted.  A live-but-muted track can exist in a MediaStream
-         * while another audio receiver track is the one actually
-         * carrying the broadcaster's audio.  Previously we stopped at
-         * the first live track, which caused a false fatal error here.
+         * AUDIO MUST STAY ASSOCIATED WITH THE SELECTED VIDEO.
          *
-         * Keep the selected/linked tracks first so we never change the
-         * stream association unless the first candidate is only muted.
+         * The previous implementation fell back to
+         * window.__superliveAudioTracks when the selected video
+         * stream did not expose audio immediately.  That array is
+         * global to the page and can contain audio receivers from
+         * other live players/broadcasters.  The logs confirmed that
+         * this can produce a perfectly valid audio recording that
+         * belongs to a different broadcast.
+         *
+         * Never use a page-global audio fallback.  Only accept audio
+         * tracks belonging to the SAME MediaStream that carries the
+         * selected video track (or a stream explicitly linked to that
+         * selected video track).  If the audio track is not attached
+         * yet, wait briefly for the page to attach it.
          */
         const audioCandidates = [];
 
@@ -2268,29 +2275,77 @@ WEBRTC_HOOK = r"""
             }
         };
 
-        if (selectedStream) {
-            for (const track of selectedStream.getAudioTracks()) {
-                addAudioCandidate(track);
+        const collectAssociatedAudio = () => {
+            audioCandidates.length = 0;
+
+            if (selectedStream) {
+                for (const track of selectedStream.getAudioTracks()) {
+                    addAudioCandidate(track);
+                }
             }
-        }
 
-        const linkedStream =
-            window.__superliveTrackLinks.get(selectedVideoTrack);
+            const linkedStream =
+                window.__superliveTrackLinks.get(selectedVideoTrack);
 
-        if (linkedStream) {
-            for (const track of linkedStream.getAudioTracks()) {
-                addAudioCandidate(track);
+            if (linkedStream) {
+                for (const track of linkedStream.getAudioTracks()) {
+                    addAudioCandidate(track);
+                }
             }
-        }
 
-        for (const track of window.__superliveAudioTracks) {
-            addAudioCandidate(track);
+            /*
+             * Some players attach audio to the same MediaStream object
+             * a little after the video track arrives.  Search every
+             * remembered stream, but ONLY when that stream contains
+             * the exact selected video track.
+             */
+            for (const stream of window.__superliveStreams) {
+                try {
+                    const hasSelectedVideo =
+                        stream.getVideoTracks().includes(
+                            selectedVideoTrack
+                        );
+
+                    if (!hasSelectedVideo) {
+                        continue;
+                    }
+
+                    for (const track of stream.getAudioTracks()) {
+                        addAudioCandidate(track);
+                    }
+                } catch (e) {
+                    // Ignore stale/detached MediaStream objects.
+                }
+            }
+        };
+
+        collectAssociatedAudio();
+
+        const audioWaitDeadline =
+            performance.now() + 10000;
+
+        while (
+            audioCandidates.length === 0
+            && performance.now() < audioWaitDeadline
+        ) {
+            await new Promise(
+                resolve => setTimeout(resolve, 500)
+            );
+
+            collectAssociatedAudio();
         }
 
         let selectedAudioTrack =
             audioCandidates.find(t => !t.muted)
             || audioCandidates[0]
             || null;
+
+        if (!selectedAudioTrack) {
+            throw new Error(
+                "No audio track associated with the selected video stream; "
+                + "refusing to use unrelated page audio"
+            );
+        }
 
         let captureStream = null;
         let captureVideoTrack = null;
@@ -2429,6 +2484,23 @@ WEBRTC_HOOK = r"""
         window.__preparedVideoTrack = captureVideoTrack;
         window.__preparedSourceVideoTrack = selectedVideoTrack;
         window.__preparedAudioTrack = selectedAudioTrack;
+        window.__preparedAudioAssociation = {
+            selectedVideoTrackId: selectedVideoTrack.id,
+            selectedStreamId: selectedStream
+                ? selectedStream.id
+                : null,
+            selectedAudioTrackId: selectedAudioTrack
+                ? selectedAudioTrack.id
+                : null,
+            selectedAudioTrackMuted: selectedAudioTrack
+                ? !!selectedAudioTrack.muted
+                : null,
+            selectedStreamAudioTrackIds: selectedStream
+                ? selectedStream.getAudioTracks().map(
+                    track => track.id
+                )
+                : [],
+        };
 
         /* Transactional MediaRecorder candidates. A recorder is only
          * accepted after it emits a real dataavailable chunk. */
