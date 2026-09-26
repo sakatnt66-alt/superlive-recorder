@@ -227,7 +227,7 @@ TEMP_DIR = Path(
 RECORDING_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-VIDEO_BITRATE = 5_000_000
+VIDEO_BITRATE = 8_000_000
 AUDIO_BITRATE = 192_000
 
 VIDEO_WAIT_SECONDS = 60
@@ -580,6 +580,14 @@ def log_video_info(label, path):
 # ============================================================
 
 def send_to_telegram(path, caption=""):
+    """
+    Upload the recorded WebM directly to Telegram.
+
+    Telegram's Bot API does not guarantee WebM as an inline video
+    through sendVideo; non-MPEG4 formats may be delivered as documents.
+    This direct-WebM test therefore uses sendDocument deliberately so
+    that the original MediaRecorder WebM is preserved byte-for-byte.
+    """
     path = Path(path)
 
     if not path.exists():
@@ -593,42 +601,22 @@ def send_to_telegram(path, caption=""):
         not TELEGRAM_BOT_TOKEN
         or not TELEGRAM_CHAT_ID
     ):
+        log("Telegram credentials are missing")
+        return False
+
+    size_mb = path.stat().st_size / (1024 * 1024)
+
+    if size_mb > TELEGRAM_MAX_SIZE_MB:
         log(
-            "Telegram credentials are missing"
+            f"Telegram upload refused locally: "
+            f"{path.name} is {size_mb:.2f} MB "
+            f"> {TELEGRAM_MAX_SIZE_MB:.2f} MB"
         )
         return False
 
-    info = get_video_info(path)
-
-    width = 0
-    height = 0
-    duration = 0
-
-    if info:
-        duration = int(
-            max(
-                0,
-                round(
-                    get_duration(info)
-                ),
-            )
-        )
-
-        for stream in info.get("streams", []):
-            if stream.get("codec_type") == "video":
-                width = int(
-                    stream.get("width") or 0
-                )
-
-                height = int(
-                    stream.get("height") or 0
-                )
-
-                break
-
     url = (
         f"https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/sendVideo"
+        f"{TELEGRAM_BOT_TOKEN}/sendDocument"
     )
 
     boundary = (
@@ -640,10 +628,6 @@ def send_to_telegram(path, caption=""):
         "chat_id": str(TELEGRAM_CHAT_ID),
         "caption": caption,
         "parse_mode": "HTML",
-        "supports_streaming": "true",
-        "duration": str(duration),
-        "width": str(width),
-        "height": str(height),
     }
 
     body = bytearray()
@@ -664,25 +648,20 @@ def send_to_telegram(path, caption=""):
         (
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; '
-            f'name="video"; filename="{filename}"\r\n'
-            f"Content-Type: video/mp4\r\n\r\n"
+            f'name="document"; filename="{filename}"\r\n'
+            f"Content-Type: video/webm\r\n\r\n"
         ).encode("utf-8")
     )
 
     try:
         with open(path, "rb") as f:
             body.extend(f.read())
-
     except Exception as e:
-        log(
-            f"Unable to read video for Telegram: {e}"
-        )
+        log(f"Unable to read WebM for Telegram: {e}")
         return False
 
     body.extend(
-        f"\r\n--{boundary}--\r\n".encode(
-            "utf-8"
-        )
+        f"\r\n--{boundary}--\r\n".encode("utf-8")
     )
 
     try:
@@ -695,32 +674,22 @@ def send_to_telegram(path, caption=""):
                     f"multipart/form-data; "
                     f"boundary={boundary}"
                 ),
-                "User-Agent":
-                    "SuperLiveRecorder/1.0",
+                "User-Agent": "SuperLiveRecorder/1.0",
             },
         )
 
-        with urllib.request.urlopen(
-            req,
-            timeout=600,
-        ) as response:
-            response_body = (
-                response.read()
-                .decode(
-                    "utf-8",
-                    errors="replace",
-                )
+        with urllib.request.urlopen(req, timeout=600) as response:
+            response_body = response.read().decode(
+                "utf-8",
+                errors="replace",
             )
 
         try:
-            result = json.loads(
-                response_body
-            )
-
+            result = json.loads(response_body)
             if result.get("ok"):
                 log(
-                    f"Telegram upload successful: "
-                    f"{path.name}"
+                    f"Telegram WebM upload successful: "
+                    f"{path.name} ({size_mb:.2f} MB)"
                 )
                 return True
 
@@ -728,35 +697,23 @@ def send_to_telegram(path, caption=""):
                 "Telegram returned failure: "
                 f"{response_body}"
             )
-
         except Exception:
-            log(
-                "Telegram response: "
-                f"{response_body}"
-            )
+            log(f"Telegram response: {response_body}")
 
     except urllib.error.HTTPError as e:
         try:
-            error_body = (
-                e.read()
-                .decode(
-                    "utf-8",
-                    errors="replace",
-                )
+            error_body = e.read().decode(
+                "utf-8",
+                errors="replace",
             )
         except Exception:
             error_body = str(e)
-
         log(
             f"Telegram HTTP error {e.code}: "
             f"{error_body}"
         )
-
     except Exception as e:
-        log(
-            f"Telegram upload error: "
-            f"{e}"
-        )
+        log(f"Telegram upload error: {e}")
 
     return False
 
@@ -1147,171 +1104,153 @@ def convert_webm_to_mp4(
 # SPLIT MP4
 # ============================================================
 
-def split_mp4_if_needed(mp4_path):
-    mp4_path = Path(mp4_path)
+def split_webm_if_needed(webm_path):
+    """Split WebM without re-encoding and keep every part below Telegram's limit."""
+    webm_path = Path(webm_path)
 
-    size_mb = (
-        mp4_path.stat().st_size
-        / (1024 * 1024)
-    )
-
-    log(
-        f"MP4 size: "
-        f"{size_mb:.2f} MB"
-    )
+    size_mb = webm_path.stat().st_size / (1024 * 1024)
+    log(f"WebM size: {size_mb:.2f} MB")
 
     if size_mb <= TELEGRAM_MAX_SIZE_MB:
-        return [mp4_path]
+        return [webm_path]
 
-    info = get_video_info(
-        mp4_path
-    )
+    info = get_video_info(webm_path)
+    duration = get_duration(info)
 
-    duration = get_duration(
-        info
-    )
-
+    # MediaRecorder WebM can have missing container duration metadata.
+    # Use the configured recording bitrate as a conservative estimate,
+    # then verify actual part sizes and retry with shorter segments if needed.
     if duration <= 1:
-        raise RuntimeError(
-            "Cannot split MP4: "
-            "invalid duration"
+        estimated_duration = (
+            webm_path.stat().st_size * 8
+            / max(1, VIDEO_BITRATE + AUDIO_BITRATE)
+        )
+        duration = max(10, estimated_duration)
+        log(
+            "WebM duration metadata is unavailable; "
+            f"using estimated duration={duration:.1f}s for splitting"
         )
 
-    target_bytes = (
-        TELEGRAM_TARGET_SIZE_MB
-        * 1024
-        * 1024
-    )
-
-    current_bytes = (
-        mp4_path.stat().st_size
-    )
+    target_bytes = TELEGRAM_TARGET_SIZE_MB * 1024 * 1024
+    current_bytes = webm_path.stat().st_size
 
     estimated_parts = max(
         2,
-        int(
-            current_bytes
-            / target_bytes
-        ) + 1,
+        int(current_bytes / target_bytes) + 1,
     )
 
     segment_time = max(
-        30,
-        duration
-        / estimated_parts,
+        10,
+        duration / estimated_parts,
     )
 
-    log(
-        f"Splitting MP4 into approximately "
-        f"{estimated_parts} parts, "
-        f"segment_time="
-        f"{segment_time:.1f}s"
-    )
+    output_glob = f"{webm_path.stem}_part_*.webm"
 
-    output_pattern = (
-        mp4_path.parent
-        / f"{mp4_path.stem}_part_%03d.mp4"
-    )
-
-    command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-y",
-
-        "-i",
-        str(mp4_path),
-
-        "-map",
-        "0:v:0",
-
-        "-map",
-        "0:a:0?",
-
-        "-c",
-        "copy",
-
-        "-f",
-        "segment",
-
-        "-segment_time",
-        str(segment_time),
-
-        "-reset_timestamps",
-        "1",
-
-        "-movflags",
-        "+faststart",
-
-        str(output_pattern),
-    ]
-
-    result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    if result.stderr:
-        log(
-            "FFmpeg split output:\n"
-            + result.stderr.strip()
-        )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            "FFmpeg split failed:\n"
-            + result.stderr
-        )
-
-    parts = sorted(
-        mp4_path.parent.glob(
-            f"{mp4_path.stem}_part_*.mp4"
-        )
-    )
-
-    if not parts:
-        raise RuntimeError(
-            "FFmpeg split produced no parts"
-        )
-
-    valid_parts = []
-
-    for part in parts:
-        part_size_mb = (
-            part.stat().st_size
-            / (1024 * 1024)
-        )
+    for attempt in range(1, 6):
+        old_parts = sorted(webm_path.parent.glob(output_glob))
+        for old_part in old_parts:
+            try:
+                old_part.unlink()
+            except Exception:
+                pass
 
         log(
-            f"Split part: "
-            f"{part.name} "
-            f"{part_size_mb:.2f} MB"
+            f"Splitting WebM attempt {attempt}/5: "
+            f"segment_time={segment_time:.1f}s"
         )
 
-        if (
-            part_size_mb
-            > TELEGRAM_MAX_SIZE_MB
-        ):
+        output_pattern = (
+            webm_path.parent
+            / f"{webm_path.stem}_part_%03d.webm"
+        )
+
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-y",
+            "-i",
+            str(webm_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c",
+            "copy",
+            "-f",
+            "segment",
+            "-segment_time",
+            str(segment_time),
+            "-reset_timestamps",
+            "1",
+            str(output_pattern),
+        ]
+
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        if result.stderr:
             log(
-                f"WARNING: {part.name} "
-                f"is still larger than "
-                f"Telegram limit"
+                "FFmpeg WebM split output:\n"
+                + result.stderr.strip()
             )
 
-        if not verify_video_file(
-            part
-        ):
+        if result.returncode != 0:
             raise RuntimeError(
-                f"Invalid split part: "
-                f"{part}"
+                "FFmpeg WebM split failed:\n"
+                + result.stderr
             )
 
-        valid_parts.append(part)
+        parts = sorted(
+            webm_path.parent.glob(output_glob)
+        )
 
-    return valid_parts
+        if not parts:
+            raise RuntimeError("WebM split produced no parts")
+
+        oversized = False
+        valid_parts = []
+
+        for part in parts:
+            part_size_mb = part.stat().st_size / (1024 * 1024)
+            log(
+                f"WebM split part: {part.name} "
+                f"{part_size_mb:.2f} MB"
+            )
+
+            if part_size_mb > TELEGRAM_MAX_SIZE_MB:
+                oversized = True
+                break
+
+            if not verify_video_file(
+                part,
+                allow_zero_duration=True,
+            ):
+                raise RuntimeError(
+                    f"Invalid WebM split part: {part}"
+                )
+
+            valid_parts.append(part)
+
+        if not oversized:
+            return valid_parts
+
+        for part in parts:
+            try:
+                part.unlink()
+            except Exception:
+                pass
+
+        segment_time *= 0.70
+
+    raise RuntimeError(
+        "Unable to split WebM into parts below Telegram limit"
+    )
 
 
 # ============================================================
@@ -1330,8 +1269,6 @@ WEBRTC_HOOK = r"""
     window.__superliveAudioTracks = [];
     window.__superliveStreams = [];
     window.__superliveTrackLinks = new Map();
-    window.__superlivePeerConnections = [];
-    window.__superlivePeerConnectionCounter = 0;
 
     const OriginalRTCPeerConnection =
         window.RTCPeerConnection;
@@ -1399,13 +1336,6 @@ WEBRTC_HOOK = r"""
         constructor(...args) {
             super(...args);
 
-            this.__superliveId =
-                ++window.__superlivePeerConnectionCounter;
-
-            window.__superlivePeerConnections.push(
-                this
-            );
-
             this.addEventListener(
                 "track",
                 (event) => {
@@ -1446,491 +1376,202 @@ WEBRTC_HOOK = r"""
     window.RTCPeerConnection =
         WrappedRTCPeerConnection;
 
-    window.__superliveDiagnostics = () => {
-        const videos = Array.from(
-            document.querySelectorAll("video")
-        ).map((video, index) => {
-            let stream = null;
-            let rect = null;
-
-            try {
-                stream = video.srcObject || null;
-                rect = video.getBoundingClientRect();
-            } catch (e) {
-                return {
-                    index,
-                    error: String(e),
-                };
-            }
-
-            const videoTracks = stream
-                ? stream.getVideoTracks()
-                : [];
-
-            const audioTracks = stream
-                ? stream.getAudioTracks()
-                : [];
-
-            return {
-                index,
-                width: video.videoWidth,
-                height: video.videoHeight,
-                readyState: video.readyState,
-                display: (() => {
-                    try {
-                        return window.getComputedStyle(video).display;
-                    } catch (e) {
-                        return null;
-                    }
-                })(),
-                visibility: (() => {
-                    try {
-                        return window.getComputedStyle(video).visibility;
-                    } catch (e) {
-                        return null;
-                    }
-                })(),
-                rect: rect
-                    ? {
-                        x: rect.x,
-                        y: rect.y,
-                        width: rect.width,
-                        height: rect.height,
-                    }
-                    : null,
-                streamId: stream
-                    ? stream.id
-                    : null,
-                videoTracks: videoTracks.map(
-                    track => ({
-                        id: track.id,
-                        kind: track.kind,
-                        readyState: track.readyState,
-                        muted: track.muted,
-                        enabled: track.enabled,
-                        settings: (() => {
-                            try {
-                                return track.getSettings();
-                            } catch (e) {
-                                return {};
-                            }
-                        })(),
-                    })
-                ),
-                audioTracks: audioTracks.map(
-                    track => ({
-                        id: track.id,
-                        kind: track.kind,
-                        readyState: track.readyState,
-                        muted: track.muted,
-                        enabled: track.enabled,
-                    })
-                ),
-            };
-        });
-
-        const peerConnections =
-            window.__superlivePeerConnections.map(
-                pc => {
-                    let senders = [];
-                    let receivers = [];
-                    let transceivers = [];
-
-                    try {
-                        senders = pc.getSenders();
-                    } catch (e) {}
-
-                    try {
-                        receivers = pc.getReceivers();
-                    } catch (e) {}
-
-                    try {
-                        transceivers = pc.getTransceivers();
-                    } catch (e) {}
-
-                    return {
-                        id: pc.__superliveId || null,
-                        connectionState: pc.connectionState,
-                        iceConnectionState:
-                            pc.iceConnectionState,
-                        iceGatheringState:
-                            pc.iceGatheringState,
-                        signalingState:
-                            pc.signalingState,
-                        senderTracks: senders.map(
-                            sender => ({
-                                kind: sender.track
-                                    ? sender.track.kind
-                                    : null,
-                                id: sender.track
-                                    ? sender.track.id
-                                    : null,
-                                readyState: sender.track
-                                    ? sender.track.readyState
-                                    : null,
-                            })
-                        ),
-                        receiverTracks: receivers.map(
-                            receiver => ({
-                                kind: receiver.track
-                                    ? receiver.track.kind
-                                    : null,
-                                id: receiver.track
-                                    ? receiver.track.id
-                                    : null,
-                                readyState: receiver.track
-                                    ? receiver.track.readyState
-                                    : null,
-                                streams: (() => {
-                                    try {
-                                        return receiver
-                                            .getContributingSources()
-                                            .length;
-                                    } catch (e) {
-                                        return 0;
-                                    }
-                                })(),
-                            })
-                        ),
-                        transceivers: transceivers.map(
-                            transceiver => ({
-                                mid: transceiver.mid,
-                                direction:
-                                    transceiver.direction,
-                                currentDirection:
-                                    transceiver.currentDirection,
-                                senderTrackId:
-                                    transceiver.sender &&
-                                    transceiver.sender.track
-                                        ? transceiver.sender.track.id
-                                        : null,
-                                receiverTrackId:
-                                    transceiver.receiver &&
-                                    transceiver.receiver.track
-                                        ? transceiver.receiver.track.id
-                                        : null,
-                            })
-                        ),
-                    };
-                }
-            );
-
-        return {
-            url: location.href,
-            streamId: "" + (
-                window.__superliveStreamId || ""
-            ),
-            videos,
-            peerConnections,
-            rememberedVideoTracks:
-                window.__superliveVideoTracks.map(
-                    track => ({
-                        id: track.id,
-                        readyState: track.readyState,
-                    })
-                ),
-            rememberedAudioTracks:
-                window.__superliveAudioTracks.map(
-                    track => ({
-                        id: track.id,
-                        readyState: track.readyState,
-                    })
-                ),
-            rememberedStreams:
-                window.__superliveStreams.map(
-                    stream => ({
-                        id: stream.id,
-                        videoTracks:
-                            stream.getVideoTracks().map(
-                                track => track.id
-                            ),
-                        audioTracks:
-                            stream.getAudioTracks().map(
-                                track => track.id
-                            ),
-                    })
-                ),
-        };
-    };
-
     window.__superliveSelectTargetVideo = () => {
         const videos = Array.from(
-            document.querySelectorAll(
-                "video"
-            )
+            document.querySelectorAll("video")
         );
 
+        const viewportWidth =
+            window.innerWidth || document.documentElement.clientWidth || 0;
+        const viewportHeight =
+            window.innerHeight || document.documentElement.clientHeight || 0;
+
         let best = null;
-        let bestVisibleArea = 0;
 
         for (const video of videos) {
             try {
-                const stream =
-                    video.srcObject;
+                const stream = video.srcObject;
+                if (!stream) continue;
 
-                if (!stream) {
-                    continue;
-                }
+                const videoTrack = stream
+                    .getVideoTracks()
+                    .find(t => t.readyState === "live");
 
-                const videoTracks =
-                    stream.getVideoTracks();
+                if (!videoTrack) continue;
+                if (video.videoWidth <= 0 || video.videoHeight <= 0) continue;
+                if (video.readyState < 2) continue;
 
-                const liveVideoTrack =
-                    videoTracks.find(
-                        t =>
-                            t.readyState
-                            === "live"
-                    );
-
-                if (
-                    !liveVideoTrack ||
-                    video.videoWidth <= 0 ||
-                    video.videoHeight <= 0 ||
-                    video.readyState < 2
-                ) {
-                    continue;
-                }
-
-                const style =
-                    window.getComputedStyle(video);
-
+                const style = getComputedStyle(video);
                 if (
                     style.display === "none" ||
                     style.visibility === "hidden" ||
-                    Number(style.opacity) === 0
+                    style.opacity === "0"
                 ) {
                     continue;
                 }
 
-                const rect =
-                    video.getBoundingClientRect();
+                const rect = video.getBoundingClientRect();
+                const left = Math.max(0, rect.left);
+                const top = Math.max(0, rect.top);
+                const right = Math.min(viewportWidth, rect.right);
+                const bottom = Math.min(viewportHeight, rect.bottom);
 
-                const viewportWidth =
-                    window.innerWidth ||
-                    document.documentElement.clientWidth;
+                const visibleWidth = Math.max(0, right - left);
+                const visibleHeight = Math.max(0, bottom - top);
+                const visibleArea = visibleWidth * visibleHeight;
 
-                const viewportHeight =
-                    window.innerHeight ||
-                    document.documentElement.clientHeight;
+                if (visibleArea <= 0) continue;
 
-                const visibleLeft =
-                    Math.max(0, rect.left);
-                const visibleTop =
-                    Math.max(0, rect.top);
-                const visibleRight =
-                    Math.min(viewportWidth, rect.right);
-                const visibleBottom =
-                    Math.min(viewportHeight, rect.bottom);
-
-                const visibleWidth =
-                    Math.max(0, visibleRight - visibleLeft);
-                const visibleHeight =
-                    Math.max(0, visibleBottom - visibleTop);
-
-                const visibleArea =
-                    visibleWidth * visibleHeight;
-
-                if (visibleArea <= 0) {
-                    continue;
-                }
-
-                if (visibleArea > bestVisibleArea) {
+                if (!best || visibleArea > best.visibleArea) {
                     best = {
                         video,
                         stream,
-                        videoTrack: liveVideoTrack,
+                        videoTrack,
+                        visibleArea,
+                        rect,
                     };
-                    bestVisibleArea = visibleArea;
                 }
             } catch (e) {
-                console.warn(
-                    "superlive video scan error",
-                    e
-                );
+                console.warn("superlive target selection error", e);
             }
         }
 
         if (!best) {
-            window.__superliveSelectedVideo = null;
-            window.__superliveSelectedStream = null;
-            window.__superliveSelectedVideoTrack = null;
-            return null;
+            throw new Error("No visible live video target found");
         }
 
         window.__superliveSelectedVideo = best.video;
         window.__superliveSelectedStream = best.stream;
-        window.__superliveSelectedVideoTrack =
-            best.videoTrack;
+        window.__superliveSelectedVideoTrack = best.videoTrack;
 
         return {
+            index: videos.indexOf(best.video),
             width: best.video.videoWidth,
             height: best.video.videoHeight,
-            audio: best.stream
-                .getAudioTracks()
-                .some(
-                    t => t.readyState === "live"
-                )
+            visibleArea: best.visibleArea,
+            rect: {
+                x: best.rect.x,
+                y: best.rect.y,
+                width: best.rect.width,
+                height: best.rect.height,
+            },
+            trackId: best.videoTrack.id,
         };
     };
 
     window.__superlivePrepare = () => {
-        let selected = null;
-
-        const storedVideo =
+        let selectedVideo =
             window.__superliveSelectedVideo;
-
-        const storedStream =
+        let selectedStream =
             window.__superliveSelectedStream;
-
-        const storedVideoTrack =
+        let selectedVideoTrack =
             window.__superliveSelectedVideoTrack;
 
-        if (
-            storedVideo &&
-            storedStream &&
-            storedVideoTrack &&
-            storedVideo.srcObject === storedStream &&
-            storedVideoTrack.readyState === "live" &&
-            storedVideo.videoWidth > 0 &&
-            storedVideo.videoHeight > 0
-        ) {
-            selected = {
-                video: storedVideo,
-                stream: storedStream,
-                videoTrack: storedVideoTrack,
-            };
-        } else {
-            const target =
-                window.__superliveSelectTargetVideo();
-
-            if (target) {
-                selected = {
-                    video:
-                        window.__superliveSelectedVideo,
-                    stream:
-                        window.__superliveSelectedStream,
-                    videoTrack:
-                        window.__superliveSelectedVideoTrack,
-                };
-            }
-        }
-
-        if (!selected) {
-            throw new Error(
-                "No visible live video track found"
-            );
-        }
-
-        const selectedVideoTrack =
-            selected.videoTrack;
-
-        const selectedStream =
-            selected.stream;
-
-        // Record the rendered video element rather than the raw
-        // WebRTC receiver track. This follows the same decoded/rendered
-        // frame path that the user sees in the page.
-        let captureStream = null;
-        let captureVideoTrack = null;
-
         try {
-            const captureFn =
-                selected.video.captureStream
-                || selected.video.mozCaptureStream;
-
-            if (typeof captureFn === "function") {
-                captureStream =
-                    captureFn.call(
-                        selected.video,
-                        30
-                    );
-
-                captureVideoTrack =
-                    captureStream
-                        .getVideoTracks()
-                        .find(
-                            t =>
-                                t.readyState
-                                === "live"
-                        );
+            if (
+                !selectedVideoTrack ||
+                selectedVideoTrack.readyState !== "live" ||
+                !selectedVideo ||
+                !selectedStream
+            ) {
+                window.__superliveSelectTargetVideo();
+                selectedVideo = window.__superliveSelectedVideo;
+                selectedStream = window.__superliveSelectedStream;
+                selectedVideoTrack = window.__superliveSelectedVideoTrack;
             }
         } catch (e) {
-            console.warn(
-                "superlive captureStream error",
-                e
+            selectedVideo = null;
+            selectedStream = null;
+            selectedVideoTrack = null;
+        }
+
+        if (!selectedVideoTrack) {
+            selectedVideoTrack = window.__superliveVideoTracks.find(
+                t => t.readyState === "live"
             );
         }
 
-        if (!captureVideoTrack) {
-            captureVideoTrack =
-                selectedVideoTrack;
+        if (!selectedVideoTrack) {
+            throw new Error("No live video track found");
         }
 
         let selectedAudioTrack = null;
 
         if (selectedStream) {
-            selectedAudioTrack =
-                selectedStream
-                    .getAudioTracks()
-                    .find(
-                        t =>
-                            t.readyState
-                            === "live"
-                    );
+            selectedAudioTrack = selectedStream
+                .getAudioTracks()
+                .find(t => t.readyState === "live");
         }
 
         if (!selectedAudioTrack) {
-            const linkedStream =
-                window.__superliveTrackLinks.get(
-                    selectedVideoTrack
-                );
+            const linkedStream = window.__superliveTrackLinks.get(
+                selectedVideoTrack
+            );
 
             if (linkedStream) {
-                selectedAudioTrack =
-                    linkedStream
-                        .getAudioTracks()
-                        .find(
-                            t =>
-                                t.readyState
-                                === "live"
-                        );
+                selectedAudioTrack = linkedStream
+                    .getAudioTracks()
+                    .find(t => t.readyState === "live");
             }
         }
 
-
-        const tracks = [
-            captureVideoTrack
-        ];
-
-        if (selectedAudioTrack) {
-            tracks.push(
-                selectedAudioTrack
+        if (!selectedAudioTrack) {
+            selectedAudioTrack = window.__superliveAudioTracks.find(
+                t => t.readyState === "live"
             );
         }
 
-        window.__preparedStream =
-            new MediaStream(tracks);
+        let captureStream = null;
+        let captureVideoTrack = null;
 
-        window.__preparedVideoTrack =
-            captureVideoTrack;
+        if (selectedVideo) {
+            try {
+                const captureFn =
+                    selectedVideo.captureStream ||
+                    selectedVideo.mozCaptureStream;
 
-        window.__preparedAudioTrack =
-            selectedAudioTrack;
+                if (typeof captureFn === "function") {
+                    captureStream = captureFn.call(
+                        selectedVideo,
+                        30
+                    );
+
+                    captureVideoTrack = captureStream
+                        .getVideoTracks()
+                        .find(t => t.readyState === "live");
+                }
+            } catch (e) {
+                console.warn(
+                    "superlive captureStream error",
+                    e
+                );
+            }
+        }
+
+        if (!captureVideoTrack) {
+            captureVideoTrack = selectedVideoTrack;
+        }
+
+        const tracks = [captureVideoTrack];
+
+        if (selectedAudioTrack) {
+            tracks.push(selectedAudioTrack);
+        }
+
+        window.__preparedStream = new MediaStream(tracks);
+        window.__preparedVideoTrack = captureVideoTrack;
+        window.__preparedSourceVideoTrack = selectedVideoTrack;
+        window.__preparedAudioTrack = selectedAudioTrack;
 
         return {
-            hasVideo:
-                !!selectedVideoTrack,
-
-            hasAudio:
-                !!selectedAudioTrack,
-
-            videoReadyState:
-                captureVideoTrack.readyState,
-
-            audioReadyState:
-                selectedAudioTrack
-                    ? selectedAudioTrack.readyState
-                    : null
+            hasVideo: !!captureVideoTrack,
+            hasAudio: !!selectedAudioTrack,
+            videoReadyState: captureVideoTrack.readyState,
+            audioReadyState: selectedAudioTrack
+                ? selectedAudioTrack.readyState
+                : null,
+            sourceVideoTrackId: selectedVideoTrack.id,
+            recordedVideoTrackId: captureVideoTrack.id,
         };
     };
 
@@ -1949,19 +1590,19 @@ WEBRTC_HOOK = r"""
 
         if (
             MediaRecorder.isTypeSupported(
-                "video/webm;codecs=vp8,opus"
-            )
-        ) {
-            mimeType =
-                "video/webm;codecs=vp8,opus";
-
-        } else if (
-            MediaRecorder.isTypeSupported(
                 "video/webm;codecs=vp9,opus"
             )
         ) {
             mimeType =
                 "video/webm;codecs=vp9,opus";
+
+        } else if (
+            MediaRecorder.isTypeSupported(
+                "video/webm;codecs=vp8,opus"
+            )
+        ) {
+            mimeType =
+                "video/webm;codecs=vp8,opus";
 
         } else if (
             MediaRecorder.isTypeSupported(
@@ -2619,20 +2260,60 @@ async def run_recording(playwright):
                 result = await page.evaluate(
                     """
                     () => {
-                        const target =
-                            window.__superliveSelectTargetVideo();
+                        const videos =
+                            Array.from(
+                                document.querySelectorAll("video")
+                            );
 
-                        if (!target) {
-                            return {
-                                ready: false
-                            };
+                        for (const video of videos) {
+                            try {
+                                const stream =
+                                    video.srcObject;
+
+                                if (!stream) {
+                                    continue;
+                                }
+
+                                const videoTracks =
+                                    stream.getVideoTracks();
+
+                                const audioTracks =
+                                    stream.getAudioTracks();
+
+                                const liveVideo =
+                                    videoTracks.some(
+                                        t =>
+                                            t.readyState
+                                            === "live"
+                                    );
+
+                                const liveAudio =
+                                    audioTracks.some(
+                                        t =>
+                                            t.readyState
+                                            === "live"
+                                    );
+
+                                if (
+                                    video.videoWidth > 0 &&
+                                    video.videoHeight > 0 &&
+                                    liveVideo
+                                ) {
+                                    return {
+                                        ready: true,
+                                        width:
+                                            video.videoWidth,
+                                        height:
+                                            video.videoHeight,
+                                        audio:
+                                            liveAudio
+                                    };
+                                }
+                            } catch (e) {}
                         }
 
                         return {
-                            ready: true,
-                            width: target.width,
-                            height: target.height,
-                            audio: target.audio
+                            ready: false
                         };
                     }
                     """
@@ -2661,34 +2342,6 @@ async def run_recording(playwright):
         if not video_ready:
             raise RuntimeError(
                 "Live video was not detected"
-            )
-
-        # ----------------------------------------------------
-        # Temporary WebRTC diagnostics
-        # ----------------------------------------------------
-
-        try:
-            diagnostics = await page.evaluate(
-                """
-                () =>
-                    window.__superliveDiagnostics()
-                """
-            )
-
-            log_section(
-                "WEBRTC DIAGNOSTICS"
-            )
-
-            log(
-                json.dumps(
-                    diagnostics,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-            )
-        except Exception as e:
-            log(
-                f"WebRTC diagnostics error: {e}"
             )
 
         # ----------------------------------------------------
@@ -3213,37 +2866,22 @@ async def run_recording(playwright):
             )
 
         # ----------------------------------------------------
-        # Convert WebM -> MP4
+        # DIRECT WEBM TEST
+        # ----------------------------------------------------
+        #
+        # IMPORTANT:
+        # No WebM -> MP4 conversion is performed in this mode.
+        # The MediaRecorder WebM is preserved as-is so we can
+        # determine whether the MP4 conversion was causing frame
+        # loss/timestamp problems.
         # ----------------------------------------------------
 
-        convert_webm_to_mp4(
-            webm_path,
-            mp4_path,
+        log_section(
+            "DIRECT WEBM MODE (NO MP4 CONVERSION)"
         )
 
-        # ----------------------------------------------------
-        # Remove WebM only after successful conversion
-        # ----------------------------------------------------
-
-        try:
-            webm_path.unlink()
-
-            log(
-                f"Removed temporary WebM: "
-                f"{webm_path}"
-            )
-
-        except Exception as e:
-            log(
-                f"Could not remove WebM: {e}"
-            )
-
-        # ----------------------------------------------------
-        # Split if necessary
-        # ----------------------------------------------------
-
-        parts = split_mp4_if_needed(
-            mp4_path
+        parts = split_webm_if_needed(
+            webm_path
         )
 
         # ----------------------------------------------------
@@ -3261,7 +2899,7 @@ async def run_recording(playwright):
             start=1,
         ):
             caption = (
-                "🎥 Recording"
+                "🎥 Recording (WebM)"
             )
 
             if total_parts > 1:
@@ -3290,28 +2928,27 @@ async def run_recording(playwright):
             )
 
         # ----------------------------------------------------
-        # Cleanup split parts
+        # Cleanup WebM parts
         # ----------------------------------------------------
 
         for part in parts:
-            if part != mp4_path:
-                try:
+            try:
+                if part.exists():
                     part.unlink()
 
-                except Exception as e:
-                    log(
-                        f"Could not remove split part "
-                        f"{part}: {e}"
-                    )
+            except Exception as e:
+                log(
+                    f"Could not remove WebM part "
+                    f"{part}: {e}"
+                )
 
-        try:
-            if mp4_path.exists():
-                mp4_path.unlink()
-
-        except Exception as e:
-            log(
-                f"Could not remove MP4: {e}"
-            )
+        if webm_path.exists():
+            try:
+                webm_path.unlink()
+            except Exception as e:
+                log(
+                    f"Could not remove original WebM: {e}"
+                )
 
         # ----------------------------------------------------
         # State update
@@ -3363,7 +3000,7 @@ async def run_recording(playwright):
 async def main():
     log_section(
         "SUPERLIVE RECORDER "
-        "(ORDERED CHUNKS + STABLE VFR MP4)"
+        "(DIRECT WEBM + ORDERED CHUNKS)"
     )
 
     from playwright.async_api import (
