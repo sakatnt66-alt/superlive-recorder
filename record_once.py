@@ -1827,6 +1827,45 @@ WEBRTC_HOOK = r"""
         const selectedStream =
             selected.stream;
 
+        // Record the rendered video element rather than the raw
+        // WebRTC receiver track. This follows the same decoded/rendered
+        // frame path that the user sees in the page.
+        let captureStream = null;
+        let captureVideoTrack = null;
+
+        try {
+            const captureFn =
+                selected.video.captureStream
+                || selected.video.mozCaptureStream;
+
+            if (typeof captureFn === "function") {
+                captureStream =
+                    captureFn.call(
+                        selected.video,
+                        30
+                    );
+
+                captureVideoTrack =
+                    captureStream
+                        .getVideoTracks()
+                        .find(
+                            t =>
+                                t.readyState
+                                === "live"
+                        );
+            }
+        } catch (e) {
+            console.warn(
+                "superlive captureStream error",
+                e
+            );
+        }
+
+        if (!captureVideoTrack) {
+            captureVideoTrack =
+                selectedVideoTrack;
+        }
+
         let selectedAudioTrack = null;
 
         if (selectedStream) {
@@ -1860,7 +1899,7 @@ WEBRTC_HOOK = r"""
 
 
         const tracks = [
-            selectedVideoTrack
+            captureVideoTrack
         ];
 
         if (selectedAudioTrack) {
@@ -1873,7 +1912,7 @@ WEBRTC_HOOK = r"""
             new MediaStream(tracks);
 
         window.__preparedVideoTrack =
-            selectedVideoTrack;
+            captureVideoTrack;
 
         window.__preparedAudioTrack =
             selectedAudioTrack;
@@ -1886,7 +1925,7 @@ WEBRTC_HOOK = r"""
                 !!selectedAudioTrack,
 
             videoReadyState:
-                selectedVideoTrack.readyState,
+                captureVideoTrack.readyState,
 
             audioReadyState:
                 selectedAudioTrack
