@@ -2228,15 +2228,100 @@ WEBRTC_HOOK = r"""
             const start =
                 performance.now();
 
+            let nextRequestAt =
+                start + 5000;
+
             while (
                 window.__superliveChunkCount < 1
             ) {
+                const now =
+                    performance.now();
+
+                const recorder =
+                    window.__superliveRecorder;
+
                 if (
-                    performance.now()
-                    - start
+                    recorder
+                    && recorder.state !== "recording"
+                ) {
+                    return {
+                        ok: false,
+                        reason: "recorder_not_recording",
+                        chunkCount:
+                            window.__superliveChunkCount,
+                        recorderState:
+                            recorder.state,
+                        uploadError:
+                            window.__superliveUploadError
+                    };
+                }
+
+                if (now >= nextRequestAt) {
+                    try {
+                        if (
+                            recorder
+                            && recorder.state === "recording"
+                            && typeof recorder.requestData ===
+                                "function"
+                        ) {
+                            recorder.requestData();
+                        }
+                    } catch (e) {
+                        console.warn(
+                            "superlive requestData error",
+                            e
+                        );
+                    }
+
+                    nextRequestAt =
+                        now + 5000;
+                }
+
+                if (
+                    now - start
                     > timeoutMs
                 ) {
-                    return false;
+                    const video =
+                        window.__superliveSelectedVideo;
+
+                    const videoTrack =
+                        window.__preparedVideoTrack;
+
+                    return {
+                        ok: false,
+                        reason: "timeout",
+                        chunkCount:
+                            window.__superliveChunkCount,
+                        recorderState: recorder
+                            ? recorder.state
+                            : null,
+                        recorderMimeType: recorder
+                            ? recorder.mimeType
+                            : null,
+                        videoReadyState: video
+                            ? video.readyState
+                            : null,
+                        videoPaused: video
+                            ? video.paused
+                            : null,
+                        videoCurrentTime: video
+                            ? video.currentTime
+                            : null,
+                        videoWidth: video
+                            ? video.videoWidth
+                            : null,
+                        videoHeight: video
+                            ? video.videoHeight
+                            : null,
+                        videoTrackState: videoTrack
+                            ? videoTrack.readyState
+                            : null,
+                        videoTrackMuted: videoTrack
+                            ? videoTrack.muted
+                            : null,
+                        uploadError:
+                            window.__superliveUploadError
+                    };
                 }
 
                 await new Promise(
@@ -2248,7 +2333,11 @@ WEBRTC_HOOK = r"""
                 );
             }
 
-            return true;
+            return {
+                ok: true,
+                chunkCount:
+                    window.__superliveChunkCount
+            };
         };
 })();
 """
@@ -2559,13 +2648,32 @@ async def run_recording(playwright):
             """
         )
 
-        if not first_chunk:
+        if (
+            not first_chunk
+            or not first_chunk.get("ok")
+        ):
+            log(
+                "First chunk diagnostics: "
+                + json.dumps(
+                    first_chunk,
+                    ensure_ascii=False,
+                )
+            )
+
             raise RuntimeError(
-                "First recording chunk was not received within 90 seconds"
+                "First recording chunk was not received; "
+                + json.dumps(
+                    first_chunk,
+                    ensure_ascii=False,
+                )
             )
 
         log(
-            "First recording chunk received"
+            "First recording chunk received: "
+            + json.dumps(
+                first_chunk,
+                ensure_ascii=False,
+            )
         )
 
         # ----------------------------------------------------
