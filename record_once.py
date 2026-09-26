@@ -1976,8 +1976,18 @@ WEBRTC_HOOK = r"""
             captureVideoTrack.readyState !== "live"
             || captureVideoTrack.muted
         ) {
+            /*
+             * WebRTC tracks can be temporarily muted during receiver
+             * startup.  Refresh the SAME selected <video> periodically
+             * instead of aborting after the first 30 seconds.
+             *
+             * The selector itself is unchanged: it still chooses the
+             * visible target video.  We are only refreshing its current
+             * WebRTC track in case the page replaced the receiver track
+             * while the player was starting.
+             */
             const waitDeadline =
-                performance.now() + 30000;
+                performance.now() + 60000;
 
             while (
                 performance.now() < waitDeadline
@@ -1990,17 +2000,43 @@ WEBRTC_HOOK = r"""
             ) {
                 await new Promise(
                     resolve =>
-                        setTimeout(resolve, 500)
+                        setTimeout(resolve, 1000)
                 );
+
+                try {
+                    window.__superliveSelectTargetVideo();
+                    selectedVideo =
+                        window.__superliveSelectedVideo;
+                    selectedStream =
+                        window.__superliveSelectedStream;
+                    selectedVideoTrack =
+                        window.__superliveSelectedVideoTrack;
+
+                    if (selectedVideoTrack) {
+                        const refreshedAudio = selectedStream
+                            ? selectedStream
+                                .getAudioTracks()
+                                .find(t => t.readyState === "live")
+                            : null;
+
+                        if (refreshedAudio) {
+                            selectedAudioTrack =
+                                refreshedAudio;
+                        }
+                    }
+                } catch (e) {
+                    // Keep waiting for the already-selected target.
+                }
             }
 
             if (
-                selectedVideoTrack.readyState
+                !selectedVideoTrack
+                || selectedVideoTrack.readyState
                     !== "live"
                 || selectedVideoTrack.muted
             ) {
                 throw new Error(
-                    "Selected WebRTC video track remained muted; no video frames are available"
+                    "Selected WebRTC video track remained muted after 60s; no video frames are available"
                 );
             }
 
