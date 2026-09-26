@@ -1621,7 +1621,7 @@ WEBRTC_HOOK = r"""
         };
     };
 
-    window.__superlivePrepare = () => {
+    window.__superlivePrepare = async () => {
         let selectedVideo =
             window.__superliveSelectedVideo;
         let selectedStream =
@@ -1716,10 +1716,13 @@ WEBRTC_HOOK = r"""
          * frames.  MediaRecorder can then stay in "recording"
          * forever without producing a single dataavailable event.
          *
-         * In that case, use the original WebRTC track instead.
-         * This keeps captureStream() as the preferred path when
-         * it is genuinely carrying video, while avoiding the
-         * zero-frame failure mode.
+         * The original WebRTC track can also be temporarily muted
+         * while the receiver is still starting.  Do not start the
+         * recorder in that state: wait for the SAME selected track
+         * to become unmuted, then prepare the recorder from it.
+         *
+         * This does not change stream selection.  It only waits for
+         * the already-selected video source to actually carry frames.
          */
         if (
             !captureVideoTrack
@@ -1733,6 +1736,42 @@ WEBRTC_HOOK = r"""
             }
 
             captureVideoTrack = selectedVideoTrack;
+        }
+
+        if (
+            captureVideoTrack.readyState !== "live"
+            || captureVideoTrack.muted
+        ) {
+            const waitDeadline =
+                performance.now() + 30000;
+
+            while (
+                performance.now() < waitDeadline
+                &&
+                (
+                    selectedVideoTrack.readyState
+                        !== "live"
+                    || selectedVideoTrack.muted
+                )
+            ) {
+                await new Promise(
+                    resolve =>
+                        setTimeout(resolve, 500)
+                );
+            }
+
+            if (
+                selectedVideoTrack.readyState
+                    !== "live"
+                || selectedVideoTrack.muted
+            ) {
+                throw new Error(
+                    "Selected WebRTC video track remained muted; no video frames are available"
+                );
+            }
+
+            captureVideoTrack =
+                selectedVideoTrack;
         }
 
         const tracks = [captureVideoTrack];
