@@ -3309,6 +3309,27 @@ async def run_recording(playwright):
                         )
                     )
 
+                    try:
+                        webrtc_diag = await page.evaluate(
+                            """
+                            () =>
+                                window.__superliveGetWebRTCStats
+                                    ? window.__superliveGetWebRTCStats()
+                                    : null
+                            """
+                        )
+                        log(
+                            "WebRTC inbound video stats: "
+                            + json.dumps(
+                                webrtc_diag,
+                                ensure_ascii=False,
+                            )
+                        )
+                    except Exception as e:
+                        log(
+                            f"WebRTC stats diagnostic error: {e}"
+                        )
+
                     last_status_log = (
                         time.monotonic()
                     )
