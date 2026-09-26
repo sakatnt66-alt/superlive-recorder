@@ -1876,6 +1876,8 @@ WEBRTC_HOOK = r"""
     window.__superliveAudioTracks = [];
     window.__superliveStreams = [];
     window.__superliveTrackLinks = new Map();
+    window.__superliveTrackPeers = new WeakMap();
+    window.__superliveTrackStreams = new WeakMap();
     window.__superlivePeerConnections = [];
 
     const OriginalRTCPeerConnection =
@@ -1952,6 +1954,11 @@ WEBRTC_HOOK = r"""
                     try {
                         const track =
                             event.track;
+
+                        window.__superliveTrackPeers.set(
+                            track,
+                            this
+                        );
 
                         const streams =
                             event.streams || [];
@@ -2275,6 +2282,41 @@ WEBRTC_HOOK = r"""
             }
         };
 
+        const getPeerAudioCandidates = () => {
+            const candidates = [];
+            const peer =
+                window.__superliveTrackPeers.get(
+                    selectedVideoTrack
+                );
+
+            if (!peer) {
+                return candidates;
+            }
+
+            try {
+                for (const receiver of peer.getReceivers()) {
+                    const track = receiver && receiver.track;
+
+                    if (
+                        !track
+                        || track.kind !== "audio"
+                        || track.readyState !== "live"
+                    ) {
+                        continue;
+                    }
+
+                    candidates.push(track);
+                }
+            } catch (e) {
+                console.warn(
+                    "superlive peer audio receiver lookup error",
+                    e
+                );
+            }
+
+            return candidates;
+        };
+
         const collectAssociatedAudio = () => {
             audioCandidates.length = 0;
 
@@ -2299,6 +2341,17 @@ WEBRTC_HOOK = r"""
              * remembered stream, but ONLY when that stream contains
              * the exact selected video track.
              */
+            /*
+             * Some players expose video and audio on different
+             * MediaStream objects even though both tracks belong to
+             * the SAME RTCPeerConnection.  Inspect only receivers on
+             * the PeerConnection that delivered the selected video.
+             * Never use page-global audio here.
+             */
+            for (const track of getPeerAudioCandidates()) {
+                addAudioCandidate(track);
+            }
+
             for (const stream of window.__superliveStreams) {
                 try {
                     const hasSelectedVideo =
@@ -2337,8 +2390,14 @@ WEBRTC_HOOK = r"""
 
         let selectedAudioTrack =
             audioCandidates.find(t => !t.muted)
-            || audioCandidates[0]
             || null;
+
+        if (!selectedAudioTrack) {
+            selectedAudioTrack =
+                getPeerAudioCandidates().find(
+                    t => !t.muted
+                ) || null;
+        }
 
         if (!selectedAudioTrack) {
             throw new Error(
@@ -2443,11 +2502,24 @@ WEBRTC_HOOK = r"""
                         window.__superliveSelectedVideoTrack;
 
                     if (selectedVideoTrack) {
-                        const refreshedAudio = selectedStream
+                        const refreshedStreamAudio = selectedStream
                             ? selectedStream
                                 .getAudioTracks()
-                                .find(t => t.readyState === "live")
+                                .find(
+                                    t =>
+                                        t.readyState === "live"
+                                        && !t.muted
+                                )
                             : null;
+
+                        const refreshedPeerAudio =
+                            getPeerAudioCandidates().find(
+                                t => !t.muted
+                            ) || null;
+
+                        const refreshedAudio =
+                            refreshedStreamAudio
+                            || refreshedPeerAudio;
 
                         if (refreshedAudio) {
                             selectedAudioTrack =
