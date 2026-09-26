@@ -1105,21 +1105,45 @@ def convert_webm_to_mp4(
 # ============================================================
 
 def split_webm_if_needed(webm_path):
-    """Split WebM without re-encoding and keep every part below Telegram's limit."""
+    """
+    Split WebM by remuxing only; never re-encode and never accept
+    a split if any source video/audio packet disappears.
+
+    The local limit is intentionally below Telegram's 50 MB limit
+    so HTTP/multipart overhead cannot push a part over the API limit.
+    """
     webm_path = Path(webm_path)
 
     size_mb = webm_path.stat().st_size / (1024 * 1024)
     log(f"WebM size: {size_mb:.2f} MB")
 
-    if size_mb <= TELEGRAM_MAX_SIZE_MB:
+    if size_mb <= TELEGRAM_TARGET_SIZE_MB:
         return [webm_path]
 
     info = get_video_info(webm_path)
     duration = get_duration(info)
 
+    source_video_packets = get_video_packet_count(info)
+    source_audio_packets = 0
+
+    if info:
+        for stream in info.get("streams", []):
+            if stream.get("codec_type") != "audio":
+                continue
+            try:
+                source_audio_packets += int(
+                    stream.get("nb_frames") or 0
+                )
+            except Exception:
+                pass
+
+    log(
+        "Source WebM packets: "
+        f"video={source_video_packets} "
+        f"audio={source_audio_packets}"
+    )
+
     # MediaRecorder WebM can have missing container duration metadata.
-    # Use the configured recording bitrate as a conservative estimate,
-    # then verify actual part sizes and retry with shorter segments if needed.
     if duration <= 1:
         estimated_duration = (
             webm_path.stat().st_size * 8
@@ -1131,6 +1155,7 @@ def split_webm_if_needed(webm_path):
             f"using estimated duration={duration:.1f}s for splitting"
         )
 
+    # Keep the target comfortably below Telegram's 50 MB limit.
     target_bytes = TELEGRAM_TARGET_SIZE_MB * 1024 * 1024
     current_bytes = webm_path.stat().st_size
 
@@ -1146,8 +1171,10 @@ def split_webm_if_needed(webm_path):
 
     output_glob = f"{webm_path.stem}_part_*.webm"
 
-    for attempt in range(1, 6):
-        old_parts = sorted(webm_path.parent.glob(output_glob))
+    for attempt in range(1, 7):
+        old_parts = sorted(
+            webm_path.parent.glob(output_glob)
+        )
         for old_part in old_parts:
             try:
                 old_part.unlink()
@@ -1155,7 +1182,7 @@ def split_webm_if_needed(webm_path):
                 pass
 
         log(
-            f"Splitting WebM attempt {attempt}/5: "
+            f"Splitting WebM attempt {attempt}/6: "
             f"segment_time={segment_time:.1f}s"
         )
 
@@ -1178,12 +1205,19 @@ def split_webm_if_needed(webm_path):
             "0:a:0?",
             "-c",
             "copy",
+            "-copyts",
+            "-avoid_negative_ts",
+            "disabled",
             "-f",
             "segment",
             "-segment_time",
             str(segment_time),
+            "-segment_time_delta",
+            "1.0",
             "-reset_timestamps",
             "1",
+            "-segment_format",
+            "webm",
             str(output_pattern),
         ]
 
@@ -1211,13 +1245,21 @@ def split_webm_if_needed(webm_path):
         )
 
         if not parts:
-            raise RuntimeError("WebM split produced no parts")
+            raise RuntimeError(
+                "WebM split produced no parts"
+            )
 
         oversized = False
         valid_parts = []
+        total_video_packets = 0
+        total_audio_packets = 0
 
         for part in parts:
-            part_size_mb = part.stat().st_size / (1024 * 1024)
+            part_size_mb = (
+                part.stat().st_size
+                / (1024 * 1024)
+            )
+
             log(
                 f"WebM split part: {part.name} "
                 f"{part_size_mb:.2f} MB"
@@ -1225,7 +1267,14 @@ def split_webm_if_needed(webm_path):
 
             if part_size_mb > TELEGRAM_MAX_SIZE_MB:
                 oversized = True
+                log(
+                    f"WARNING: {part.name} exceeds the "
+                    f"absolute Telegram safety limit of "
+                    f"{TELEGRAM_MAX_SIZE_MB:.2f} MB"
+                )
                 break
+
+            part_info = get_video_info(part)
 
             if not verify_video_file(
                 part,
@@ -1235,21 +1284,95 @@ def split_webm_if_needed(webm_path):
                     f"Invalid WebM split part: {part}"
                 )
 
+            part_video_packets = get_video_packet_count(
+                part_info
+            )
+            total_video_packets += part_video_packets
+
+            if part_info:
+                for stream in part_info.get("streams", []):
+                    if stream.get("codec_type") != "audio":
+                        continue
+                    try:
+                        total_audio_packets += int(
+                            stream.get("nb_frames") or 0
+                        )
+                    except Exception:
+                        pass
+
             valid_parts.append(part)
 
-        if not oversized:
-            return valid_parts
+        if oversized:
+            for part in parts:
+                try:
+                    part.unlink()
+                except Exception:
+                    pass
 
-        for part in parts:
-            try:
-                part.unlink()
-            except Exception:
-                pass
+            segment_time *= 0.70
+            continue
 
-        segment_time *= 0.70
+        # ----------------------------------------------------
+        # HARD INTEGRITY CHECK
+        # ----------------------------------------------------
+        # Stream-copy splitting must not lose packets. If ffprobe
+        # can count them, require an exact aggregate match before
+        # anything is uploaded to Telegram.
+        # ----------------------------------------------------
+
+        if (
+            source_video_packets > 0
+            and total_video_packets
+            != source_video_packets
+        ):
+            log(
+                "WebM split integrity failure: "
+                f"source video packets={source_video_packets}, "
+                f"split video packets={total_video_packets}"
+            )
+
+            for part in parts:
+                try:
+                    part.unlink()
+                except Exception:
+                    pass
+
+            segment_time *= 0.85
+            continue
+
+        if (
+            source_audio_packets > 0
+            and total_audio_packets
+            != source_audio_packets
+        ):
+            log(
+                "WebM split integrity failure: "
+                f"source audio packets={source_audio_packets}, "
+                f"split audio packets={total_audio_packets}"
+            )
+
+            for part in parts:
+                try:
+                    part.unlink()
+                except Exception:
+                    pass
+
+            segment_time *= 0.85
+            continue
+
+        log(
+            "WebM split integrity verified: "
+            f"video={total_video_packets}/"
+            f"{source_video_packets} "
+            f"audio={total_audio_packets}/"
+            f"{source_audio_packets}"
+        )
+
+        return valid_parts
 
     raise RuntimeError(
-        "Unable to split WebM into parts below Telegram limit"
+        "Unable to split WebM safely below Telegram limit "
+        "without losing packets"
     )
 
 
