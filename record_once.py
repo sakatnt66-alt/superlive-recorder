@@ -1369,7 +1369,218 @@ def convert_webm_to_mp4(
 
 
 # ============================================================
-# SPLIT MP4
+# AUDIO FILE VERIFICATION
+# ============================================================
+
+def verify_audio_file(path):
+    path = Path(path)
+
+    if not path.exists() or path.stat().st_size <= 4096:
+        log(
+            f"Audio verification failed: file missing/too small: {path}"
+        )
+        return False
+
+    info = get_video_info(path)
+
+    if not info:
+        log(
+            "Audio verification failed: ffprobe information unavailable"
+        )
+        return False
+
+    audio_streams = [
+        stream
+        for stream in info.get("streams", [])
+        if stream.get("codec_type") == "audio"
+    ]
+
+    if not audio_streams:
+        log(
+            "Audio verification failed: no audio stream"
+        )
+        return False
+
+    audio_packets = get_audio_packet_count(info)
+    codec = audio_streams[0].get("codec_name")
+
+    log(
+        "Verified audio: "
+        f"{path.stat().st_size / (1024 * 1024):.2f} MB, "
+        f"codec={codec}, "
+        f"audio_packets={audio_packets}"
+    )
+
+    if not codec or audio_packets <= 0:
+        log(
+            "Audio verification failed: codec or packet count unavailable"
+        )
+        return False
+
+    return True
+
+
+# ============================================================
+# LOSSLESS WEBM VIDEO + AUDIO MUX
+# ============================================================
+
+def mux_webm_video_audio(
+    video_path,
+    audio_path,
+    output_path,
+):
+    """
+    Combine independently recorded WebM video and Opus audio
+    without re-encoding either stream.
+
+    Safety rules:
+      * Video packets must be preserved exactly.
+      * Audio packets must be preserved exactly.
+      * The output must contain both streams.
+      * Any packet-count mismatch is a hard failure.
+
+    No CFR conversion, timestamp regeneration, or re-encoding is
+    performed here.
+    """
+    video_path = Path(video_path)
+    audio_path = Path(audio_path)
+    output_path = Path(output_path)
+
+    if not video_path.exists():
+        raise FileNotFoundError(video_path)
+
+    if not audio_path.exists():
+        raise FileNotFoundError(audio_path)
+
+    video_info = get_video_info(video_path)
+    audio_info = get_video_info(audio_path)
+
+    if not video_info or not audio_info:
+        raise RuntimeError(
+            "Unable to inspect independent WebM streams before muxing"
+        )
+
+    source_video_packets = get_video_packet_count(video_info)
+    source_audio_packets = get_audio_packet_count(audio_info)
+
+    if source_video_packets <= 0:
+        raise RuntimeError(
+            "Independent video WebM contains no countable video packets"
+        )
+
+    if source_audio_packets <= 0:
+        raise RuntimeError(
+            "Independent audio WebM contains no countable audio packets"
+        )
+
+    log(
+        "Independent WebM packet counts before mux: "
+        f"video={source_video_packets} "
+        f"audio={source_audio_packets}"
+    )
+
+    if output_path.exists():
+        output_path.unlink()
+
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-y",
+        "-copyts",
+        "-i",
+        str(video_path),
+        "-copyts",
+        "-i",
+        str(audio_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "disabled",
+        "-f",
+        "webm",
+        str(output_path),
+    ]
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=300,
+    )
+
+    if result.stderr:
+        log(
+            "FFmpeg WebM mux output:\n"
+            + result.stderr.strip()
+        )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Lossless WebM video/audio mux failed:\n"
+            + result.stderr
+        )
+
+    if not output_path.exists() or output_path.stat().st_size <= 10 * 1024:
+        raise RuntimeError(
+            "Lossless WebM mux produced an invalid/empty output"
+        )
+
+    output_info = get_video_info(output_path)
+    if not output_info:
+        raise RuntimeError(
+            "Unable to inspect muxed WebM output"
+        )
+
+    output_video_packets = get_video_packet_count(output_info)
+    output_audio_packets = get_audio_packet_count(output_info)
+
+    log(
+        "Muxed WebM packet counts: "
+        f"video={output_video_packets}/{source_video_packets} "
+        f"audio={output_audio_packets}/{source_audio_packets}"
+    )
+
+    if output_video_packets != source_video_packets:
+        raise RuntimeError(
+            "Video packet loss/change detected during WebM mux: "
+            f"source={source_video_packets}, "
+            f"output={output_video_packets}"
+        )
+
+    if output_audio_packets != source_audio_packets:
+        raise RuntimeError(
+            "Audio packet loss/change detected during WebM mux: "
+            f"source={source_audio_packets}, "
+            f"output={output_audio_packets}"
+        )
+
+    streams = output_info.get("streams", [])
+    has_video = any(
+        stream.get("codec_type") == "video"
+        for stream in streams
+    )
+    has_audio = any(
+        stream.get("codec_type") == "audio"
+        for stream in streams
+    )
+
+    if not has_video or not has_audio:
+        raise RuntimeError(
+            "Muxed WebM does not contain both video and audio streams"
+        )
+
+    return output_path
+
+
+# ============================================================
+# SPLIT WEBM
 # ============================================================
 
 def split_webm_if_needed(webm_path):
@@ -2220,6 +2431,52 @@ WEBRTC_HOOK = r"""
             });
         };
 
+        /*
+         * FINAL RECORDING STRATEGY:
+         *
+         * Do not put audio and video into the same MediaRecorder.
+         * The live tests proved that Chromium can enter
+         * `recording` forever when this particular WebRTC audio
+         * track is present, while video-only recording works.
+         *
+         * Video is therefore recorded independently from the
+         * selected WebRTC/capture video source. Audio is recorded
+         * independently and muxed losslessly after capture.
+         *
+         * Prefer the original WebRTC video first because its
+         * inbound stats show ~25-30 decoded FPS, whereas the
+         * rendered <video> callback was ~17-19 FPS.
+         */
+
+        addRecordingCandidate(
+            "webrtc-video-only",
+            selectedVideoTrack,
+            null
+        );
+
+        addRecordingCandidate(
+            "webrtc-video-only-clone",
+            selectedVideoTrack,
+            null,
+            true
+        );
+
+        if (
+            captureVideoTrack
+            && captureVideoTrack.readyState === "live"
+            && !captureVideoTrack.muted
+        ) {
+            addRecordingCandidate(
+                "capture-video-only",
+                captureVideoTrack,
+                null
+            );
+        }
+
+        /* Keep AV candidates available for diagnostics/fallback on
+         * browsers where combined recording actually works. They
+         * are intentionally placed last so they can never delay the
+         * normal video+audio dual-recorder path. */
         if (
             captureVideoTrack
             && captureVideoTrack.readyState === "live"
@@ -2242,31 +2499,6 @@ WEBRTC_HOOK = r"""
             "webrtc-av-clone",
             selectedVideoTrack,
             selectedAudioTrack,
-            true
-        );
-
-        if (
-            captureVideoTrack
-            && captureVideoTrack.readyState === "live"
-            && !captureVideoTrack.muted
-        ) {
-            addRecordingCandidate(
-                "capture-video-only",
-                captureVideoTrack,
-                null
-            );
-        }
-
-        addRecordingCandidate(
-            "webrtc-video-only",
-            selectedVideoTrack,
-            null
-        );
-
-        addRecordingCandidate(
-            "webrtc-video-only-clone",
-            selectedVideoTrack,
-            null,
             true
         );
 
@@ -2959,13 +3191,371 @@ WEBRTC_HOOK = r"""
         };
     };
 
+    /* ========================================================
+     * INDEPENDENT AUDIO RECORDER
+     * ========================================================
+     *
+     * Audio is intentionally recorded separately from video.
+     * Some Chromium/WebRTC combinations can leave an AV
+     * MediaRecorder in "recording" without ever emitting data,
+     * while the same video track records correctly by itself.
+     *
+     * The audio WebM is therefore captured independently and later
+     * muxed into the video WebM with stream copy. Packet counts are
+     * checked before anything is uploaded.
+     */
+
+    window.__superliveAudioRecorder = null;
+    window.__superliveAudioAttemptId = null;
+    window.__superliveAudioChunkCount = 0;
+    window.__superliveAudioUploadedChunkCount = 0;
+    window.__superliveAudioUploadQueue = [];
+    window.__superliveAudioIsUploading = false;
+    window.__superliveAudioUploadError = null;
+    window.__superliveAudioLastChunkAt = 0;
+    window.__superliveAudioStopFired = false;
+    window.__superliveAudioPendingDataTasks = 0;
+    window.__superliveAudioFinalDataReady = false;
+    window.__superliveAudioFinalDataResolve = null;
+    window.__superliveAudioFinalDataPromise = null;
+
+    window.__superliveStartAudioRec = (
+        audioBitrate,
+        timeslice,
+        attemptId = "audio-default"
+    ) => {
+        const sourceAudioTrack =
+            window.__preparedAudioTrack;
+
+        if (
+            !sourceAudioTrack
+            || sourceAudioTrack.readyState !== "live"
+            || sourceAudioTrack.muted
+        ) {
+            throw new Error(
+                "Selected audio track is not live/unmuted"
+            );
+        }
+
+        let audioTrack = sourceAudioTrack;
+
+        try {
+            audioTrack = sourceAudioTrack.clone();
+        } catch (e) {
+            console.warn(
+                "superlive audio clone failed; using source track",
+                e
+            );
+        }
+
+        const audioStream =
+            new MediaStream([audioTrack]);
+
+        let mimeType = "";
+
+        if (
+            MediaRecorder.isTypeSupported(
+                "audio/webm;codecs=opus"
+            )
+        ) {
+            mimeType =
+                "audio/webm;codecs=opus";
+        } else if (
+            MediaRecorder.isTypeSupported(
+                "audio/webm"
+            )
+        ) {
+            mimeType = "audio/webm";
+        } else {
+            throw new Error(
+                "No supported audio WebM MediaRecorder MIME type"
+            );
+        }
+
+        const recorder =
+            new MediaRecorder(
+                audioStream,
+                {
+                    mimeType,
+                    audioBitsPerSecond: audioBitrate
+                }
+            );
+
+        window.__superliveAudioRecorder = recorder;
+        window.__superliveAudioAttemptId = attemptId;
+        window.__superliveAudioChunkCount = 0;
+        window.__superliveAudioUploadedChunkCount = 0;
+        window.__superliveAudioUploadQueue = [];
+        window.__superliveAudioIsUploading = false;
+        window.__superliveAudioUploadError = null;
+        window.__superliveAudioLastChunkAt = performance.now();
+        window.__superliveAudioStopFired = false;
+        window.__superliveAudioPendingDataTasks = 0;
+        window.__superliveAudioFinalDataReady = false;
+        window.__superliveAudioFinalDataResolve = null;
+        window.__superliveAudioFinalDataPromise =
+            new Promise((resolve) => {
+                window.__superliveAudioFinalDataResolve = resolve;
+            });
+
+        async function processAudioQueue() {
+            if (window.__superliveAudioIsUploading) {
+                return;
+            }
+
+            window.__superliveAudioIsUploading = true;
+
+            try {
+                while (
+                    window.__superliveAudioUploadQueue.length
+                ) {
+                    const item =
+                        window.__superliveAudioUploadQueue.shift();
+
+                    try {
+                        let success = false;
+                        let lastError = null;
+
+                        for (let attempt = 1; attempt <= 3; attempt++) {
+                            try {
+                                const response = await fetch(
+                                    "/__slr_audio_chunk",
+                                    {
+                                        method: "POST",
+                                        body: item.blob
+                                    }
+                                );
+
+                                if (!response.ok) {
+                                    throw new Error(
+                                        "HTTP " + response.status
+                                    );
+                                }
+
+                                success = true;
+                                break;
+                            } catch (e) {
+                                lastError = e;
+                                await new Promise(
+                                    resolve => setTimeout(resolve, 250 * attempt)
+                                );
+                            }
+                        }
+
+                        if (!success) {
+                            window.__superliveAudioUploadError =
+                                String(lastError || "audio upload failed");
+                            window.__superliveAudioUploadQueue.unshift(item);
+                            break;
+                        }
+
+                        window.__superliveAudioUploadedChunkCount++;
+                    } catch (e) {
+                        window.__superliveAudioUploadError = String(e);
+                        window.__superliveAudioUploadQueue.unshift(item);
+                        break;
+                    }
+                }
+            } finally {
+                window.__superliveAudioIsUploading = false;
+
+                if (window.__superliveAudioUploadQueue.length) {
+                    setTimeout(
+                        () => processAudioQueue(),
+                        250
+                    );
+                }
+
+                window.__superliveMaybeResolveAudioFinal();
+            }
+        }
+
+        window.__superliveMaybeResolveAudioFinal = () => {
+            if (
+                window.__superliveAudioStopFired
+                && window.__superliveAudioPendingDataTasks === 0
+                && window.__superliveAudioUploadQueue.length === 0
+                && !window.__superliveAudioIsUploading
+                && !window.__superliveAudioFinalDataReady
+            ) {
+                window.__superliveAudioFinalDataReady = true;
+                const resolve =
+                    window.__superliveAudioFinalDataResolve;
+                window.__superliveAudioFinalDataResolve = null;
+                if (resolve) {
+                    resolve(true);
+                }
+            }
+        };
+
+        recorder.ondataavailable = (event) => {
+            if (
+                attemptId
+                !== window.__superliveAudioAttemptId
+            ) {
+                return;
+            }
+
+            window.__superliveAudioPendingDataTasks++;
+
+            try {
+                if (
+                    event.data
+                    && event.data.size > 0
+                ) {
+                    window.__superliveAudioChunkCount++;
+                    window.__superliveAudioLastChunkAt =
+                        performance.now();
+                    window.__superliveAudioUploadQueue.push({
+                        blob: event.data
+                    });
+                }
+            } catch (e) {
+                window.__superliveAudioUploadError = String(e);
+            } finally {
+                window.__superliveAudioPendingDataTasks--;
+                processAudioQueue();
+                window.__superliveMaybeResolveAudioFinal();
+            }
+        };
+
+        recorder.onerror = (event) => {
+            window.__superliveAudioUploadError =
+                "Audio MediaRecorder error";
+            console.error(
+                "superlive audio MediaRecorder error",
+                event
+            );
+        };
+
+        recorder.onstop = () => {
+            window.__superliveAudioStopFired = true;
+            window.__superliveMaybeResolveAudioFinal();
+        };
+
+        recorder.start(timeslice);
+
+        return {
+            mimeType,
+            state: recorder.state,
+            trackId: audioTrack.id,
+            sourceTrackId: sourceAudioTrack.id
+        };
+    };
+
+    window.__superliveWaitAudioChunk = async (timeoutMs) => {
+        const start = performance.now();
+
+        while (
+            window.__superliveAudioChunkCount < 1
+        ) {
+            const recorder =
+                window.__superliveAudioRecorder;
+
+            if (
+                recorder
+                && recorder.state !== "recording"
+            ) {
+                return {
+                    ok: false,
+                    reason: "recorder_not_recording",
+                    chunkCount: window.__superliveAudioChunkCount,
+                    recorderState: recorder.state,
+                    error: window.__superliveAudioUploadError
+                };
+            }
+
+            if (performance.now() - start > timeoutMs) {
+                return {
+                    ok: false,
+                    reason: "timeout",
+                    chunkCount: window.__superliveAudioChunkCount,
+                    recorderState: recorder
+                        ? recorder.state
+                        : null,
+                    error: window.__superliveAudioUploadError,
+                    trackState:
+                        window.__preparedAudioTrack
+                            ? window.__preparedAudioTrack.readyState
+                            : null,
+                    trackMuted:
+                        window.__preparedAudioTrack
+                            ? window.__preparedAudioTrack.muted
+                            : null
+                };
+            }
+
+            await new Promise(
+                resolve => setTimeout(resolve, 100)
+            );
+        }
+
+        return {
+            ok: true,
+            chunkCount: window.__superliveAudioChunkCount
+        };
+    };
+
+    window.__superliveStopAudioRec = () => {
+        const recorder = window.__superliveAudioRecorder;
+
+        if (
+            recorder
+            && recorder.state !== "inactive"
+        ) {
+            recorder.stop();
+            return true;
+        }
+
+        window.__superliveAudioStopFired = true;
+        window.__superliveMaybeResolveAudioFinal();
+        return false;
+    };
+
+    window.__superliveWaitAudioFinal = async (timeoutMs) => {
+        if (window.__superliveAudioFinalDataReady) {
+            return true;
+        }
+
+        const timeoutPromise = new Promise(
+            resolve => setTimeout(() => resolve(false), timeoutMs)
+        );
+
+        const result = await Promise.race([
+            window.__superliveAudioFinalDataPromise,
+            timeoutPromise
+        ]);
+
+        return result === true;
+    };
+
+    window.__superliveGetAudioStatus = () => ({
+        chunkCount: window.__superliveAudioChunkCount,
+        uploadedChunkCount:
+            window.__superliveAudioUploadedChunkCount,
+        queueLength:
+            window.__superliveAudioUploadQueue.length,
+        isUploading:
+            window.__superliveAudioIsUploading,
+        uploadError:
+            window.__superliveAudioUploadError,
+        pendingDataTasks:
+            window.__superliveAudioPendingDataTasks,
+        recorderState:
+            window.__superliveAudioRecorder
+                ? window.__superliveAudioRecorder.state
+                : null,
+        finalDataReady:
+            window.__superliveAudioFinalDataReady
+    });
+
     window.__superliveWaitChunk =
         async (timeoutMs) => {
             const start =
                 performance.now();
 
             let nextRequestAt =
-                start + 5000;
+                start + 1500;
 
             while (
                 window.__superliveChunkCount < 1
@@ -3018,7 +3608,7 @@ WEBRTC_HOOK = r"""
                     }
 
                     nextRequestAt =
-                        now + 5000;
+                        now + 1500;
                 }
 
                 if (
@@ -3169,16 +3759,35 @@ async def run_recording(playwright):
         / f"recording_{timestamp}.webm"
     )
 
+    audio_webm_path = (
+        TEMP_DIR
+        / f"recording_{timestamp}_audio.webm"
+    )
+
+    muxed_webm_path = (
+        TEMP_DIR
+        / f"recording_{timestamp}_av.webm"
+    )
+
     mp4_path = (
         RECORDING_DIR
         / f"recording_{timestamp}.mp4"
     )
 
     webm_file = None
+    audio_webm_file = None
+
+    audio_chunk_count = 0
+    audio_total_bytes = 0
 
     try:
         webm_file = open(
             webm_path,
+            "wb",
+        )
+
+        audio_webm_file = open(
+            audio_webm_path,
             "wb",
         )
 
@@ -3219,9 +3828,48 @@ async def run_recording(playwright):
                 except Exception:
                     pass
 
+        async def handle_audio_chunk(
+            route,
+            request,
+        ):
+            nonlocal audio_chunk_count
+            nonlocal audio_total_bytes
+
+            try:
+                body = request.post_data_buffer
+
+                if body:
+                    audio_webm_file.write(body)
+                    audio_webm_file.flush()
+                    audio_chunk_count += 1
+                    audio_total_bytes += len(body)
+
+                await route.fulfill(
+                    status=200,
+                    body=b"OK",
+                )
+
+            except Exception as e:
+                log(
+                    f"Audio chunk handler error: {e}"
+                )
+
+                try:
+                    await route.fulfill(
+                        status=500,
+                        body=b"ERROR",
+                    )
+                except Exception:
+                    pass
+
         await page.route(
             "**/__slr_chunk",
             handle_chunk,
+        )
+
+        await page.route(
+            "**/__slr_audio_chunk",
+            handle_audio_chunk,
         )
 
         log_section(
@@ -3433,9 +4081,20 @@ async def run_recording(playwright):
             + json.dumps(candidates, ensure_ascii=False)
         )
 
+        candidates = [
+            candidate
+            for candidate in candidates
+            if not candidate.get("hasAudio")
+        ]
+
+        log(
+            "Video-only recorder candidates selected: "
+            + json.dumps(candidates, ensure_ascii=False)
+        )
+
         if not candidates:
             raise RuntimeError(
-                "No usable recording candidates were created"
+                "No usable video-only recording candidates were created"
             )
 
         first_chunk = None
@@ -3471,7 +4130,7 @@ async def run_recording(playwright):
 
             attempt_result = await page.evaluate(
                 """
-                () => window.__superliveWaitChunk(10000)
+                () => window.__superliveWaitChunk(4000)
                 """
             )
 
@@ -3530,6 +4189,78 @@ async def run_recording(playwright):
             "First recording chunk received: "
             + json.dumps(first_chunk, ensure_ascii=False)
         )
+
+        # ----------------------------------------------------
+        # Start independent audio recorder
+        # ----------------------------------------------------
+
+        audio_expected = bool(
+            prepared.get("hasAudio")
+        )
+
+        audio_first_chunk = None
+
+        if audio_expected:
+            audio_attempt_id = (
+                f"audio-{time.monotonic_ns()}"
+            )
+
+            try:
+                audio_start_result = await page.evaluate(
+                    """
+                    ([audioBitrate, timeslice, attemptId]) =>
+                        window.__superliveStartAudioRec(
+                            audioBitrate,
+                            timeslice,
+                            attemptId
+                        )
+                    """,
+                    [
+                        AUDIO_BITRATE,
+                        1000,
+                        audio_attempt_id,
+                    ],
+                )
+
+                log(
+                    "Independent audio recorder started: "
+                    + json.dumps(
+                        audio_start_result,
+                        ensure_ascii=False,
+                    )
+                )
+
+                audio_first_chunk = await page.evaluate(
+                    """
+                    () =>
+                        window.__superliveWaitAudioChunk(5000)
+                    """
+                )
+
+                log(
+                    "Independent audio first chunk: "
+                    + json.dumps(
+                        audio_first_chunk,
+                        ensure_ascii=False,
+                    )
+                )
+
+                if not audio_first_chunk.get("ok"):
+                    raise RuntimeError(
+                        "Independent audio recorder failed to produce data"
+                    )
+
+            except Exception:
+                try:
+                    await page.evaluate(
+                        """
+                        () =>
+                            window.__superliveStopRec()
+                        """
+                    )
+                except Exception:
+                    pass
+                raise
 
         # ----------------------------------------------------
         # Main recording loop
@@ -3728,6 +4459,19 @@ async def run_recording(playwright):
                 f"{stop_result}"
             )
 
+            if audio_expected:
+                audio_stop_result = await page.evaluate(
+                    """
+                    () =>
+                        window.__superliveStopAudioRec()
+                    """
+                )
+
+                log(
+                    "Independent audio recorder stop requested: "
+                    f"{audio_stop_result}"
+                )
+
         except Exception as e:
             log(
                 f"MediaRecorder stop error: {e}"
@@ -3771,6 +4515,23 @@ async def run_recording(playwright):
             raise RuntimeError(
                 "Timed out waiting for MediaRecorder "
                 "final dataavailable event"
+            )
+
+        if audio_expected:
+            audio_final_ready = await page.evaluate(
+                """
+                () =>
+                    window.__superliveWaitAudioFinal(30000)
+                """
+            )
+
+            if not audio_final_ready:
+                raise RuntimeError(
+                    "Timed out waiting for independent audio final dataavailable event"
+                )
+
+            log(
+                "Independent audio final dataavailable processing completed"
             )
 
         # ----------------------------------------------------
@@ -3875,6 +4636,21 @@ async def run_recording(playwright):
                     "uploadError"
                 )
 
+                audio_status = {}
+                if audio_expected:
+                    try:
+                        audio_status = await page.evaluate(
+                            """
+                            () =>
+                                window.__superliveGetAudioStatus()
+                            """
+                        )
+                    except Exception as e:
+                        raise RuntimeError(
+                            "Unable to read independent audio recorder status: "
+                            + str(e)
+                        )
+
                 if (
                     time.monotonic()
                     - last_drain_log
@@ -3900,9 +4676,23 @@ async def run_recording(playwright):
                             f"{upload_error}"
                         )
 
+                    if audio_expected:
+                        log(
+                            "Independent audio drain status: "
+                            + json.dumps(
+                                audio_status,
+                                ensure_ascii=False,
+                            )
+                        )
+
                     log(
                         f"Local WebM received: "
                         f"{total_bytes / 1024 / 1024:.2f} MB"
+                    )
+
+                    log(
+                        f"Local audio WebM received: "
+                        f"{audio_total_bytes / 1024 / 1024:.2f} MB"
                     )
 
                     last_drain_log = (
@@ -3916,12 +4706,26 @@ async def run_recording(playwright):
                         f"{upload_error}"
                     )
 
+                audio_drained = True
+                if audio_expected:
+                    audio_drained = (
+                        int(audio_status.get("queueLength", 0)) == 0
+                        and not bool(audio_status.get("isUploading"))
+                        and int(audio_status.get("pendingDataTasks", 0)) == 0
+                        and int(audio_status.get("uploadedChunkCount", 0))
+                            == int(audio_status.get("chunkCount", 0))
+                        and int(audio_status.get("chunkCount", 0)) > 0
+                        and not audio_status.get("uploadError")
+                    )
+
                 if (
                     queue_length == 0
                     and not uploading
                     and pending_tasks == 0
                     and uploaded_chunks == recorder_chunks
                     and recorder_chunks > 0
+                    and not upload_error
+                    and audio_drained
                 ):
                     break
 
@@ -3990,10 +4794,43 @@ async def run_recording(playwright):
         if (
             final_status.get("queueLength", 0) != 0
             or final_status.get("isUploading")
+            or final_status.get("uploadError")
         ):
             raise RuntimeError(
-                "Queue is not fully drained"
+                "Queue is not fully drained or contains an upload error"
             )
+
+        if audio_expected:
+            final_audio_status = await page.evaluate(
+                """
+                () =>
+                    window.__superliveGetAudioStatus()
+                """
+            )
+
+            log(
+                "Final independent audio recorder status: "
+                + json.dumps(
+                    final_audio_status,
+                    ensure_ascii=False,
+                )
+            )
+
+            if (
+                int(final_audio_status.get("chunkCount", 0)) <= 0
+                or int(final_audio_status.get("uploadedChunkCount", 0))
+                    != int(final_audio_status.get("chunkCount", 0))
+                or final_audio_status.get("queueLength", 0) != 0
+                or final_audio_status.get("isUploading")
+                or final_audio_status.get("uploadError")
+            ):
+                raise RuntimeError(
+                    "Independent audio chunk integrity check failed: "
+                    + json.dumps(
+                        final_audio_status,
+                        ensure_ascii=False,
+                    )
+                )
 
         log(
             f"Final WebM received: "
@@ -4006,27 +4843,34 @@ async def run_recording(playwright):
             handle_chunk,
         )
 
+        await page.unroute(
+            "**/__slr_audio_chunk",
+            handle_audio_chunk,
+        )
+
         # ----------------------------------------------------
-        # Close WebM safely
+        # Close independent WebM files safely
         # ----------------------------------------------------
 
         webm_file.flush()
-
-        os.fsync(
-            webm_file.fileno()
-        )
-
+        os.fsync(webm_file.fileno())
         webm_file.close()
         webm_file = None
+
+        if audio_expected:
+            audio_webm_file.flush()
+            os.fsync(audio_webm_file.fileno())
+            audio_webm_file.close()
+            audio_webm_file = None
 
         await browser.close()
 
         # ----------------------------------------------------
-        # Verify WebM BEFORE conversion
+        # Verify independent streams before muxing
         # ----------------------------------------------------
 
         log_section(
-            "VERIFY ORIGINAL WEBM"
+            "VERIFY INDEPENDENT WEBM STREAMS"
         )
 
         if not verify_video_file(
@@ -4034,7 +4878,32 @@ async def run_recording(playwright):
             allow_zero_duration=True,
         ):
             raise RuntimeError(
-                "Original WebM failed verification"
+                "Independent video WebM failed verification"
+            )
+
+        if audio_expected:
+            if not verify_audio_file(
+                audio_webm_path
+            ):
+                raise RuntimeError(
+                    "Independent audio WebM failed verification"
+                )
+
+            mux_webm_video_audio(
+                webm_path,
+                audio_webm_path,
+                muxed_webm_path,
+            )
+
+            # The muxed file becomes the ONLY file eligible for
+            # timing analysis, splitting, and Telegram upload.
+            webm_path.unlink(missing_ok=True)
+            audio_webm_path.unlink(missing_ok=True)
+            webm_path = muxed_webm_path
+
+            log(
+                "Lossless WebM AV mux completed; both streams are present "
+                "and packet counts were preserved."
             )
 
         # ----------------------------------------------------
@@ -4179,6 +5048,15 @@ async def run_recording(playwright):
                 webm_file.flush()
                 webm_file.close()
                 webm_file = None
+
+        except Exception:
+            pass
+
+        try:
+            if audio_webm_file is not None:
+                audio_webm_file.flush()
+                audio_webm_file.close()
+                audio_webm_file = None
 
         except Exception:
             pass
