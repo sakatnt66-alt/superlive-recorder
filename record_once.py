@@ -1330,6 +1330,8 @@ WEBRTC_HOOK = r"""
     window.__superliveAudioTracks = [];
     window.__superliveStreams = [];
     window.__superliveTrackLinks = new Map();
+    window.__superlivePeerConnections = [];
+    window.__superlivePeerConnectionCounter = 0;
 
     const OriginalRTCPeerConnection =
         window.RTCPeerConnection;
@@ -1397,6 +1399,13 @@ WEBRTC_HOOK = r"""
         constructor(...args) {
             super(...args);
 
+            this.__superliveId =
+                ++window.__superlivePeerConnectionCounter;
+
+            window.__superlivePeerConnections.push(
+                this
+            );
+
             this.addEventListener(
                 "track",
                 (event) => {
@@ -1436,6 +1445,213 @@ WEBRTC_HOOK = r"""
 
     window.RTCPeerConnection =
         WrappedRTCPeerConnection;
+
+    window.__superliveDiagnostics = () => {
+        const videos = Array.from(
+            document.querySelectorAll("video")
+        ).map((video, index) => {
+            let stream = null;
+            let rect = null;
+
+            try {
+                stream = video.srcObject || null;
+                rect = video.getBoundingClientRect();
+            } catch (e) {
+                return {
+                    index,
+                    error: String(e),
+                };
+            }
+
+            const videoTracks = stream
+                ? stream.getVideoTracks()
+                : [];
+
+            const audioTracks = stream
+                ? stream.getAudioTracks()
+                : [];
+
+            return {
+                index,
+                width: video.videoWidth,
+                height: video.videoHeight,
+                readyState: video.readyState,
+                display: (() => {
+                    try {
+                        return window.getComputedStyle(video).display;
+                    } catch (e) {
+                        return null;
+                    }
+                })(),
+                visibility: (() => {
+                    try {
+                        return window.getComputedStyle(video).visibility;
+                    } catch (e) {
+                        return null;
+                    }
+                })(),
+                rect: rect
+                    ? {
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                    }
+                    : null,
+                streamId: stream
+                    ? stream.id
+                    : null,
+                videoTracks: videoTracks.map(
+                    track => ({
+                        id: track.id,
+                        kind: track.kind,
+                        readyState: track.readyState,
+                        muted: track.muted,
+                        enabled: track.enabled,
+                        settings: (() => {
+                            try {
+                                return track.getSettings();
+                            } catch (e) {
+                                return {};
+                            }
+                        })(),
+                    })
+                ),
+                audioTracks: audioTracks.map(
+                    track => ({
+                        id: track.id,
+                        kind: track.kind,
+                        readyState: track.readyState,
+                        muted: track.muted,
+                        enabled: track.enabled,
+                    })
+                ),
+            };
+        });
+
+        const peerConnections =
+            window.__superlivePeerConnections.map(
+                pc => {
+                    let senders = [];
+                    let receivers = [];
+                    let transceivers = [];
+
+                    try {
+                        senders = pc.getSenders();
+                    } catch (e) {}
+
+                    try {
+                        receivers = pc.getReceivers();
+                    } catch (e) {}
+
+                    try {
+                        transceivers = pc.getTransceivers();
+                    } catch (e) {}
+
+                    return {
+                        id: pc.__superliveId || null,
+                        connectionState: pc.connectionState,
+                        iceConnectionState:
+                            pc.iceConnectionState,
+                        iceGatheringState:
+                            pc.iceGatheringState,
+                        signalingState:
+                            pc.signalingState,
+                        senderTracks: senders.map(
+                            sender => ({
+                                kind: sender.track
+                                    ? sender.track.kind
+                                    : null,
+                                id: sender.track
+                                    ? sender.track.id
+                                    : null,
+                                readyState: sender.track
+                                    ? sender.track.readyState
+                                    : null,
+                            })
+                        ),
+                        receiverTracks: receivers.map(
+                            receiver => ({
+                                kind: receiver.track
+                                    ? receiver.track.kind
+                                    : null,
+                                id: receiver.track
+                                    ? receiver.track.id
+                                    : null,
+                                readyState: receiver.track
+                                    ? receiver.track.readyState
+                                    : null,
+                                streams: (() => {
+                                    try {
+                                        return receiver
+                                            .getContributingSources()
+                                            .length;
+                                    } catch (e) {
+                                        return 0;
+                                    }
+                                })(),
+                            })
+                        ),
+                        transceivers: transceivers.map(
+                            transceiver => ({
+                                mid: transceiver.mid,
+                                direction:
+                                    transceiver.direction,
+                                currentDirection:
+                                    transceiver.currentDirection,
+                                senderTrackId:
+                                    transceiver.sender &&
+                                    transceiver.sender.track
+                                        ? transceiver.sender.track.id
+                                        : null,
+                                receiverTrackId:
+                                    transceiver.receiver &&
+                                    transceiver.receiver.track
+                                        ? transceiver.receiver.track.id
+                                        : null,
+                            })
+                        ),
+                    };
+                }
+            );
+
+        return {
+            url: location.href,
+            streamId: "" + (
+                window.__superliveStreamId || ""
+            ),
+            videos,
+            peerConnections,
+            rememberedVideoTracks:
+                window.__superliveVideoTracks.map(
+                    track => ({
+                        id: track.id,
+                        readyState: track.readyState,
+                    })
+                ),
+            rememberedAudioTracks:
+                window.__superliveAudioTracks.map(
+                    track => ({
+                        id: track.id,
+                        readyState: track.readyState,
+                    })
+                ),
+            rememberedStreams:
+                window.__superliveStreams.map(
+                    stream => ({
+                        id: stream.id,
+                        videoTracks:
+                            stream.getVideoTracks().map(
+                                track => track.id
+                            ),
+                        audioTracks:
+                            stream.getAudioTracks().map(
+                                track => track.id
+                            ),
+                    })
+                ),
+        };
+    };
 
     window.__superliveSelectTargetVideo = () => {
         const videos = Array.from(
@@ -2385,6 +2601,34 @@ async def run_recording(playwright):
         if not video_ready:
             raise RuntimeError(
                 "Live video was not detected"
+            )
+
+        # ----------------------------------------------------
+        # Temporary WebRTC diagnostics
+        # ----------------------------------------------------
+
+        try:
+            diagnostics = await page.evaluate(
+                """
+                () =>
+                    window.__superliveDiagnostics()
+                """
+            )
+
+            log_section(
+                "WEBRTC DIAGNOSTICS"
+            )
+
+            log(
+                json.dumps(
+                    diagnostics,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+        except Exception as e:
+            log(
+                f"WebRTC diagnostics error: {e}"
             )
 
         # ----------------------------------------------------
