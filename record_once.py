@@ -197,9 +197,17 @@ def send_telegram_notification(text):
 # ============================================================
 
 def log(message):
+    text = str(message)
+    max_log_chars = 12000
+    if len(text) > max_log_chars:
+        omitted = len(text) - max_log_chars
+        text = (
+            text[:max_log_chars]
+            + f"\n... [log output truncated: {omitted} chars omitted]"
+        )
     print(
         f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-        f"{message}",
+        f"{text}",
         flush=True,
     )
 
@@ -5707,6 +5715,7 @@ async def run_recording(playwright):
     encoded_h264_mode = False
     encoded_video_timestamp_deltas = []
     encoded_video_timestamp_regressions = 0
+    encoded_video_observed_fps = []
 
     try:
         # Video output is opened lazily: encoded WebRTC capture writes IVF
@@ -6680,6 +6689,8 @@ async def run_recording(playwright):
         )
         last_encoded_frame_count = 0
         last_encoded_frame_progress_at = time.monotonic()
+        last_inbound_video_signature = None
+        last_inbound_video_progress_at = time.monotonic()
 
         while True:
             elapsed = (
@@ -6816,32 +6827,65 @@ async def run_recording(playwright):
                         - last_encoded_frame_progress_at
                     )
 
+                    # Detect a real stream stop by watching the WebRTC
+                    # inbound counters as well as the encoded-frame counter.
+                    # Some SuperLive receiver objects remain present after the
+                    # stream ends, so `inboundVideo == []` is not a reliable
+                    # end-of-stream condition by itself.
+                    try:
+                        end_stats = await page.evaluate(
+                            """
+                            () =>
+                                window.__superliveGetWebRTCStats
+                                    ? window.__superliveGetWebRTCStats()
+                                    : null
+                            """
+                        )
+                    except Exception:
+                        end_stats = None
+
+                    inbound_video = []
+                    if isinstance(end_stats, dict):
+                        inbound_video = end_stats.get("inboundVideo") or []
+
+                    inbound_signature_parts = []
+                    for item in inbound_video:
+                        if not isinstance(item, dict):
+                            continue
+                        inbound_signature_parts.append(
+                            (
+                                str(item.get("trackIdentifier") or ""),
+                                int(item.get("ssrc") or 0),
+                                int(item.get("framesReceived") or 0),
+                                int(item.get("packetsReceived") or 0),
+                                int(item.get("bytesReceived") or 0),
+                            )
+                        )
+
+                    inbound_signature = tuple(
+                        sorted(inbound_signature_parts)
+                    )
+
+                    if inbound_signature != last_inbound_video_signature:
+                        last_inbound_video_signature = inbound_signature
+                        last_inbound_video_progress_at = time.monotonic()
+
+                    inbound_idle_seconds = (
+                        time.monotonic()
+                        - last_inbound_video_progress_at
+                    )
+
                     if (
                         current_encoded_frame_count > 0
                         and encoded_idle_seconds >= STREAM_END_IDLE_TIMEOUT
+                        and inbound_idle_seconds >= STREAM_END_IDLE_TIMEOUT
                     ):
-                        try:
-                            end_stats = await page.evaluate(
-                                """
-                                () =>
-                                    window.__superliveGetWebRTCStats
-                                        ? window.__superliveGetWebRTCStats()
-                                        : null
-                                """
-                            )
-                        except Exception:
-                            end_stats = None
-
-                        inbound_video = []
-                        if isinstance(end_stats, dict):
-                            inbound_video = end_stats.get("inboundVideo") or []
-
-                        if not inbound_video:
-                            log(
-                                "Stream end detected: no new encoded video frames "
-                                f"for {encoded_idle_seconds:.1f}s and WebRTC inbound video is empty"
-                            )
-                            break
+                        log(
+                            "Stream end detected: no encoded video frame progress "
+                            f"for {encoded_idle_seconds:.1f}s and no WebRTC inbound "
+                            f"counter progress for {inbound_idle_seconds:.1f}s"
+                        )
+                        break
 
                 if (
                     time.monotonic()
@@ -6922,6 +6966,20 @@ async def run_recording(playwright):
                                 ensure_ascii=False,
                             )
                         )
+
+                        if encoded_video_mode and isinstance(webrtc_diag, dict):
+                            for item in webrtc_diag.get("inboundVideo") or []:
+                                if not isinstance(item, dict):
+                                    continue
+                                fps = item.get("framesPerSecond")
+                                try:
+                                    fps = float(fps)
+                                except (TypeError, ValueError):
+                                    continue
+                                if 1.0 <= fps <= 120.0:
+                                    encoded_video_observed_fps.append(fps)
+                                    if len(encoded_video_observed_fps) > 120:
+                                        del encoded_video_observed_fps[:-120]
                     except Exception as e:
                         log(
                             f"WebRTC stats diagnostic error: {e}"
@@ -7389,25 +7447,35 @@ async def run_recording(playwright):
                         "Encoded H.264 capture contains no validated IDR key frame; "
                         "refusing to remux/upload"
                     )
-                if not encoded_video_timestamp_deltas:
-                    log(
-                        "WARNING: Encoded H.264 capture has no usable positive "
-                        "timestamp deltas; using 30 FPS for raw-H.264 remux timing"
-                    )
-                    # 30 FPS on the 90 kHz RTP clock = 3000 ticks/frame.
-                    encoded_video_timestamp_deltas = [
-                        round(90_000 / 30)
-                    ]
-                sorted_deltas = sorted(encoded_video_timestamp_deltas)
-                median_delta = sorted_deltas[len(sorted_deltas) // 2]
+                # A receiver rebind can introduce a large RTP timestamp jump
+                # without changing the actual encoded frame cadence. The raw
+                # H.264 demuxer cannot preserve arbitrary per-frame RTP
+                # timestamps, so use the observed WebRTC frame-rate signal
+                # whenever it is available. Fall back to the median RTP
+                # timestamp delta only when WebRTC did not provide a usable
+                # frame-rate sample.
+                valid_observed_fps = [
+                    float(value)
+                    for value in encoded_video_observed_fps
+                    if 1.0 <= float(value) <= 120.0
+                ]
 
-                # Chromium's WebRTC EncodedVideoChunk timestamp for this
-                # RTP/H.264 receiver is expressed on the video RTP clock,
-                # i.e. 90,000 ticks/second. It is NOT a microsecond value.
-                # Example from the successful capture: delta=2970 ticks
-                # corresponds to 90,000 / 2970 = 30.303 FPS.
-                H264_RTP_CLOCK_HZ = 90_000.0
-                source_fps = H264_RTP_CLOCK_HZ / median_delta
+                if valid_observed_fps:
+                    sorted_fps = sorted(valid_observed_fps)
+                    source_fps = sorted_fps[len(sorted_fps) // 2]
+                    timing_basis = "WebRTC observed framesPerSecond"
+                    median_delta = None
+                elif encoded_video_timestamp_deltas:
+                    sorted_deltas = sorted(encoded_video_timestamp_deltas)
+                    median_delta = sorted_deltas[len(sorted_deltas) // 2]
+                    H264_RTP_CLOCK_HZ = 90_000.0
+                    source_fps = H264_RTP_CLOCK_HZ / median_delta
+                    source_fps = max(1.0, min(120.0, source_fps))
+                    timing_basis = "median RTP timestamp delta"
+                else:
+                    median_delta = None
+                    source_fps = 30.0
+                    timing_basis = "30 FPS fallback"
 
                 log(
                     "Final encoded H.264: "
@@ -7416,7 +7484,9 @@ async def run_recording(playwright):
                     f"keyframes={encoded_video_keyframe_count}, "
                     f"timestamp_regressions={encoded_video_timestamp_regressions}, "
                     f"median_frame_delta_rtp_ticks={median_delta}, "
-                    f"source_fps={source_fps:.3f}"
+                    f"observed_fps_samples={len(valid_observed_fps)}, "
+                    f"source_fps={source_fps:.3f}, "
+                    f"timing_basis={timing_basis}"
                 )
                 remux_h264_to_mkv(
                     h264_path, h264_mkv_path,
