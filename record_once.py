@@ -3243,8 +3243,15 @@ WEBRTC_HOOK = r"""
                 const visibleWidth = Math.max(0, right - left);
                 const visibleHeight = Math.max(0, bottom - top);
                 const visibleArea = visibleWidth * visibleHeight;
+                const layoutArea = Math.max(0, rect.width) * Math.max(0, rect.height);
 
-                if (visibleArea <= 0) continue;
+                // A live WebRTC player can legitimately be just outside the
+                // current viewport (for example when the page contains
+                // vertically stacked player containers).  Do not discard it
+                // merely because its intersection with the viewport is zero.
+                // Identity still comes from the exact stream/DOM association
+                // and real inbound WebRTC activity below; viewport position
+                // is only a ranking signal.
 
                 const stats = findTrackStats(videoTrack.id);
                 const streamIds =
@@ -3280,6 +3287,7 @@ WEBRTC_HOOK = r"""
                 const score =
                     identityScore
                     + Math.min(visibleArea, 1000000) / 100
+                    + Math.min(layoutArea, 1000000) / 10000
                     + Math.min(fps, 120);
 
                 candidates.push({
@@ -3289,6 +3297,7 @@ WEBRTC_HOOK = r"""
                     videoTrack,
                     rect,
                     visibleArea,
+                    layoutArea,
                     streamIds,
                     peer,
                     sameTargetDom,
@@ -3334,6 +3343,7 @@ WEBRTC_HOOK = r"""
                 width: item.video.videoWidth,
                 height: item.video.videoHeight,
                 visibleArea: item.visibleArea,
+                layoutArea: item.layoutArea,
                 rect: {
                     x: item.rect.x,
                     y: item.rect.y,
