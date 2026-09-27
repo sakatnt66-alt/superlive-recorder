@@ -2849,22 +2849,24 @@ WEBRTC_HOOK = r"""
          * selected WebRTC/capture video source. Audio is recorded
          * independently and muxed losslessly after capture.
          *
-         * Prefer an isolated clone of the selected WebRTC video first.
-         * This keeps MediaRecorder away from the page-owned source track
-         * while preserving the exact selected WebRTC source.
+          * Prefer the selected WebRTC source track directly.
+         * Recent tests showed the isolated clone can reduce the effective
+         * recorded frame rate, while the direct WebRTC track performs better.
+         * Keep the clone immediately available as the first fallback if the
+         * direct source fails to produce a real recording chunk.
          */
+
+        addRecordingCandidate(
+            "webrtc-video-only",
+            selectedVideoTrack,
+            null
+        );
 
         addRecordingCandidate(
             "webrtc-video-only-clone",
             selectedVideoTrack,
             null,
             true
-        );
-
-        addRecordingCandidate(
-            "webrtc-video-only",
-            selectedVideoTrack,
-            null
         );
 
         if (
