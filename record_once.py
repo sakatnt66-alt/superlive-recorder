@@ -2888,6 +2888,162 @@ WEBRTC_HOOK = r"""
         };
     };
 
+    window.__superliveMaybeRebindEncodedVideo = async () => {
+        const state = window.__superliveEncodedVideo;
+
+        if (!state.started || state.stopping) {
+            return {changed: false, reason: "not_active"};
+        }
+
+        try {
+            if (!window.__superliveSelectTargetVideo) {
+                return {changed: false, reason: "selector_unavailable"};
+            }
+
+            await window.__superliveSelectTargetVideo();
+            const nextTrack =
+                window.__superliveSelectedVideoTrack || null;
+
+            if (!nextTrack || nextTrack.kind !== "video") {
+                return {changed: false, reason: "no_live_target_track"};
+            }
+
+            if (nextTrack.id === state.attachedTrackId) {
+                return {changed: false, reason: "same_track"};
+            }
+
+            const peer =
+                window.__superliveTrackPeers.get(nextTrack) || null;
+            if (!peer) {
+                return {changed: false, reason: "target_peer_not_found"};
+            }
+
+            let receiver = null;
+            try {
+                receiver = peer.getReceivers().find(
+                    item => item && item.track === nextTrack
+                ) || null;
+            } catch (error) {
+                return {
+                    changed: false,
+                    reason: "target_receiver_lookup_failed",
+                    error: String(error),
+                };
+            }
+
+            if (!receiver) {
+                return {changed: false, reason: "target_receiver_not_found"};
+            }
+
+            // Confirm that the replacement receiver carries the same
+            // supported codec before activating its encoded transform.
+            let codecMimeType = null;
+            try {
+                const stats = await receiver.getStats();
+                let inbound = null;
+                stats.forEach(report => {
+                    if (
+                        !inbound
+                        && report
+                        && report.type === "inbound-rtp"
+                        && (report.kind === "video" || report.mediaType === "video")
+                        && report.codecId
+                    ) {
+                        inbound = report;
+                    }
+                });
+                if (inbound) {
+                    const codec = stats.get(inbound.codecId);
+                    if (codec && codec.mimeType) {
+                        codecMimeType =
+                            String(codec.mimeType).toLowerCase();
+                    }
+                }
+            } catch (error) {
+                return {
+                    changed: false,
+                    reason: "target_codec_lookup_failed",
+                    error: String(error),
+                };
+            }
+
+            if (!codecMimeType || codecMimeType !== state.codecMimeType) {
+                return {
+                    changed: false,
+                    reason: "target_codec_changed",
+                    codecMimeType,
+                    currentCodec: state.codecMimeType,
+                };
+            }
+
+            let ok = state.receivers.has(nextTrack.id);
+            if (!ok) {
+                ok = installEncodedVideoTransform(
+                    receiver,
+                    nextTrack
+                );
+            }
+
+            if (!ok) {
+                return {
+                    changed: false,
+                    reason: state.uploadError
+                        || "replacement_encoded_transform_unavailable",
+                };
+            }
+
+            const nextEntry = state.receivers.get(nextTrack.id);
+            if (!nextEntry) {
+                return {changed: false, reason: "replacement_receiver_entry_missing"};
+            }
+
+            if (state.attachedTrackId) {
+                const oldEntry =
+                    state.receivers.get(state.attachedTrackId);
+                if (oldEntry) {
+                    oldEntry.active = false;
+                    try {
+                        oldEntry.port.postMessage({
+                            command: "set-active",
+                            active: false,
+                        });
+                    } catch (e) {}
+                }
+            }
+
+            state.attachedTrackId = nextTrack.id;
+            state.seenKeyFrame = false;
+            state.timestampRegressionCount = 0;
+            nextEntry.active = true;
+
+            try {
+                nextEntry.port.postMessage({
+                    command: "set-active",
+                    active: true,
+                });
+            } catch (error) {
+                nextEntry.active = false;
+                return {
+                    changed: false,
+                    reason: "replacement_receiver_activation_failed",
+                    error: String(error),
+                };
+            }
+
+            return {
+                changed: true,
+                trackId: nextTrack.id,
+                codecMimeType,
+            };
+        } catch (error) {
+            return {
+                changed: false,
+                reason: "rebind_exception",
+                error: String(error),
+            };
+        }
+    };
+
     window.__superliveWaitEncodedVideoFrame = async (timeoutMs) => {
         const state = window.__superliveEncodedVideo;
 
@@ -6518,6 +6674,9 @@ async def run_recording(playwright):
         last_status_log = (
             time.monotonic()
         )
+        last_encoded_rebind_check = (
+            time.monotonic()
+        )
 
         while True:
             elapsed = (
@@ -6547,6 +6706,25 @@ async def run_recording(playwright):
 
             try:
                 if encoded_video_mode:
+                    now = time.monotonic()
+                    if now - last_encoded_rebind_check >= 5.0:
+                        rebind_result = await page.evaluate(
+                            """
+                            async () => {
+                                if (!window.__superliveMaybeRebindEncodedVideo) {
+                                    return {changed: false, reason: "rebind_unavailable"};
+                                }
+                                return await window.__superliveMaybeRebindEncodedVideo();
+                            }
+                            """
+                        )
+                        last_encoded_rebind_check = now
+                        if rebind_result and rebind_result.get("changed"):
+                            log(
+                                "Encoded video receiver rebound to live target: "
+                                + json.dumps(rebind_result, ensure_ascii=False)
+                            )
+
                     status = await page.evaluate(
                         """
                         () => window.__superliveGetEncodedVideoStatus
@@ -6657,7 +6835,7 @@ async def run_recording(playwright):
 
                     if encoded_video_mode:
                         log(
-                            "Encoded VP8 received locally: "
+                            "Encoded video received locally: "
                             f"{encoded_video_total_bytes / 1024 / 1024:.2f} MB "
                             f"frames={encoded_video_frame_count}"
                         )
@@ -7167,19 +7345,28 @@ async def run_recording(playwright):
                         "WARNING: Encoded H.264 capture has no usable positive "
                         "timestamp deltas; using 30 FPS for raw-H.264 remux timing"
                     )
+                    # 30 FPS on the 90 kHz RTP clock = 3000 ticks/frame.
                     encoded_video_timestamp_deltas = [
-                        round(1_000_000 / 30)
+                        round(90_000 / 30)
                     ]
                 sorted_deltas = sorted(encoded_video_timestamp_deltas)
                 median_delta = sorted_deltas[len(sorted_deltas) // 2]
-                source_fps = 1_000_000.0 / median_delta
+
+                # Chromium's WebRTC EncodedVideoChunk timestamp for this
+                # RTP/H.264 receiver is expressed on the video RTP clock,
+                # i.e. 90,000 ticks/second. It is NOT a microsecond value.
+                # Example from the successful capture: delta=2970 ticks
+                # corresponds to 90,000 / 2970 = 30.303 FPS.
+                H264_RTP_CLOCK_HZ = 90_000.0
+                source_fps = H264_RTP_CLOCK_HZ / median_delta
+
                 log(
                     "Final encoded H.264: "
                     f"{h264_path.stat().st_size / 1024 / 1024:.2f} MB, "
                     f"frames={encoded_video_frame_count}, "
                     f"keyframes={encoded_video_keyframe_count}, "
                     f"timestamp_regressions={encoded_video_timestamp_regressions}, "
-                    f"median_frame_delta_us={median_delta}, "
+                    f"median_frame_delta_rtp_ticks={median_delta}, "
                     f"source_fps={source_fps:.3f}"
                 )
                 remux_h264_to_mkv(
