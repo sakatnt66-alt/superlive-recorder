@@ -7242,29 +7242,21 @@ async def run_recording(playwright):
                             # track. Stale/secondary receivers can report a
                             # different FPS and must never affect the timing of
                             # the stream we are actually recording.
-                            attached_track_id = encoded_status.get("attachedTrackId")
+                            selected_track_id = webrtc_diag.get("selectedTrackId")
                             fps_items = []
 
-                            # The encoded recorder's attached track is the only
-                            # track whose cadence can define the output timeline.
-                            # Do not use selectedTrackId here: the page can expose
-                            # another live receiver that the diagnostics selector
-                            # temporarily prefers, while the recorder remains
-                            # correctly locked to the target track.
-                            target_track_id = attached_track_id
-                            if target_track_id:
-                                for item in webrtc_diag.get("matching") or []:
-                                    if (
-                                        isinstance(item, dict)
-                                        and item.get("trackIdentifier") == target_track_id
-                                    ):
-                                        fps_items.append(item)
+                            for item in webrtc_diag.get("matching") or []:
+                                if not isinstance(item, dict):
+                                    continue
+                                if selected_track_id and item.get("trackIdentifier") != selected_track_id:
+                                    continue
+                                fps_items.append(item)
 
-                            if not fps_items and target_track_id:
+                            if not fps_items and selected_track_id:
                                 for item in webrtc_diag.get("inboundVideo") or []:
                                     if (
                                         isinstance(item, dict)
-                                        and item.get("trackIdentifier") == target_track_id
+                                        and item.get("trackIdentifier") == selected_track_id
                                     ):
                                         fps_items.append(item)
 
@@ -7745,49 +7737,67 @@ async def run_recording(playwright):
                         "Encoded H.264 capture contains no validated IDR key frame; "
                         "refusing to remux/upload"
                     )
-                # A receiver rebind can introduce a large RTP timestamp jump
-                # without changing the actual encoded frame cadence. The raw
-                # H.264 demuxer cannot preserve arbitrary per-frame RTP
-                # timestamps, so use the observed WebRTC frame-rate signal
-                # whenever it is available. Fall back to the median RTP
-                # timestamp delta only when WebRTC did not provide a usable
-                # frame-rate sample.
-                valid_observed_fps = [
-                    float(value)
-                    for value in encoded_video_observed_fps
-                    if 1.0 <= float(value) <= 120.0
-                ]
+                # The raw H.264 file cannot carry arbitrary per-frame RTP
+                # timestamps, so its CFR timeline must use the *whole capture
+                # span*, not a local median frame delta or a short WebRTC FPS
+                # sample. The selected receiver can legitimately vary between
+                # 27-31 FPS during a long capture. Using a median local delta
+                # (for example 2970 RTP ticks ~= 30.303 FPS) compresses the
+                # complete video timeline when the real RTP span is longer.
+                # That makes the independently recorded audio appear late.
+                #
+                # The target-locked receiver now guarantees that the first and
+                # last encoded timestamps belong to the same media track. With
+                # zero timestamp regressions, the capture-span FPS preserves
+                # the real elapsed media duration while keeping the output CFR
+                # and smooth.
+                H264_RTP_CLOCK_HZ = 90_000.0
+                span_ticks = None
+                if (
+                    encoded_video_first_timestamp is not None
+                    and encoded_video_last_timestamp is not None
+                    and encoded_video_frame_count > 1
+                    and encoded_video_last_timestamp >= encoded_video_first_timestamp
+                    and encoded_video_timestamp_regressions == 0
+                ):
+                    span_ticks = (
+                        encoded_video_last_timestamp
+                        - encoded_video_first_timestamp
+                    )
 
-                # RTP timestamps belong to the encoded frames themselves and
-                # are therefore a stronger timing source than WebRTC's
-                # framesPerSecond diagnostic, which is an instantaneous/rounded
-                # statistic and can change substantially during one recording.
-                # Use the RTP cadence when it is sufficiently populated and
-                # there were no timestamp regressions; otherwise fall back to
-                # the attached receiver's observed FPS.
-                if encoded_video_timestamp_regressions == 0 and len(encoded_video_timestamp_deltas) >= 30:
-                    sorted_deltas = sorted(encoded_video_timestamp_deltas)
-                    median_delta = sorted_deltas[len(sorted_deltas) // 2]
-                    H264_RTP_CLOCK_HZ = 90_000.0
-                    source_fps = H264_RTP_CLOCK_HZ / median_delta
-                    source_fps = max(1.0, min(120.0, source_fps))
-                    timing_basis = "median RTP timestamp delta (attached track)"
-                elif valid_observed_fps:
-                    sorted_fps = sorted(valid_observed_fps)
-                    source_fps = sorted_fps[len(sorted_fps) // 2]
-                    timing_basis = "attached-track WebRTC observed framesPerSecond"
-                    median_delta = None
-                elif encoded_video_timestamp_deltas:
-                    sorted_deltas = sorted(encoded_video_timestamp_deltas)
-                    median_delta = sorted_deltas[len(sorted_deltas) // 2]
-                    H264_RTP_CLOCK_HZ = 90_000.0
-                    source_fps = H264_RTP_CLOCK_HZ / median_delta
-                    source_fps = max(1.0, min(120.0, source_fps))
-                    timing_basis = "median RTP timestamp delta"
-                else:
-                    median_delta = None
-                    source_fps = 30.0
-                    timing_basis = "30 FPS fallback"
+                if span_ticks and span_ticks > 0:
+                    capture_span_seconds = span_ticks / H264_RTP_CLOCK_HZ
+                    source_fps = (
+                        (encoded_video_frame_count - 1)
+                        / capture_span_seconds
+                    )
+                    if not (1.0 <= source_fps <= 120.0):
+                        source_fps = None
+                    else:
+                        timing_basis = "RTP capture-span CFR"
+                        median_delta = None
+
+                if source_fps is None:
+                    valid_observed_fps = [
+                        float(value)
+                        for value in encoded_video_observed_fps
+                        if 1.0 <= float(value) <= 120.0
+                    ]
+                    if valid_observed_fps:
+                        sorted_fps = sorted(valid_observed_fps)
+                        source_fps = sorted_fps[len(sorted_fps) // 2]
+                        timing_basis = "WebRTC observed framesPerSecond fallback"
+                        median_delta = None
+                    elif encoded_video_timestamp_deltas:
+                        sorted_deltas = sorted(encoded_video_timestamp_deltas)
+                        median_delta = sorted_deltas[len(sorted_deltas) // 2]
+                        source_fps = H264_RTP_CLOCK_HZ / median_delta
+                        source_fps = max(1.0, min(120.0, source_fps))
+                        timing_basis = "median RTP timestamp delta fallback"
+                    else:
+                        median_delta = None
+                        source_fps = 30.0
+                        timing_basis = "30 FPS fallback"
 
                 log(
                     "Final encoded H.264: "
