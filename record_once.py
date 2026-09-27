@@ -6598,7 +6598,7 @@ async def run_recording(playwright):
                 "<4sHH4sHHIIII",
                 b"DKIF", 0, 32, b"VP80",
                 encoded_video_width, encoded_video_height,
-                1_000_000, 1, 0, 0,
+                90_000, 1, 0, 0,
             )
         )
         encoded_video_file.flush()
