@@ -7042,9 +7042,29 @@ async def run_recording(playwright):
                         )
 
                         if encoded_video_mode and isinstance(webrtc_diag, dict):
-                            for item in webrtc_diag.get("inboundVideo") or []:
+                            # Only sample FPS from the selected encoded video
+                            # track. Stale/secondary receivers can report a
+                            # different FPS and must never affect the timing of
+                            # the stream we are actually recording.
+                            selected_track_id = webrtc_diag.get("selectedTrackId")
+                            fps_items = []
+
+                            for item in webrtc_diag.get("matching") or []:
                                 if not isinstance(item, dict):
                                     continue
+                                if selected_track_id and item.get("trackIdentifier") != selected_track_id:
+                                    continue
+                                fps_items.append(item)
+
+                            if not fps_items and selected_track_id:
+                                for item in webrtc_diag.get("inboundVideo") or []:
+                                    if (
+                                        isinstance(item, dict)
+                                        and item.get("trackIdentifier") == selected_track_id
+                                    ):
+                                        fps_items.append(item)
+
+                            for item in fps_items:
                                 fps = item.get("framesPerSecond")
                                 try:
                                     fps = float(fps)
