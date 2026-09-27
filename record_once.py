@@ -7242,21 +7242,29 @@ async def run_recording(playwright):
                             # track. Stale/secondary receivers can report a
                             # different FPS and must never affect the timing of
                             # the stream we are actually recording.
-                            selected_track_id = webrtc_diag.get("selectedTrackId")
+                            attached_track_id = encoded_status.get("attachedTrackId")
                             fps_items = []
 
-                            for item in webrtc_diag.get("matching") or []:
-                                if not isinstance(item, dict):
-                                    continue
-                                if selected_track_id and item.get("trackIdentifier") != selected_track_id:
-                                    continue
-                                fps_items.append(item)
+                            # The encoded recorder's attached track is the only
+                            # track whose cadence can define the output timeline.
+                            # Do not use selectedTrackId here: the page can expose
+                            # another live receiver that the diagnostics selector
+                            # temporarily prefers, while the recorder remains
+                            # correctly locked to the target track.
+                            target_track_id = attached_track_id
+                            if target_track_id:
+                                for item in webrtc_diag.get("matching") or []:
+                                    if (
+                                        isinstance(item, dict)
+                                        and item.get("trackIdentifier") == target_track_id
+                                    ):
+                                        fps_items.append(item)
 
-                            if not fps_items and selected_track_id:
+                            if not fps_items and target_track_id:
                                 for item in webrtc_diag.get("inboundVideo") or []:
                                     if (
                                         isinstance(item, dict)
-                                        and item.get("trackIdentifier") == selected_track_id
+                                        and item.get("trackIdentifier") == target_track_id
                                     ):
                                         fps_items.append(item)
 
@@ -7750,10 +7758,24 @@ async def run_recording(playwright):
                     if 1.0 <= float(value) <= 120.0
                 ]
 
-                if valid_observed_fps:
+                # RTP timestamps belong to the encoded frames themselves and
+                # are therefore a stronger timing source than WebRTC's
+                # framesPerSecond diagnostic, which is an instantaneous/rounded
+                # statistic and can change substantially during one recording.
+                # Use the RTP cadence when it is sufficiently populated and
+                # there were no timestamp regressions; otherwise fall back to
+                # the attached receiver's observed FPS.
+                if encoded_video_timestamp_regressions == 0 and len(encoded_video_timestamp_deltas) >= 30:
+                    sorted_deltas = sorted(encoded_video_timestamp_deltas)
+                    median_delta = sorted_deltas[len(sorted_deltas) // 2]
+                    H264_RTP_CLOCK_HZ = 90_000.0
+                    source_fps = H264_RTP_CLOCK_HZ / median_delta
+                    source_fps = max(1.0, min(120.0, source_fps))
+                    timing_basis = "median RTP timestamp delta (attached track)"
+                elif valid_observed_fps:
                     sorted_fps = sorted(valid_observed_fps)
                     source_fps = sorted_fps[len(sorted_fps) // 2]
-                    timing_basis = "WebRTC observed framesPerSecond"
+                    timing_basis = "attached-track WebRTC observed framesPerSecond"
                     median_delta = None
                 elif encoded_video_timestamp_deltas:
                     sorted_deltas = sorted(encoded_video_timestamp_deltas)
