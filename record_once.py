@@ -197,17 +197,9 @@ def send_telegram_notification(text):
 # ============================================================
 
 def log(message):
-    text = str(message)
-    max_log_chars = 12000
-    if len(text) > max_log_chars:
-        omitted = len(text) - max_log_chars
-        text = (
-            text[:max_log_chars]
-            + f"\n... [log output truncated: {omitted} chars omitted]"
-        )
     print(
         f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-        f"{text}",
+        f"{message}",
         flush=True,
     )
 
@@ -1567,15 +1559,7 @@ def remux_h264_to_mkv(
     expected_video_packets: int,
     frame_rate: float,
 ):
-    """Remux captured encoded H.264 with a synthetic monotonic CFR timeline.
-
-    The browser-side encoded-frame timestamp can jump when the WebRTC
-    receiver is rebound. The raw H.264 payload does not carry those RTP
-    timestamps, and FFmpeg may derive conflicting DTS from H.264 picture
-    ordering. The setts bitstream filter replaces packet timing with a
-    deterministic frame-index timeline while leaving every H.264 payload
-    byte unchanged.
-    """
+    """Remux captured encoded H.264 into Matroska without re-encoding."""
     if not h264_path.exists() or h264_path.stat().st_size <= 0:
         raise RuntimeError("Encoded H.264 capture is missing or empty")
 
@@ -1596,8 +1580,6 @@ def remux_h264_to_mkv(
         "0:v:0",
         "-c:v",
         "copy",
-        "-bsf:v",
-        f"setts=pts=N*90000/{frame_rate:.12f}+6000:dts=N*90000/{frame_rate:.12f}:time_base=1/90000",
         "-f",
         "matroska",
         str(mkv_path),
@@ -1622,8 +1604,7 @@ def remux_h264_to_mkv(
     log(
         "Encoded H.264 Matroska packet integrity: "
         f"expected={expected_video_packets} actual={actual_packets} "
-        f"source_fps={frame_rate:.3f} "
-        "timing=synthetic_frame_index_cfr"
+        f"source_fps={frame_rate:.3f}"
     )
     if actual_packets != expected_video_packets:
         raise RuntimeError(
@@ -2450,7 +2431,6 @@ WEBRTC_HOOK = r"""
 
             const entry = {
                 trackId: track.id,
-                receiver,
                 worker,
                 workerUrl,
                 port: channel.port1,
@@ -2720,7 +2700,7 @@ WEBRTC_HOOK = r"""
         }
     };
 
-    window.__superliveEnableEncodedVideo = async (track) => {
+    window.__superliveEnableEncodedVideo = async (track, deferActivation = false) => {
         const state = window.__superliveEncodedVideo;
 
         if (!track || track.kind !== "video") {
@@ -2885,8 +2865,21 @@ WEBRTC_HOOK = r"""
             state.firstFrameReject = reject;
         });
 
-        entry.active = true;
+        entry.active = false;
+
+        if (deferActivation) {
+            return {
+                supported: true,
+                receiverFound: true,
+                trackId: track.id,
+                codecMimeType: actualCodecMimeType,
+                inboundCodecId,
+                activationDeferred: true,
+            };
+        }
+
         try {
+            entry.active = true;
             entry.port.postMessage({
                 command: "set-active",
                 active: true,
@@ -2917,119 +2910,20 @@ WEBRTC_HOOK = r"""
         }
 
         try {
-            let nextVideo =
-                window.__superliveSelectedVideo || null;
-            let nextTrack = null;
-            let selectedFromTargetVideo = false;
-
-            /*
-             * IMPORTANT:
-             *
-             * Rebinding is NOT a fresh global target-selection operation.
-             * The initial selector has already identified the requested
-             * livestream.  If WebRTC replaces its receiver track, first
-             * follow the SAME <video> element and its current srcObject.
-             *
-             * The old implementation called the global selector here.  On
-             * pages containing several simultaneous players, that allowed a
-             * different live player to become the recording source when its
-             * track happened to rank higher at that moment.
-             */
-            if (nextVideo) {
-                try {
-                    const stream = nextVideo.srcObject || null;
-                    const targetStillAttached =
-                        typeof domContainsTargetId === "function"
-                        && domContainsTargetId(nextVideo);
-                    const candidate = stream
-                        ? stream
-                            .getVideoTracks()
-                            .find(t => t && t.readyState === "live")
-                        : null;
-
-                    if (candidate && targetStillAttached) {
-                        nextTrack = candidate;
-                        selectedFromTargetVideo = true;
-                    }
-                } catch (error) {
-                    // Fall through to the strict target selector below.
-                }
+            if (!window.__superliveSelectTargetVideo) {
+                return {changed: false, reason: "selector_unavailable"};
             }
 
-            if (!nextTrack) {
-                if (!window.__superliveSelectTargetVideo) {
-                    return {changed: false, reason: "selector_unavailable"};
-                }
-
-                const selection =
-                    await window.__superliveSelectTargetVideo();
-
-                if (
-                    !selection
-                    || !selection.selected
-                    || selection.selected.sameTargetDom !== true
-                ) {
-                    return {
-                        changed: false,
-                        reason: "requested_target_not_present",
-                        sameTargetDom: selection
-                            && selection.selected
-                            ? selection.selected.sameTargetDom
-                            : null,
-                    };
-                }
-
-                nextVideo =
-                    window.__superliveSelectedVideo || null;
-                nextTrack =
-                    window.__superliveSelectedVideoTrack || null;
-            }
+            await window.__superliveSelectTargetVideo();
+            const nextTrack =
+                window.__superliveSelectedVideoTrack || null;
 
             if (!nextTrack || nextTrack.kind !== "video") {
                 return {changed: false, reason: "no_live_target_track"};
             }
 
             if (nextTrack.id === state.attachedTrackId) {
-                return {
-                    changed: false,
-                    reason: "same_track",
-                    selectedFromTargetVideo,
-                };
-            }
-
-            /*
-             * Never switch to another page player.  If the candidate came
-             * from the previously selected video element, that element is
-             * the identity anchor.  If it came from a selector refresh, the
-             * selector must have explicitly associated it with STREAM_ID.
-             */
-            if (!selectedFromTargetVideo) {
-                try {
-                    const selection =
-                        await window.__superliveSelectTargetVideo();
-                    if (
-                        !selection
-                        || !selection.selected
-                        || selection.selected.trackId !== nextTrack.id
-                        || selection.selected.sameTargetDom !== true
-                    ) {
-                        return {
-                            changed: false,
-                            reason: "replacement_not_explicit_target",
-                            trackId: nextTrack.id,
-                            sameTargetDom: selection
-                                && selection.selected
-                                ? selection.selected.sameTargetDom
-                                : null,
-                        };
-                    }
-                } catch (error) {
-                    return {
-                        changed: false,
-                        reason: "replacement_target_validation_failed",
-                        error: String(error),
-                    };
-                }
+                return {changed: false, reason: "same_track"};
             }
 
             const peer =
@@ -3162,6 +3056,52 @@ WEBRTC_HOOK = r"""
                 error: String(error),
             };
         }
+    };
+
+    window.__superliveActivateEncodedVideo = () => {
+        const state = window.__superliveEncodedVideo;
+        if (!state.started || state.stopping || !state.attachedTrackId) {
+            return {ok: false, reason: "encoded_capture_not_ready"};
+        }
+        const entry = state.receivers.get(state.attachedTrackId);
+        if (!entry) {
+            return {ok: false, reason: "encoded_receiver_entry_missing"};
+        }
+        try {
+            entry.active = true;
+            entry.port.postMessage({command: "set-active", active: true});
+            return {ok: true, trackId: state.attachedTrackId};
+        } catch (error) {
+            entry.active = false;
+            state.uploadError = String(error);
+            return {ok: false, reason: "encoded_receiver_activation_failed", error: String(error)};
+        }
+    };
+
+    window.__superliveStartAudioAndActivateEncodedVideo = (
+        audioBitrate,
+        timeslice,
+        attemptId = "audio-default"
+    ) => {
+        const startedAt = performance.now();
+        const audio = window.__superliveStartAudioRec
+            ? window.__superliveStartAudioRec(audioBitrate, timeslice, attemptId)
+            : {ok: false, reason: "audio_recorder_missing"};
+        const audioRecorderStartedAt = performance.now();
+        const video = window.__superliveActivateEncodedVideo
+            ? window.__superliveActivateEncodedVideo()
+            : {ok: false, reason: "encoded_activation_missing"};
+        const videoActivatedAt = performance.now();
+        return {
+            audio,
+            video,
+            syncDiagnostics: {
+                audioRecorderStartToVideoActivationMs:
+                    videoActivatedAt - audioRecorderStartedAt,
+                combinedCallElapsedMs:
+                    videoActivatedAt - startedAt,
+            },
+        };
     };
 
     window.__superliveWaitEncodedVideoFrame = async (timeoutMs) => {
@@ -3715,68 +3655,6 @@ WEBRTC_HOOK = r"""
         };
     };
 
-    window.__superliveGetEncodedAttachedTrackStats = async () => {
-        const state = window.__superliveEncodedVideo;
-        const trackId = state && state.attachedTrackId
-            ? state.attachedTrackId
-            : null;
-
-        if (!trackId) {
-            return {
-                trackId: null,
-                trackReadyState: null,
-                receiverFound: false,
-                inbound: null,
-            };
-        }
-
-        const entry = state.receivers.get(trackId) || null;
-        const track = entry && entry.receiver
-            ? entry.receiver.track
-            : null;
-
-        let inbound = null;
-        if (entry && entry.receiver) {
-            try {
-                const stats = await entry.receiver.getStats();
-                stats.forEach(report => {
-                    if (
-                        !inbound
-                        && report
-                        && report.type === "inbound-rtp"
-                        && (report.kind === "video" || report.mediaType === "video")
-                    ) {
-                        inbound = {
-                            trackIdentifier: report.trackIdentifier || trackId,
-                            ssrc: report.ssrc ?? null,
-                            framesReceived: report.framesReceived ?? null,
-                            packetsReceived: report.packetsReceived ?? null,
-                            bytesReceived: report.bytesReceived ?? null,
-                            framesDecoded: report.framesDecoded ?? null,
-                            packetsLost: report.packetsLost ?? null,
-                            framesPerSecond: report.framesPerSecond ?? null,
-                        };
-                    }
-                });
-            } catch (error) {
-                return {
-                    trackId,
-                    trackReadyState: track ? track.readyState : null,
-                    receiverFound: !!entry.receiver,
-                    inbound: null,
-                    error: String(error),
-                };
-            }
-        }
-
-        return {
-            trackId,
-            trackReadyState: track ? track.readyState : null,
-            receiverFound: !!(entry && entry.receiver),
-            inbound,
-        };
-    };
-
     window.__superliveEnsureSelectedVideoPlaying = async () => {
         const video = window.__superliveSelectedVideo;
 
@@ -3906,62 +3784,28 @@ WEBRTC_HOOK = r"""
 
         const getPeerAudioCandidates = () => {
             const candidates = [];
-            const seen = new Set();
-            let selectedPeer =
+            const peer =
                 window.__superliveTrackPeers.get(
                     selectedVideoTrack
-                ) || null;
+                );
 
-            const addCandidate = (track) => {
-                if (
-                    !track
-                    || track.kind !== "audio"
-                    || track.readyState !== "live"
-                    || seen.has(track.id)
-                ) {
-                    return;
-                }
-
-                seen.add(track.id);
-                candidates.push(track);
-            };
-
-            /*
-             * Normally the selected video track is already mapped to the
-             * PeerConnection that delivered it.  During receiver rebinding
-             * that WeakMap entry can briefly refer to the old track object.
-             * In that case, recover the SAME PeerConnection by matching the
-             * selected track object/id against its current receivers.
-             */
-            if (!selectedPeer) {
-                for (const pc of window.__superlivePeerConnections) {
-                    try {
-                        const receivers = pc.getReceivers();
-                        if (receivers.some(
-                            receiver =>
-                                receiver
-                                && receiver.track
-                                && (
-                                    receiver.track === selectedVideoTrack
-                                    || receiver.track.id === selectedVideoTrack.id
-                                )
-                        )) {
-                            selectedPeer = pc;
-                            break;
-                        }
-                    } catch (e) {
-                        // Ignore a stale/closed PeerConnection.
-                    }
-                }
-            }
-
-            if (!selectedPeer) {
+            if (!peer) {
                 return candidates;
             }
 
             try {
-                for (const receiver of selectedPeer.getReceivers()) {
-                    addCandidate(receiver && receiver.track);
+                for (const receiver of peer.getReceivers()) {
+                    const track = receiver && receiver.track;
+
+                    if (
+                        !track
+                        || track.kind !== "audio"
+                        || track.readyState !== "live"
+                    ) {
+                        continue;
+                    }
+
+                    candidates.push(track);
                 }
             } catch (e) {
                 console.warn(
@@ -3992,40 +3836,11 @@ WEBRTC_HOOK = r"""
             }
 
             /*
-             * Some players expose video and audio on different
-             * MediaStream objects but advertise the same event.streams
-             * id on the corresponding WebRTC tracks.  The selected
-             * <video>.srcObject.id is not always that WebRTC stream id.
-             * Therefore also search remembered streams by the exact
-             * stream ids recorded for the selected video track.
-             *
-             * This remains an association to the selected WebRTC track;
-             * it does NOT fall back to arbitrary page-global audio.
+             * Some players attach audio to the same MediaStream object
+             * a little after the video track arrives.  Search every
+             * remembered stream, but ONLY when that stream contains
+             * the exact selected video track.
              */
-            const selectedStreamIds = new Set(
-                (
-                    window.__superliveTrackStreamIds.get(
-                        selectedVideoTrack
-                    ) || []
-                ).filter(Boolean)
-            );
-
-            if (selectedStreamIds.size) {
-                for (const stream of window.__superliveStreams) {
-                    try {
-                        if (!stream || !selectedStreamIds.has(stream.id)) {
-                            continue;
-                        }
-
-                        for (const track of stream.getAudioTracks()) {
-                            addAudioCandidate(track);
-                        }
-                    } catch (e) {
-                        // Ignore stale/detached MediaStream objects.
-                    }
-                }
-            }
-
             /*
              * Some players expose video and audio on different
              * MediaStream objects even though both tracks belong to
@@ -4060,7 +3875,7 @@ WEBRTC_HOOK = r"""
         collectAssociatedAudio();
 
         const audioWaitDeadline =
-            performance.now() + 20000;
+            performance.now() + 10000;
 
         while (
             audioCandidates.length === 0
@@ -5951,7 +5766,6 @@ async def run_recording(playwright):
     encoded_h264_mode = False
     encoded_video_timestamp_deltas = []
     encoded_video_timestamp_regressions = 0
-    encoded_video_observed_fps = []
 
     try:
         # Video output is opened lazily: encoded WebRTC capture writes IVF
@@ -6415,27 +6229,10 @@ async def run_recording(playwright):
                         last_detection_log = now
 
                 if result.get("ready"):
+                    video_ready = True
+
                     selection = result.get("selection") or {}
                     selected = selection.get("selected") or {}
-
-                    # When STREAM_ID is known, never start recording from a
-                    # fallback live player.  The selector may temporarily find
-                    # another valid WebRTC video before the requested stream's
-                    # DOM association appears.  Starting there creates a short
-                    # wrong-broadcast clip before the real target arrives.
-                    if STREAM_ID and selected.get("sameTargetDom") is not True:
-                        now = time.monotonic()
-                        if now - last_detection_log >= 10:
-                            log(
-                                "Live video candidates found, but requested "
-                                "STREAM_ID is not explicitly associated yet; "
-                                "waiting for target video"
-                            )
-                            last_detection_log = now
-                        await asyncio.sleep(1)
-                        continue
-
-                    video_ready = True
 
                     log(
                         "Live video detected: "
@@ -6598,7 +6395,7 @@ async def run_recording(playwright):
                 "<4sHH4sHHIIII",
                 b"DKIF", 0, 32, b"VP80",
                 encoded_video_width, encoded_video_height,
-                90_000, 1, 0, 0,
+                1_000_000, 1, 0, 0,
             )
         )
         encoded_video_file.flush()
@@ -6630,40 +6427,18 @@ async def run_recording(playwright):
                 encoded_capability.get("codecMimeType") == "video/h264"
             )
             try:
-                encoded_wait = await page.evaluate(
-                    """
-                    () => window.__superliveWaitEncodedVideoFrame
-                        ? window.__superliveWaitEncodedVideoFrame(5000)
-                        : {ok: false, reason: "encoded_wait_missing"}
-                    """
+                encoded_video_mode = True
+                encoded_video_started = True
+                video_capture_mode = (
+                    "webrtc-encoded-h264" if encoded_h264_mode
+                    else "webrtc-encoded-vp8"
                 )
-
                 log(
-                    "First encoded WebRTC video frame: "
-                    + json.dumps(
-                        encoded_wait,
-                        ensure_ascii=False,
-                    )
+                    "Using direct encoded WebRTC "
+                    + ("H.264" if encoded_h264_mode else "VP8")
+                    + " capture; activation deferred until independent audio "
+                    + "recorder starts for A/V synchronization"
                 )
-
-                if encoded_wait.get("ok"):
-                    encoded_video_mode = True
-                    encoded_video_started = True
-                    video_capture_mode = (
-                        "webrtc-encoded-h264" if encoded_h264_mode
-                        else "webrtc-encoded-vp8"
-                    )
-                    log(
-                        "Using direct encoded WebRTC "
-                        + ("H.264" if encoded_h264_mode else "VP8")
-                        + " capture; MediaRecorder video encoder is bypassed"
-                    )
-                else:
-                    raise RuntimeError(
-                        "Encoded WebRTC transform was installed but did not "
-                        "produce a first frame: "
-                        + json.dumps(encoded_wait, ensure_ascii=False)
-                    )
 
             except Exception as e:
                 log(
@@ -6845,21 +6620,38 @@ async def run_recording(playwright):
             )
 
             try:
-                audio_start_result = await page.evaluate(
-                    """
-                    ([audioBitrate, timeslice, attemptId]) =>
-                        window.__superliveStartAudioRec(
-                            audioBitrate,
-                            timeslice,
-                            attemptId
-                        )
-                    """,
-                    [
-                        AUDIO_BITRATE,
-                        1000,
-                        audio_attempt_id,
-                    ],
-                )
+                if encoded_video_mode:
+                    audio_start_result = await page.evaluate(
+                        """
+                        ([audioBitrate, timeslice, attemptId]) =>
+                            window.__superliveStartAudioAndActivateEncodedVideo(
+                                audioBitrate,
+                                timeslice,
+                                attemptId
+                            )
+                        """,
+                        [
+                            AUDIO_BITRATE,
+                            1000,
+                            audio_attempt_id,
+                        ],
+                    )
+                else:
+                    audio_start_result = await page.evaluate(
+                        """
+                        ([audioBitrate, timeslice, attemptId]) =>
+                            window.__superliveStartAudioRec(
+                                audioBitrate,
+                                timeslice,
+                                attemptId
+                            )
+                        """,
+                        [
+                            AUDIO_BITRATE,
+                            1000,
+                            audio_attempt_id,
+                        ],
+                    )
 
                 log(
                     "Independent audio recorder started: "
@@ -6868,6 +6660,36 @@ async def run_recording(playwright):
                         ensure_ascii=False,
                     )
                 )
+
+                if encoded_video_mode:
+                    encoded_activation = audio_start_result.get("video")
+                    log(
+                        "Encoded WebRTC video activation synchronized with audio start: "
+                        + json.dumps(encoded_activation, ensure_ascii=False)
+                    )
+                    if not encoded_activation or not encoded_activation.get("ok"):
+                        raise RuntimeError(
+                            "Failed to activate encoded video after starting audio: "
+                            + json.dumps(encoded_activation, ensure_ascii=False)
+                        )
+
+                    encoded_wait = await page.evaluate(
+                        """
+                        () => window.__superliveWaitEncodedVideoFrame
+                            ? window.__superliveWaitEncodedVideoFrame(5000)
+                            : {ok: false, reason: "encoded_wait_missing"}
+                        """
+                    )
+                    log(
+                        "First encoded WebRTC video frame: "
+                        + json.dumps(encoded_wait, ensure_ascii=False)
+                    )
+                    if not encoded_wait.get("ok"):
+                        raise RuntimeError(
+                            "Encoded WebRTC video did not produce a first frame "
+                            "after synchronized activation: "
+                            + json.dumps(encoded_wait, ensure_ascii=False)
+                        )
 
                 audio_first_chunk = await page.evaluate(
                     """
@@ -6930,6 +6752,36 @@ async def run_recording(playwright):
                     pass
                 raise
 
+        if encoded_video_mode and not audio_expected:
+            encoded_activation = await page.evaluate(
+                """
+                () => window.__superliveActivateEncodedVideo
+                    ? window.__superliveActivateEncodedVideo()
+                    : {ok: false, reason: "encoded_activation_missing"}
+                """
+            )
+            log(
+                "Encoded WebRTC video activation completed (no audio track): "
+                + json.dumps(encoded_activation, ensure_ascii=False)
+            )
+            if not encoded_activation.get("ok"):
+                raise RuntimeError(
+                    "Failed to activate encoded video without audio: "
+                    + json.dumps(encoded_activation, ensure_ascii=False)
+                )
+            encoded_wait = await page.evaluate(
+                """
+                () => window.__superliveWaitEncodedVideoFrame
+                    ? window.__superliveWaitEncodedVideoFrame(5000)
+                    : {ok: false, reason: "encoded_wait_missing"}
+                """
+            )
+            if not encoded_wait.get("ok"):
+                raise RuntimeError(
+                    "Encoded WebRTC video did not produce a first frame: "
+                    + json.dumps(encoded_wait, ensure_ascii=False)
+                )
+
         # ----------------------------------------------------
         # Main recording loop
         # ----------------------------------------------------
@@ -6942,9 +6794,6 @@ async def run_recording(playwright):
         )
         last_encoded_frame_count = 0
         last_encoded_frame_progress_at = time.monotonic()
-        last_inbound_video_signature = None
-        last_inbound_video_track_id = None
-        last_inbound_video_progress_at = time.monotonic()
 
         while True:
             elapsed = (
@@ -7081,81 +6930,32 @@ async def run_recording(playwright):
                         - last_encoded_frame_progress_at
                     )
 
-                    # Detect stream end using ONLY the WebRTC receiver that
-                    # the encoded recorder is actually attached to.  The page
-                    # may keep other broadcasts/receivers alive after the
-                    # requested stream ends; global inboundVideo progress from
-                    # those tracks must never keep this recording alive.
-                    try:
-                        attached_stats = await page.evaluate(
-                            """
-                            () =>
-                                window.__superliveGetEncodedAttachedTrackStats
-                                    ? window.__superliveGetEncodedAttachedTrackStats()
-                                    : null
-                            """
-                        )
-                    except Exception:
-                        attached_stats = None
-
-                    attached_track_id = (
-                        attached_stats.get("trackId")
-                        if isinstance(attached_stats, dict)
-                        else None
-                    )
-
-                    if attached_track_id != last_inbound_video_track_id:
-                        last_inbound_video_track_id = attached_track_id
-                        last_inbound_video_signature = None
-                        last_inbound_video_progress_at = time.monotonic()
-
-                    attached_inbound = None
-                    if isinstance(attached_stats, dict):
-                        attached_inbound = attached_stats.get("inbound")
-
-                    if isinstance(attached_inbound, dict):
-                        attached_signature = (
-                            str(attached_inbound.get("trackIdentifier") or attached_track_id or ""),
-                            int(attached_inbound.get("ssrc") or 0),
-                            int(attached_inbound.get("framesReceived") or 0),
-                            int(attached_inbound.get("packetsReceived") or 0),
-                            int(attached_inbound.get("bytesReceived") or 0),
-                        )
-
-                        if attached_signature != last_inbound_video_signature:
-                            last_inbound_video_signature = attached_signature
-                            last_inbound_video_progress_at = time.monotonic()
-                    else:
-                        # A missing inbound report or ended track is itself
-                        # evidence that the attached receiver stopped.  Reset
-                        # only when the attached identity changes; otherwise
-                        # allow the idle timer to mature.
-                        if (
-                            isinstance(attached_stats, dict)
-                            and attached_stats.get("trackReadyState") == "ended"
-                        ):
-                            last_inbound_video_progress_at = min(
-                                last_inbound_video_progress_at,
-                                time.monotonic() - STREAM_END_IDLE_TIMEOUT,
-                            )
-
-                    inbound_idle_seconds = (
-                        time.monotonic()
-                        - last_inbound_video_progress_at
-                    )
-
                     if (
                         current_encoded_frame_count > 0
                         and encoded_idle_seconds >= STREAM_END_IDLE_TIMEOUT
-                        and inbound_idle_seconds >= STREAM_END_IDLE_TIMEOUT
                     ):
-                        log(
-                            "Stream end detected on attached encoded track: "
-                            f"track={attached_track_id} "
-                            f"encoded_idle={encoded_idle_seconds:.1f}s "
-                            f"attached_receiver_idle={inbound_idle_seconds:.1f}s"
-                        )
-                        break
+                        try:
+                            end_stats = await page.evaluate(
+                                """
+                                () =>
+                                    window.__superliveGetWebRTCStats
+                                        ? window.__superliveGetWebRTCStats()
+                                        : null
+                                """
+                            )
+                        except Exception:
+                            end_stats = None
+
+                        inbound_video = []
+                        if isinstance(end_stats, dict):
+                            inbound_video = end_stats.get("inboundVideo") or []
+
+                        if not inbound_video:
+                            log(
+                                "Stream end detected: no new encoded video frames "
+                                f"for {encoded_idle_seconds:.1f}s and WebRTC inbound video is empty"
+                            )
+                            break
 
                 if (
                     time.monotonic()
@@ -7236,40 +7036,6 @@ async def run_recording(playwright):
                                 ensure_ascii=False,
                             )
                         )
-
-                        if encoded_video_mode and isinstance(webrtc_diag, dict):
-                            # Only sample FPS from the selected encoded video
-                            # track. Stale/secondary receivers can report a
-                            # different FPS and must never affect the timing of
-                            # the stream we are actually recording.
-                            selected_track_id = webrtc_diag.get("selectedTrackId")
-                            fps_items = []
-
-                            for item in webrtc_diag.get("matching") or []:
-                                if not isinstance(item, dict):
-                                    continue
-                                if selected_track_id and item.get("trackIdentifier") != selected_track_id:
-                                    continue
-                                fps_items.append(item)
-
-                            if not fps_items and selected_track_id:
-                                for item in webrtc_diag.get("inboundVideo") or []:
-                                    if (
-                                        isinstance(item, dict)
-                                        and item.get("trackIdentifier") == selected_track_id
-                                    ):
-                                        fps_items.append(item)
-
-                            for item in fps_items:
-                                fps = item.get("framesPerSecond")
-                                try:
-                                    fps = float(fps)
-                                except (TypeError, ValueError):
-                                    continue
-                                if 1.0 <= fps <= 120.0:
-                                    encoded_video_observed_fps.append(fps)
-                                    if len(encoded_video_observed_fps) > 120:
-                                        del encoded_video_observed_fps[:-120]
                     except Exception as e:
                         log(
                             f"WebRTC stats diagnostic error: {e}"
@@ -7737,67 +7503,25 @@ async def run_recording(playwright):
                         "Encoded H.264 capture contains no validated IDR key frame; "
                         "refusing to remux/upload"
                     )
-                # The raw H.264 file cannot carry arbitrary per-frame RTP
-                # timestamps, so its CFR timeline must use the *whole capture
-                # span*, not a local median frame delta or a short WebRTC FPS
-                # sample. The selected receiver can legitimately vary between
-                # 27-31 FPS during a long capture. Using a median local delta
-                # (for example 2970 RTP ticks ~= 30.303 FPS) compresses the
-                # complete video timeline when the real RTP span is longer.
-                # That makes the independently recorded audio appear late.
-                #
-                # The target-locked receiver now guarantees that the first and
-                # last encoded timestamps belong to the same media track. With
-                # zero timestamp regressions, the capture-span FPS preserves
-                # the real elapsed media duration while keeping the output CFR
-                # and smooth.
-                H264_RTP_CLOCK_HZ = 90_000.0
-                span_ticks = None
-                if (
-                    encoded_video_first_timestamp is not None
-                    and encoded_video_last_timestamp is not None
-                    and encoded_video_frame_count > 1
-                    and encoded_video_last_timestamp >= encoded_video_first_timestamp
-                    and encoded_video_timestamp_regressions == 0
-                ):
-                    span_ticks = (
-                        encoded_video_last_timestamp
-                        - encoded_video_first_timestamp
+                if not encoded_video_timestamp_deltas:
+                    log(
+                        "WARNING: Encoded H.264 capture has no usable positive "
+                        "timestamp deltas; using 30 FPS for raw-H.264 remux timing"
                     )
-
-                if span_ticks and span_ticks > 0:
-                    capture_span_seconds = span_ticks / H264_RTP_CLOCK_HZ
-                    source_fps = (
-                        (encoded_video_frame_count - 1)
-                        / capture_span_seconds
-                    )
-                    if not (1.0 <= source_fps <= 120.0):
-                        source_fps = None
-                    else:
-                        timing_basis = "RTP capture-span CFR"
-                        median_delta = None
-
-                if source_fps is None:
-                    valid_observed_fps = [
-                        float(value)
-                        for value in encoded_video_observed_fps
-                        if 1.0 <= float(value) <= 120.0
+                    # 30 FPS on the 90 kHz RTP clock = 3000 ticks/frame.
+                    encoded_video_timestamp_deltas = [
+                        round(90_000 / 30)
                     ]
-                    if valid_observed_fps:
-                        sorted_fps = sorted(valid_observed_fps)
-                        source_fps = sorted_fps[len(sorted_fps) // 2]
-                        timing_basis = "WebRTC observed framesPerSecond fallback"
-                        median_delta = None
-                    elif encoded_video_timestamp_deltas:
-                        sorted_deltas = sorted(encoded_video_timestamp_deltas)
-                        median_delta = sorted_deltas[len(sorted_deltas) // 2]
-                        source_fps = H264_RTP_CLOCK_HZ / median_delta
-                        source_fps = max(1.0, min(120.0, source_fps))
-                        timing_basis = "median RTP timestamp delta fallback"
-                    else:
-                        median_delta = None
-                        source_fps = 30.0
-                        timing_basis = "30 FPS fallback"
+                sorted_deltas = sorted(encoded_video_timestamp_deltas)
+                median_delta = sorted_deltas[len(sorted_deltas) // 2]
+
+                # Chromium's WebRTC EncodedVideoChunk timestamp for this
+                # RTP/H.264 receiver is expressed on the video RTP clock,
+                # i.e. 90,000 ticks/second. It is NOT a microsecond value.
+                # Example from the successful capture: delta=2970 ticks
+                # corresponds to 90,000 / 2970 = 30.303 FPS.
+                H264_RTP_CLOCK_HZ = 90_000.0
+                source_fps = H264_RTP_CLOCK_HZ / median_delta
 
                 log(
                     "Final encoded H.264: "
@@ -7806,9 +7530,7 @@ async def run_recording(playwright):
                     f"keyframes={encoded_video_keyframe_count}, "
                     f"timestamp_regressions={encoded_video_timestamp_regressions}, "
                     f"median_frame_delta_rtp_ticks={median_delta}, "
-                    f"observed_fps_samples={len(valid_observed_fps)}, "
-                    f"source_fps={source_fps:.3f}, "
-                    f"timing_basis={timing_basis}"
+                    f"source_fps={source_fps:.3f}"
                 )
                 remux_h264_to_mkv(
                     h264_path, h264_mkv_path,
