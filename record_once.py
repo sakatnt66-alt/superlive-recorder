@@ -3733,28 +3733,62 @@ WEBRTC_HOOK = r"""
 
         const getPeerAudioCandidates = () => {
             const candidates = [];
-            const peer =
+            const seen = new Set();
+            let selectedPeer =
                 window.__superliveTrackPeers.get(
                     selectedVideoTrack
-                );
+                ) || null;
 
-            if (!peer) {
+            const addCandidate = (track) => {
+                if (
+                    !track
+                    || track.kind !== "audio"
+                    || track.readyState !== "live"
+                    || seen.has(track.id)
+                ) {
+                    return;
+                }
+
+                seen.add(track.id);
+                candidates.push(track);
+            };
+
+            /*
+             * Normally the selected video track is already mapped to the
+             * PeerConnection that delivered it.  During receiver rebinding
+             * that WeakMap entry can briefly refer to the old track object.
+             * In that case, recover the SAME PeerConnection by matching the
+             * selected track object/id against its current receivers.
+             */
+            if (!selectedPeer) {
+                for (const pc of window.__superlivePeerConnections) {
+                    try {
+                        const receivers = pc.getReceivers();
+                        if (receivers.some(
+                            receiver =>
+                                receiver
+                                && receiver.track
+                                && (
+                                    receiver.track === selectedVideoTrack
+                                    || receiver.track.id === selectedVideoTrack.id
+                                )
+                        )) {
+                            selectedPeer = pc;
+                            break;
+                        }
+                    } catch (e) {
+                        // Ignore a stale/closed PeerConnection.
+                    }
+                }
+            }
+
+            if (!selectedPeer) {
                 return candidates;
             }
 
             try {
-                for (const receiver of peer.getReceivers()) {
-                    const track = receiver && receiver.track;
-
-                    if (
-                        !track
-                        || track.kind !== "audio"
-                        || track.readyState !== "live"
-                    ) {
-                        continue;
-                    }
-
-                    candidates.push(track);
+                for (const receiver of selectedPeer.getReceivers()) {
+                    addCandidate(receiver && receiver.track);
                 }
             } catch (e) {
                 console.warn(
@@ -3785,11 +3819,40 @@ WEBRTC_HOOK = r"""
             }
 
             /*
-             * Some players attach audio to the same MediaStream object
-             * a little after the video track arrives.  Search every
-             * remembered stream, but ONLY when that stream contains
-             * the exact selected video track.
+             * Some players expose video and audio on different
+             * MediaStream objects but advertise the same event.streams
+             * id on the corresponding WebRTC tracks.  The selected
+             * <video>.srcObject.id is not always that WebRTC stream id.
+             * Therefore also search remembered streams by the exact
+             * stream ids recorded for the selected video track.
+             *
+             * This remains an association to the selected WebRTC track;
+             * it does NOT fall back to arbitrary page-global audio.
              */
+            const selectedStreamIds = new Set(
+                (
+                    window.__superliveTrackStreamIds.get(
+                        selectedVideoTrack
+                    ) || []
+                ).filter(Boolean)
+            );
+
+            if (selectedStreamIds.size) {
+                for (const stream of window.__superliveStreams) {
+                    try {
+                        if (!stream || !selectedStreamIds.has(stream.id)) {
+                            continue;
+                        }
+
+                        for (const track of stream.getAudioTracks()) {
+                            addAudioCandidate(track);
+                        }
+                    } catch (e) {
+                        // Ignore stale/detached MediaStream objects.
+                    }
+                }
+            }
+
             /*
              * Some players expose video and audio on different
              * MediaStream objects even though both tracks belong to
@@ -3824,7 +3887,7 @@ WEBRTC_HOOK = r"""
         collectAssociatedAudio();
 
         const audioWaitDeadline =
-            performance.now() + 10000;
+            performance.now() + 20000;
 
         while (
             audioCandidates.length === 0
