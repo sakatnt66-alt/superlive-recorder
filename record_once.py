@@ -1567,7 +1567,15 @@ def remux_h264_to_mkv(
     expected_video_packets: int,
     frame_rate: float,
 ):
-    """Remux captured encoded H.264 into Matroska without re-encoding."""
+    """Remux captured encoded H.264 with a synthetic monotonic CFR timeline.
+
+    The browser-side encoded-frame timestamp can jump when the WebRTC
+    receiver is rebound. The raw H.264 payload does not carry those RTP
+    timestamps, and FFmpeg may derive conflicting DTS from H.264 picture
+    ordering. The setts bitstream filter replaces packet timing with a
+    deterministic frame-index timeline while leaving every H.264 payload
+    byte unchanged.
+    """
     if not h264_path.exists() or h264_path.stat().st_size <= 0:
         raise RuntimeError("Encoded H.264 capture is missing or empty")
 
@@ -1588,6 +1596,8 @@ def remux_h264_to_mkv(
         "0:v:0",
         "-c:v",
         "copy",
+        "-bsf:v",
+        f"setts=pts=N*90000/{frame_rate:.12f}+6000:dts=N*90000/{frame_rate:.12f}:time_base=1/90000",
         "-f",
         "matroska",
         str(mkv_path),
@@ -1612,7 +1622,8 @@ def remux_h264_to_mkv(
     log(
         "Encoded H.264 Matroska packet integrity: "
         f"expected={expected_video_packets} actual={actual_packets} "
-        f"source_fps={frame_rate:.3f}"
+        f"source_fps={frame_rate:.3f} "
+        "timing=synthetic_frame_index_cfr"
     )
     if actual_packets != expected_video_packets:
         raise RuntimeError(
