@@ -1878,7 +1878,14 @@ WEBRTC_HOOK = r"""
     window.__superliveTrackLinks = new Map();
     window.__superliveTrackPeers = new WeakMap();
     window.__superliveTrackStreams = new WeakMap();
+    window.__superliveTrackStreamIds = new WeakMap();
     window.__superlivePeerConnections = [];
+    window.__superliveInboundStats = [];
+
+    /* Set from Python after navigation so the selector can use the
+     * exact livestream id as a positive identity hint when the page
+     * exposes it in DOM/stream metadata. */
+    window.__superliveTargetStreamId = null;
 
     const OriginalRTCPeerConnection =
         window.RTCPeerConnection;
@@ -1964,6 +1971,17 @@ WEBRTC_HOOK = r"""
                             event.streams || [];
 
                         if (streams.length) {
+                            window.__superliveTrackStreams.set(
+                                track,
+                                streams.slice()
+                            );
+                            window.__superliveTrackStreamIds.set(
+                                track,
+                                streams.map(
+                                    stream => stream && stream.id
+                                ).filter(Boolean)
+                            );
+
                             for (
                                 const stream
                                 of streams
@@ -1974,6 +1992,14 @@ WEBRTC_HOOK = r"""
                                 );
                             }
                         } else {
+                            window.__superliveTrackStreams.set(
+                                track,
+                                []
+                            );
+                            window.__superliveTrackStreamIds.set(
+                                track,
+                                []
+                            );
                             rememberTrack(
                                 track,
                                 null
@@ -1993,7 +2019,7 @@ WEBRTC_HOOK = r"""
     window.RTCPeerConnection =
         WrappedRTCPeerConnection;
 
-    window.__superliveSelectTargetVideo = () => {
+    window.__superliveSelectTargetVideo = async () => {
         const videos = Array.from(
             document.querySelectorAll("video")
         );
@@ -2003,9 +2029,123 @@ WEBRTC_HOOK = r"""
         const viewportHeight =
             window.innerHeight || document.documentElement.clientHeight || 0;
 
-        let best = null;
+        const targetId =
+            window.__superliveTargetStreamId
+                ? String(window.__superliveTargetStreamId)
+                : null;
 
-        for (const video of videos) {
+        const getInboundStats = async () => {
+            const results = [];
+
+            for (const pc of window.__superlivePeerConnections) {
+                try {
+                    const stats = await pc.getStats();
+                    stats.forEach(report => {
+                        if (report.type !== "inbound-rtp") return;
+                        const kind = report.kind || report.mediaType || null;
+                        if (kind !== "video" && kind !== "audio") return;
+
+                        results.push({
+                            kind,
+                            trackIdentifier: report.trackIdentifier || null,
+                            framesReceived: report.framesReceived ?? null,
+                            framesDecoded: report.framesDecoded ?? null,
+                            framesDropped: report.framesDropped ?? null,
+                            framesPerSecond: report.framesPerSecond ?? null,
+                            packetsReceived: report.packetsReceived ?? null,
+                            packetsLost: report.packetsLost ?? null,
+                            bytesReceived: report.bytesReceived ?? null,
+                        });
+                    });
+                } catch (e) {}
+            }
+
+            return results;
+        };
+
+        const inboundStats = await getInboundStats();
+        window.__superliveInboundStats = inboundStats;
+
+        const findTrackStats = trackId =>
+            inboundStats.find(
+                item =>
+                    item.kind === "video"
+                    && item.trackIdentifier === trackId
+            ) || null;
+
+        const domContainsTargetId = (element) => {
+            if (!targetId || !element) return false;
+
+            let node = element;
+            let depth = 0;
+
+            while (node && depth < 8) {
+                try {
+                    const values = [
+                        node.id,
+                        node.className,
+                        node.getAttribute && node.getAttribute("data-stream-id"),
+                        node.getAttribute && node.getAttribute("data-id"),
+                        node.getAttribute && node.getAttribute("data-livestream-id"),
+                        node.getAttribute && node.getAttribute("data-channel-id"),
+                        node.getAttribute && node.getAttribute("data-video-id"),
+                        node.getAttribute && node.getAttribute("href"),
+                    ];
+
+                    if (
+                        values.some(
+                            value =>
+                                value != null
+                                && String(value).includes(targetId)
+                        )
+                    ) {
+                        return true;
+                    }
+
+                    /* A player container may keep the livestream id on
+                     * a descendant link/button rather than on the
+                     * container itself. Check a small subtree so a
+                     * recommendation/player card can be tied to the
+                     * exact requested livestream without using global
+                     * page state. */
+                    if (node.querySelector) {
+                        const descendants = node.querySelectorAll(
+                            '[href], [data-stream-id], [data-livestream-id], [data-video-id]'
+                        );
+
+                        for (const descendant of descendants) {
+                            const descendantValues = [
+                                descendant.getAttribute && descendant.getAttribute("href"),
+                                descendant.getAttribute && descendant.getAttribute("data-stream-id"),
+                                descendant.getAttribute && descendant.getAttribute("data-livestream-id"),
+                                descendant.getAttribute && descendant.getAttribute("data-video-id"),
+                            ];
+
+                            if (
+                                descendantValues.some(
+                                    value =>
+                                        value != null
+                                        && String(value).includes(targetId)
+                                )
+                            ) {
+                                return true;
+                            }
+                        }
+                    }
+                } catch (e) {}
+
+                node = node.parentElement;
+                depth++;
+            }
+
+            return false;
+        };
+
+        const candidates = [];
+
+        for (let index = 0; index < videos.length; index++) {
+            const video = videos[index];
+
             try {
                 const stream = video.srcObject;
                 if (!stream) continue;
@@ -2020,9 +2160,9 @@ WEBRTC_HOOK = r"""
 
                 const style = getComputedStyle(video);
                 if (
-                    style.display === "none" ||
-                    style.visibility === "hidden" ||
-                    style.opacity === "0"
+                    style.display === "none"
+                    || style.visibility === "hidden"
+                    || style.opacity === "0"
                 ) {
                     continue;
                 }
@@ -2032,47 +2172,113 @@ WEBRTC_HOOK = r"""
                 const top = Math.max(0, rect.top);
                 const right = Math.min(viewportWidth, rect.right);
                 const bottom = Math.min(viewportHeight, rect.bottom);
-
                 const visibleWidth = Math.max(0, right - left);
                 const visibleHeight = Math.max(0, bottom - top);
                 const visibleArea = visibleWidth * visibleHeight;
 
                 if (visibleArea <= 0) continue;
 
-                if (!best || visibleArea > best.visibleArea) {
-                    best = {
-                        video,
-                        stream,
-                        videoTrack,
-                        visibleArea,
-                        rect,
-                    };
-                }
+                const stats = findTrackStats(videoTrack.id);
+                const streamIds =
+                    window.__superliveTrackStreamIds.get(videoTrack) || [];
+                const peer =
+                    window.__superliveTrackPeers.get(videoTrack) || null;
+
+                const sameTargetDom = domContainsTargetId(video);
+                const activePackets =
+                    stats && Number(stats.packetsReceived || 0) > 0;
+                const activeDecoded =
+                    stats && Number(stats.framesDecoded || 0) > 0;
+                const fps =
+                    stats && Number.isFinite(Number(stats.framesPerSecond))
+                        ? Number(stats.framesPerSecond)
+                        : 0;
+
+                /*
+                 * Selection priority:
+                 *   1. An explicit DOM reference to the requested stream id.
+                 *   2. A real inbound WebRTC receiver for this exact track.
+                 *   3. Visibility/size of the actual player.
+                 *
+                 * FPS is deliberately NOT used as identity.  It is only a
+                 * diagnostic field, because another broadcaster can also be
+                 * 30 FPS.
+                 */
+                let identityScore = 0;
+                if (sameTargetDom) identityScore += 1000000;
+                if (activePackets) identityScore += 10000;
+                if (activeDecoded) identityScore += 1000;
+
+                const score =
+                    identityScore
+                    + Math.min(visibleArea, 1000000) / 100
+                    + Math.min(fps, 120);
+
+                candidates.push({
+                    index,
+                    video,
+                    stream,
+                    videoTrack,
+                    rect,
+                    visibleArea,
+                    streamIds,
+                    peer,
+                    sameTargetDom,
+                    stats,
+                    score,
+                });
             } catch (e) {
                 console.warn("superlive target selection error", e);
             }
         }
 
-        if (!best) {
+        if (!candidates.length) {
             throw new Error("No visible live video target found");
         }
+
+        candidates.sort((a, b) => b.score - a.score);
+        const best = candidates[0];
 
         window.__superliveSelectedVideo = best.video;
         window.__superliveSelectedStream = best.stream;
         window.__superliveSelectedVideoTrack = best.videoTrack;
 
         return {
-            index: videos.indexOf(best.video),
-            width: best.video.videoWidth,
-            height: best.video.videoHeight,
-            visibleArea: best.visibleArea,
-            rect: {
-                x: best.rect.x,
-                y: best.rect.y,
-                width: best.rect.width,
-                height: best.rect.height,
+            selected: {
+                index: best.index,
+                width: best.video.videoWidth,
+                height: best.video.videoHeight,
+                visibleArea: best.visibleArea,
+                rect: {
+                    x: best.rect.x,
+                    y: best.rect.y,
+                    width: best.rect.width,
+                    height: best.rect.height,
+                },
+                trackId: best.videoTrack.id,
+                streamId: best.stream.id || null,
+                streamIds: best.streamIds,
+                sameTargetDom: best.sameTargetDom,
+                inboundStats: best.stats,
             },
-            trackId: best.videoTrack.id,
+            candidates: candidates.map(item => ({
+                index: item.index,
+                width: item.video.videoWidth,
+                height: item.video.videoHeight,
+                visibleArea: item.visibleArea,
+                rect: {
+                    x: item.rect.x,
+                    y: item.rect.y,
+                    width: item.rect.width,
+                    height: item.rect.height,
+                },
+                trackId: item.videoTrack.id,
+                streamId: item.stream.id || null,
+                streamIds: item.streamIds,
+                sameTargetDom: item.sameTargetDom,
+                score: item.score,
+                inboundStats: item.stats,
+            })),
         };
     };
 
@@ -2233,7 +2439,7 @@ WEBRTC_HOOK = r"""
                 !selectedVideo ||
                 !selectedStream
             ) {
-                window.__superliveSelectTargetVideo();
+                await window.__superliveSelectTargetVideo();
                 selectedVideo = window.__superliveSelectedVideo;
                 selectedStream = window.__superliveSelectedStream;
                 selectedVideoTrack = window.__superliveSelectedVideoTrack;
@@ -2493,7 +2699,7 @@ WEBRTC_HOOK = r"""
                 );
 
                 try {
-                    window.__superliveSelectTargetVideo();
+                    await window.__superliveSelectTargetVideo();
                     selectedVideo =
                         window.__superliveSelectedVideo;
                     selectedStream =
@@ -4092,6 +4298,16 @@ async def run_recording(playwright):
             timeout=PAGE_TIMEOUT_MS,
         )
 
+        await page.evaluate(
+            """
+            (streamId) => {
+                window.__superliveTargetStreamId =
+                    streamId || null;
+            }
+            """,
+            STREAM_ID,
+        )
+
         log(
             "Page loaded. "
             "Waiting for live video..."
@@ -4115,62 +4331,25 @@ async def run_recording(playwright):
             try:
                 result = await page.evaluate(
                     """
-                    () => {
-                        const videos =
-                            Array.from(
-                                document.querySelectorAll("video")
-                            );
+                    async () => {
+                        try {
+                            if (!window.__superliveSelectTargetVideo) {
+                                return {ready: false};
+                            }
 
-                        for (const video of videos) {
-                            try {
-                                const stream =
-                                    video.srcObject;
+                            const selection =
+                                await window.__superliveSelectTargetVideo();
 
-                                if (!stream) {
-                                    continue;
-                                }
-
-                                const videoTracks =
-                                    stream.getVideoTracks();
-
-                                const audioTracks =
-                                    stream.getAudioTracks();
-
-                                const liveVideo =
-                                    videoTracks.some(
-                                        t =>
-                                            t.readyState
-                                            === "live"
-                                    );
-
-                                const liveAudio =
-                                    audioTracks.some(
-                                        t =>
-                                            t.readyState
-                                            === "live"
-                                    );
-
-                                if (
-                                    video.videoWidth > 0 &&
-                                    video.videoHeight > 0 &&
-                                    liveVideo
-                                ) {
-                                    return {
-                                        ready: true,
-                                        width:
-                                            video.videoWidth,
-                                        height:
-                                            video.videoHeight,
-                                        audio:
-                                            liveAudio
-                                    };
-                                }
-                            } catch (e) {}
+                            return {
+                                ready: true,
+                                selection,
+                            };
+                        } catch (e) {
+                            return {
+                                ready: false,
+                                error: String(e),
+                            };
                         }
-
-                        return {
-                            ready: false
-                        };
                     }
                     """
                 )
@@ -4178,12 +4357,23 @@ async def run_recording(playwright):
                 if result.get("ready"):
                     video_ready = True
 
+                    selection = result.get("selection") or {}
+                    selected = selection.get("selected") or {}
+
                     log(
                         "Live video detected: "
-                        f"{result.get('width')}x"
-                        f"{result.get('height')} "
-                        "audio="
-                        f"{result.get('audio')}"
+                        f"{selected.get('width')}x"
+                        f"{selected.get('height')} "
+                        f"track={selected.get('trackId')} "
+                        f"stream={selected.get('streamId')}"
+                    )
+
+                    log(
+                        "Video target candidates: "
+                        + json.dumps(
+                            selection.get("candidates", []),
+                            ensure_ascii=False,
+                        )
                     )
 
                     break
