@@ -231,7 +231,7 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 VIDEO_BITRATE = 2_000_000
 AUDIO_BITRATE = 128_000
 
-VIDEO_WAIT_SECONDS = 60
+VIDEO_WAIT_SECONDS = 120
 PAGE_TIMEOUT_MS = 30_000
 FIRST_CHUNK_TIMEOUT_SECONDS = 10
 
@@ -5387,6 +5387,8 @@ async def run_recording(playwright):
         # ----------------------------------------------------
 
         video_ready = False
+        last_detection_error = None
+        last_detection_log = 0.0
 
         wait_started = (
             time.monotonic()
@@ -5423,6 +5425,90 @@ async def run_recording(playwright):
                     """
                 )
 
+                if not result.get("ready"):
+                    detection_error = result.get("error")
+                    if detection_error:
+                        last_detection_error = str(detection_error)
+
+                    now = time.monotonic()
+                    if now - last_detection_log >= 10:
+                        try:
+                            diagnostics = await page.evaluate(
+                                """
+                                (targetId) => {
+                                    const videos = Array.from(document.querySelectorAll("video"));
+                                    const describe = (video, index) => {
+                                        const stream = video.srcObject;
+                                        const tracks = stream
+                                            ? stream.getVideoTracks()
+                                            : [];
+                                        const liveTrack = tracks.find(
+                                            track => track.readyState === "live"
+                                        ) || null;
+                                        const rect = video.getBoundingClientRect();
+                                        const style = getComputedStyle(video);
+                                        let targetDom = false;
+                                        let node = video;
+                                        let depth = 0;
+                                        while (node && depth < 8) {
+                                            try {
+                                                const values = [
+                                                    node.id,
+                                                    node.className,
+                                                    node.getAttribute && node.getAttribute("data-stream-id"),
+                                                    node.getAttribute && node.getAttribute("data-id"),
+                                                    node.getAttribute && node.getAttribute("data-livestream-id"),
+                                                    node.getAttribute && node.getAttribute("data-channel-id"),
+                                                    node.getAttribute && node.getAttribute("data-video-id"),
+                                                    node.getAttribute && node.getAttribute("href"),
+                                                ];
+                                                if (values.some(value => value != null && String(value).includes(String(targetId || "")))) {
+                                                    targetDom = true;
+                                                    break;
+                                                }
+                                            } catch (e) {}
+                                            node = node.parentElement;
+                                            depth++;
+                                        }
+                                        return {
+                                            index,
+                                            hasSrcObject: !!stream,
+                                            videoTrackCount: tracks.length,
+                                            liveTrack: !!liveTrack,
+                                            trackId: liveTrack ? liveTrack.id : null,
+                                            readyState: video.readyState,
+                                            width: video.videoWidth,
+                                            height: video.videoHeight,
+                                            rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
+                                            display: style.display,
+                                            visibility: style.visibility,
+                                            opacity: style.opacity,
+                                            targetDom,
+                                        };
+                                    };
+                                    return {
+                                        targetId: targetId || null,
+                                        videoCount: videos.length,
+                                        videos: videos.map(describe),
+                                    };
+                                }
+                                """,
+                                STREAM_ID,
+                            )
+                            log(
+                                "Video detection diagnostics: "
+                                + json.dumps(
+                                    diagnostics,
+                                    ensure_ascii=False,
+                                )
+                            )
+                        except Exception as diagnostic_error:
+                            log(
+                                "Video detection diagnostics error: "
+                                f"{diagnostic_error}"
+                            )
+                        last_detection_log = now
+
                 if result.get("ready"):
                     video_ready = True
 
@@ -5455,8 +5541,14 @@ async def run_recording(playwright):
             await asyncio.sleep(1)
 
         if not video_ready:
+            detail = (
+                f"; last selector error={last_detection_error}"
+                if last_detection_error
+                else ""
+            )
             raise RuntimeError(
                 "Live video was not detected"
+                + detail
             )
 
         # ----------------------------------------------------
