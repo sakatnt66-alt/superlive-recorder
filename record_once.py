@@ -239,6 +239,7 @@ STREAM_ID = os.environ.get("STREAM_ID", "")
 
 STOP_CHECK_INTERVAL = 3
 STREAM_IDLE_TIMEOUT = 20
+STREAM_END_IDLE_TIMEOUT = 60
 
 MIN_CHUNK_SIZE = 500
 
@@ -6677,6 +6678,8 @@ async def run_recording(playwright):
         last_encoded_rebind_check = (
             time.monotonic()
         )
+        last_encoded_frame_count = 0
+        last_encoded_frame_progress_at = time.monotonic()
 
         while True:
             elapsed = (
@@ -6793,6 +6796,52 @@ async def run_recording(playwright):
                         raise RuntimeError(
                             "Encoded video upload counters stopped advancing"
                         )
+
+                    current_encoded_frame_count = int(
+                        encoded_status.get("frameCount", 0) or 0
+                    )
+
+                    if current_encoded_frame_count > last_encoded_frame_count:
+                        last_encoded_frame_count = current_encoded_frame_count
+                        last_encoded_frame_progress_at = time.monotonic()
+                    elif current_encoded_frame_count < last_encoded_frame_count:
+                        # A browser-side receiver/rebind should never reset the
+                        # counter, but do not treat an unexpected reset as an
+                        # end-of-stream signal. Start the inactivity clock over.
+                        last_encoded_frame_count = current_encoded_frame_count
+                        last_encoded_frame_progress_at = time.monotonic()
+
+                    encoded_idle_seconds = (
+                        time.monotonic()
+                        - last_encoded_frame_progress_at
+                    )
+
+                    if (
+                        current_encoded_frame_count > 0
+                        and encoded_idle_seconds >= STREAM_END_IDLE_TIMEOUT
+                    ):
+                        try:
+                            end_stats = await page.evaluate(
+                                """
+                                () =>
+                                    window.__superliveGetWebRTCStats
+                                        ? window.__superliveGetWebRTCStats()
+                                        : null
+                                """
+                            )
+                        except Exception:
+                            end_stats = None
+
+                        inbound_video = []
+                        if isinstance(end_stats, dict):
+                            inbound_video = end_stats.get("inboundVideo") or []
+
+                        if not inbound_video:
+                            log(
+                                "Stream end detected: no new encoded video frames "
+                                f"for {encoded_idle_seconds:.1f}s and WebRTC inbound video is empty"
+                            )
+                            break
 
                 if (
                     time.monotonic()
