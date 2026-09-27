@@ -3806,11 +3806,21 @@ WEBRTC_HOOK = r"""
         }
 
         window.__superliveMaybeResolveAudioFinal = () => {
+            /*
+             * Final recorder completion is deliberately independent of the
+             * Telegram upload queue.  Once MediaRecorder has stopped and
+             * every dataavailable handler has finished enqueueing its blob,
+             * all recorder data is locally accounted for.  The upload queue
+             * is drained separately by the Python-side final queue check.
+             *
+             * Previously this also waited for the upload queue to become
+             * empty, so a large backlog at the exact moment the video track
+             * ended could make __superliveWaitAudioFinal() time out even
+             * though the audio recorder had already stopped correctly.
+             */
             if (
                 window.__superliveAudioStopFired
                 && window.__superliveAudioPendingDataTasks === 0
-                && window.__superliveAudioUploadQueue.length === 0
-                && !window.__superliveAudioIsUploading
                 && !window.__superliveAudioFinalDataReady
             ) {
                 window.__superliveAudioFinalDataReady = true;
