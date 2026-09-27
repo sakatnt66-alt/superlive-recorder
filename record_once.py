@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import subprocess
+import struct
 import sys
 import time
 import urllib.error
@@ -1426,6 +1427,78 @@ def verify_audio_file(path):
 # LOSSLESS WEBM VIDEO + AUDIO MUX
 # ============================================================
 
+def remux_ivf_to_webm(
+    ivf_path: Path,
+    webm_path: Path,
+    expected_video_packets: int,
+):
+    """Remux captured VP8 IVF frames into WebM without re-encoding."""
+    if not ivf_path.exists():
+        raise RuntimeError(
+            f"Encoded VP8 IVF file does not exist: {ivf_path}"
+        )
+
+    if ivf_path.stat().st_size <= 32:
+        raise RuntimeError(
+            "Encoded VP8 IVF file is unexpectedly small"
+        )
+
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-y",
+        "-i",
+        str(ivf_path),
+        "-map",
+        "0:v:0",
+        "-c:v",
+        "copy",
+        "-f",
+        "webm",
+        str(webm_path),
+    ]
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if result.stdout:
+        log("IVF -> WebM stdout:\n" + result.stdout.strip())
+
+    if result.stderr:
+        log("IVF -> WebM output:\n" + result.stderr.strip())
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "FFmpeg IVF -> WebM remux failed:\n"
+            + result.stderr
+        )
+
+    if not webm_path.exists() or webm_path.stat().st_size <= 32:
+        raise RuntimeError(
+            "FFmpeg reported success but encoded WebM was not created"
+        )
+
+    actual_packets = get_video_packet_count(get_video_info(webm_path))
+
+    log(
+        "Encoded WebM packet integrity: "
+        f"expected={expected_video_packets} "
+        f"actual={actual_packets}"
+    )
+
+    if actual_packets != expected_video_packets:
+        raise RuntimeError(
+            "Encoded video packet count changed during IVF -> WebM remux: "
+            f"expected={expected_video_packets}, actual={actual_packets}"
+        )
+
+
 def mux_webm_video_audio(
     video_path,
     audio_path,
@@ -1883,6 +1956,33 @@ WEBRTC_HOOK = r"""
     window.__superliveTrackStreamIds = new WeakMap();
     window.__superlivePeerConnections = [];
     window.__superliveInboundStats = [];
+    window.__superliveEncodedVideo = {
+        supported: false,
+        receivers: new Map(),
+        attachedTrackId: null,
+        receiverFound: false,
+        worker: null,
+        workerUrl: null,
+        port: null,
+        frameQueue: [],
+        uploadQueue: [],
+        uploading: false,
+        flushTimer: null,
+        frameCount: 0,
+        keyFrameCount: 0,
+        uploadedBatchCount: 0,
+        uploadedFrameCount: 0,
+        pendingDataTasks: 0,
+        uploadError: null,
+        firstFramePromise: null,
+        firstFrameResolve: null,
+        firstFrameReject: null,
+        started: false,
+        stopping: false,
+        lastTimestamp: null,
+        firstTimestamp: null,
+    };
+
 
     /* Set from Python after navigation so the selector can use the
      * exact livestream id as a positive identity hint when the page
@@ -1949,6 +2049,552 @@ WEBRTC_HOOK = r"""
         }
     }
 
+    const installEncodedVideoTransform = (receiver, track) => {
+        const state = window.__superliveEncodedVideo;
+
+        if (!receiver || !track || track.kind !== "video") {
+            return false;
+        }
+
+        if (state.receivers.has(track.id)) {
+            state.receiverFound = true;
+            return true;
+        }
+
+        if (
+            typeof RTCRtpScriptTransform !== "function"
+            || !window.RTCRtpReceiver
+            || !("transform" in RTCRtpReceiver.prototype)
+            || typeof Worker !== "function"
+            || typeof Blob !== "function"
+            || typeof URL.createObjectURL !== "function"
+        ) {
+            state.supported = false;
+            return false;
+        }
+
+        try {
+            const workerSource = `
+                addEventListener("rtctransform", (event) => {
+                    const transformer = event.transformer;
+                    const port = transformer.options.port;
+                    let active = false;
+
+                    port.onmessage = (messageEvent) => {
+                        const message = messageEvent.data || {};
+                        if (message.command === "set-active") {
+                            active = !!message.active;
+                            if (
+                                active
+                                && typeof transformer.sendKeyFrameRequest === "function"
+                            ) {
+                                transformer.sendKeyFrameRequest().catch(() => {});
+                            }
+                        }
+                    };
+
+                    const transform = new TransformStream({
+                        async transform(encodedFrame, controller) {
+                            try {
+                                if (!active) {
+                                    controller.enqueue(encodedFrame);
+                                    return;
+                                }
+
+                                const source = new Uint8Array(encodedFrame.data);
+                                const copy = new Uint8Array(source.byteLength);
+                                copy.set(source);
+
+                                port.postMessage({
+                                    timestamp: Number(encodedFrame.timestamp || 0),
+                                    duration: Number(encodedFrame.duration || 0),
+                                    type: encodedFrame.type || "delta",
+                                    data: copy.buffer,
+                                }, [copy.buffer]);
+                            } catch (error) {
+                                port.postMessage({
+                                    error: String(error),
+                                });
+                            }
+
+                            controller.enqueue(encodedFrame);
+                        },
+                    });
+
+                    transformer.readable
+                        .pipeThrough(transform)
+                        .pipeTo(transformer.writable)
+                        .catch((error) => {
+                            try {
+                                port.postMessage({
+                                    error: String(error),
+                                });
+                            } catch (ignored) {}
+                        });
+                });
+            `;
+
+            const blob = new Blob(
+                [workerSource],
+                {type: "application/javascript"}
+            );
+            const workerUrl = URL.createObjectURL(blob);
+            const worker = new Worker(workerUrl);
+            const channel = new MessageChannel();
+
+            state.supported = true;
+            state.receiverFound = true;
+
+            const entry = {
+                trackId: track.id,
+                worker,
+                workerUrl,
+                port: channel.port1,
+                active: false,
+            };
+
+            state.receivers.set(track.id, entry);
+
+            channel.port1.onmessage = (event) => {
+                const message = event.data || {};
+
+                if (message.error) {
+                    state.uploadError =
+                        state.uploadError ||
+                        String(message.error);
+                    return;
+                }
+
+                if (!message.data) {
+                    return;
+                }
+
+                const timestamp = Number(message.timestamp);
+                const data = message.data;
+
+                if (!entry.active) {
+                    return;
+                }
+
+                if (!Number.isFinite(timestamp)) {
+                    state.uploadError =
+                        "Encoded video frame has invalid timestamp";
+                    return;
+                }
+
+                if (message.type === "key") {
+                    state.seenKeyFrame = true;
+                    state.keyFrameCount++;
+                } else if (!state.seenKeyFrame) {
+                    // Never start an IVF/WebM file with a delta frame.
+                    return;
+                }
+
+                state.frameCount++;
+
+                if (state.firstTimestamp === null) {
+                    state.firstTimestamp = timestamp;
+                    if (state.firstFrameResolve) {
+                        state.firstFrameResolve({
+                            ok: true,
+                            timestamp,
+                            frameCount: state.frameCount,
+                        });
+                        state.firstFrameResolve = null;
+                    }
+                }
+
+                if (
+                    state.lastTimestamp !== null
+                    && timestamp < state.lastTimestamp
+                ) {
+                    state.uploadError =
+                        "Encoded video timestamp moved backwards";
+                }
+
+                state.lastTimestamp = timestamp;
+                state.frameQueue.push({timestamp, data});
+
+                if (!state.flushTimer) {
+                    state.flushTimer = setTimeout(
+                        () => {
+                            state.flushTimer = null;
+                            flushEncodedVideoQueue();
+                        },
+                        250
+                    );
+                }
+            };
+
+            channel.port1.start();
+
+            receiver.transform = new RTCRtpScriptTransform(
+                worker,
+                {port: channel.port2},
+                [channel.port2]
+            );
+
+            return true;
+        } catch (error) {
+            state.supported = false;
+            state.receiverFound = false;
+            state.uploadError =
+                "Encoded video transform setup failed: "
+                + String(error);
+            return false;
+        }
+    };
+
+    const flushEncodedVideoQueue = async () => {
+        const state = window.__superliveEncodedVideo;
+
+        if (state.uploading || !state.frameQueue.length) {
+            return;
+        }
+
+        state.uploading = true;
+        state.pendingDataTasks++;
+
+        try {
+            while (state.frameQueue.length) {
+                const frames = state.frameQueue.splice(
+                    0,
+                    state.frameQueue.length
+                );
+
+                let payloadSize = 8;
+                for (const frame of frames) {
+                    payloadSize += 8 + 1 + 4 + frame.data.byteLength;
+                }
+
+                const payload = new ArrayBuffer(payloadSize);
+                const view = new DataView(payload);
+                const magic = [83, 76, 86, 70, 1, 0, 0, 0];
+                for (let i = 0; i < magic.length; i++) {
+                    view.setUint8(i, magic[i]);
+                }
+
+                let offset = 8;
+                for (const frame of frames) {
+                    view.setBigUint64(
+                        offset,
+                        BigInt(Math.max(0, Math.round(frame.timestamp))),
+                        true
+                    );
+                    offset += 8;
+                    view.setUint8(
+                        offset,
+                        frame.type === "key" ? 1 : 0
+                    );
+                    offset += 1;
+                    view.setUint32(
+                        offset,
+                        frame.data.byteLength,
+                        true
+                    );
+                    offset += 4;
+                    new Uint8Array(payload, offset, frame.data.byteLength)
+                        .set(new Uint8Array(frame.data));
+                    offset += frame.data.byteLength;
+                }
+
+                let uploaded = false;
+                let lastError = null;
+
+                for (let attempt = 0; attempt < 3; attempt++) {
+                    try {
+                        const response = await fetch(
+                            "/__slr_encoded_video_chunk",
+                            {
+                                method: "POST",
+                                body: payload,
+                                headers: {
+                                    "Content-Type":
+                                        "application/octet-stream",
+                                },
+                            }
+                        );
+
+                        if (!response.ok) {
+                            throw new Error(
+                                `HTTP ${response.status}`
+                            );
+                        }
+
+                        uploaded = true;
+                        break;
+                    } catch (error) {
+                        lastError = error;
+                        await new Promise(
+                            resolve => setTimeout(resolve, 300 * (attempt + 1))
+                        );
+                    }
+                }
+
+                if (!uploaded) {
+                    state.uploadError =
+                        "Encoded video batch upload failed: "
+                        + String(lastError);
+                    return;
+                }
+
+                state.uploadedBatchCount++;
+                state.uploadedFrameCount += frames.length;
+            }
+        } finally {
+            state.uploading = false;
+            state.pendingDataTasks--;
+
+            if (
+                state.frameQueue.length
+                && !state.flushTimer
+            ) {
+                state.flushTimer = setTimeout(
+                    () => {
+                        state.flushTimer = null;
+                        flushEncodedVideoQueue();
+                    },
+                    0
+                );
+            }
+        }
+    };
+
+    window.__superliveEnableEncodedVideo = (track) => {
+        const state = window.__superliveEncodedVideo;
+
+        if (!track || track.kind !== "video") {
+            return {
+                supported: false,
+                reason: "invalid_video_track",
+            };
+        }
+
+        const peer = window.__superliveTrackPeers.get(track);
+        if (!peer) {
+            return {
+                supported: false,
+                reason: "selected_track_peer_not_found",
+            };
+        }
+
+        let receiver = null;
+        try {
+            receiver = peer.getReceivers().find(
+                item => item && item.track === track
+            ) || null;
+        } catch (error) {
+            return {
+                supported: false,
+                reason: "receiver_lookup_failed",
+                error: String(error),
+            };
+        }
+
+        if (!receiver) {
+            return {
+                supported: false,
+                reason: "selected_track_receiver_not_found",
+            };
+        }
+
+        let receiverCodecs = [];
+        try {
+            receiverCodecs = (receiver.getParameters().codecs || [])
+                .map(codec => String(codec.mimeType || "").toLowerCase())
+                .filter(Boolean);
+        } catch (error) {
+            return {
+                supported: false,
+                reason: "receiver_codec_lookup_failed",
+                error: String(error),
+            };
+        }
+
+        if (!receiverCodecs.includes("video/vp8")) {
+            return {
+                supported: false,
+                reason: "selected_webRTC_codec_is_not_vp8",
+                codecs: receiverCodecs,
+            };
+        }
+
+        let ok = state.receivers.has(track.id);
+        if (!ok) {
+            ok = installEncodedVideoTransform(
+                receiver,
+                track
+            );
+        }
+
+        if (!ok) {
+            return {
+                supported: false,
+                reason:
+                    state.uploadError
+                    || "encoded_transform_unavailable",
+            };
+        }
+
+        const entry = state.receivers.get(track.id);
+        if (!entry) {
+            return {
+                supported: false,
+                reason: "encoded_receiver_entry_missing",
+            };
+        }
+
+        state.attachedTrackId = track.id;
+        state.started = true;
+        state.stopping = false;
+        state.firstTimestamp = null;
+        state.lastTimestamp = null;
+        state.seenKeyFrame = false;
+        state.frameCount = 0;
+        state.keyFrameCount = 0;
+        state.uploadedBatchCount = 0;
+        state.uploadedFrameCount = 0;
+        state.pendingDataTasks = 0;
+        state.uploadError = null;
+        state.frameQueue.length = 0;
+
+        state.firstFramePromise = new Promise((resolve, reject) => {
+            state.firstFrameResolve = resolve;
+            state.firstFrameReject = reject;
+        });
+
+        entry.active = true;
+        try {
+            entry.port.postMessage({
+                command: "set-active",
+                active: true,
+            });
+        } catch (e) {
+            entry.active = false;
+            state.uploadError = String(e);
+            return {
+                supported: false,
+                reason: "encoded_receiver_activation_failed",
+            };
+        }
+
+        return {
+            supported: true,
+            receiverFound: true,
+            trackId: track.id,
+        };
+    };
+
+    window.__superliveWaitEncodedVideoFrame = async (timeoutMs) => {
+        const state = window.__superliveEncodedVideo;
+
+        if (state.frameCount > 0) {
+            return {
+                ok: true,
+                frameCount: state.frameCount,
+                timestamp: state.firstTimestamp,
+            };
+        }
+
+        if (!state.firstFramePromise) {
+            return {
+                ok: false,
+                reason: "encoded_capture_not_started",
+            };
+        }
+
+        const timeoutPromise = new Promise(resolve => {
+            setTimeout(
+                () => resolve({
+                    ok: false,
+                    reason: "timeout_waiting_for_encoded_video_frame",
+                }),
+                timeoutMs
+            );
+        });
+
+        return await Promise.race([
+            state.firstFramePromise,
+            timeoutPromise,
+        ]);
+    };
+
+    window.__superliveStopEncodedVideo = async () => {
+        const state = window.__superliveEncodedVideo;
+        state.stopping = true;
+
+        if (state.attachedTrackId) {
+            const entry = state.receivers.get(state.attachedTrackId);
+            if (entry) {
+                entry.active = false;
+                try {
+                    entry.port.postMessage({
+                        command: "set-active",
+                        active: false,
+                    });
+                } catch (e) {}
+            }
+        }
+
+        if (state.flushTimer) {
+            clearTimeout(state.flushTimer);
+            state.flushTimer = null;
+        }
+
+        await flushEncodedVideoQueue();
+
+        const deadline = performance.now() + 30000;
+        while (
+            state.uploading
+            || state.pendingDataTasks > 0
+            || state.frameQueue.length > 0
+        ) {
+            if (performance.now() >= deadline) {
+                state.uploadError =
+                    state.uploadError
+                    || "Timed out draining encoded video upload queue";
+                break;
+            }
+            await new Promise(resolve => setTimeout(resolve, 25));
+        }
+
+        return {
+            frameCount: state.frameCount,
+            keyFrameCount: state.keyFrameCount,
+            uploadedFrameCount: state.uploadedFrameCount,
+            uploadedBatchCount: state.uploadedBatchCount,
+            queueLength: state.frameQueue.length,
+            uploading: state.uploading,
+            pendingDataTasks: state.pendingDataTasks,
+            uploadError: state.uploadError,
+            firstTimestamp: state.firstTimestamp,
+            lastTimestamp: state.lastTimestamp,
+            seenKeyFrame: state.seenKeyFrame,
+        };
+    };
+
+    window.__superliveGetEncodedVideoStatus = () => {
+        const state = window.__superliveEncodedVideo;
+        return {
+            supported: state.supported,
+            started: state.started,
+            stopping: state.stopping,
+            attachedTrackId: state.attachedTrackId || null,
+            receiverTrackIds: Array.from(state.receivers.keys()),
+            receiverFound: state.receiverFound,
+            frameCount: state.frameCount,
+            keyFrameCount: state.keyFrameCount,
+            uploadedFrameCount: state.uploadedFrameCount,
+            uploadedBatchCount: state.uploadedBatchCount,
+            queueLength: state.frameQueue.length,
+            uploading: state.uploading,
+            pendingDataTasks: state.pendingDataTasks,
+            uploadError: state.uploadError,
+            firstTimestamp: state.firstTimestamp,
+            lastTimestamp: state.lastTimestamp,
+        };
+    };
+
     class WrappedRTCPeerConnection
         extends OriginalRTCPeerConnection {
 
@@ -1968,6 +2614,20 @@ WEBRTC_HOOK = r"""
                             track,
                             this
                         );
+
+                        if (track.kind === "video") {
+                            try {
+                                installEncodedVideoTransform(
+                                    event.receiver,
+                                    track
+                                );
+                            } catch (error) {
+                                console.warn(
+                                    "superlive encoded video transform setup error",
+                                    error
+                                );
+                            }
+                        }
 
                         const streams =
                             event.streams || [];
@@ -3251,6 +3911,20 @@ WEBRTC_HOOK = r"""
             sourceAudioTrackMuted: selectedAudioTrack
                 ? selectedAudioTrack.muted
                 : null,
+            videoWidth: (() => {
+                try {
+                    return Number(selectedVideoTrack.getSettings().width || 0);
+                } catch (e) {
+                    return 0;
+                }
+            })(),
+            videoHeight: (() => {
+                try {
+                    return Number(selectedVideoTrack.getSettings().height || 0);
+                } catch (e) {
+                    return 0;
+                }
+            })(),
         };
     };
 
@@ -4440,11 +5114,23 @@ async def run_recording(playwright):
     audio_chunk_count = 0
     audio_total_bytes = 0
 
+    encoded_video_chunk_count = 0
+    encoded_video_frame_count = 0
+    encoded_video_keyframe_count = 0
+    encoded_video_total_bytes = 0
+    encoded_video_first_timestamp = None
+    encoded_video_last_timestamp = None
+    encoded_video_ivf_path = (
+        TEMP_DIR
+        / f"recording_{timestamp}_encoded.ivf"
+    )
+    encoded_video_file = None
+    encoded_video_mode = False
+
     try:
-        webm_file = open(
-            webm_path,
-            "wb",
-        )
+        # Video output is opened lazily: encoded WebRTC capture writes IVF
+        # first, while the MediaRecorder fallback writes WebM chunks directly.
+        webm_file = None
 
         audio_webm_file = open(
             audio_webm_path,
@@ -4464,6 +5150,10 @@ async def run_recording(playwright):
                 )
 
                 if body:
+                    if webm_file is None:
+                        raise RuntimeError(
+                            "MediaRecorder chunk received before WebM file was opened"
+                        )
                     webm_file.write(body)
                     webm_file.flush()
 
@@ -4522,6 +5212,136 @@ async def run_recording(playwright):
                 except Exception:
                     pass
 
+        async def handle_encoded_video_chunk(
+            route,
+            request,
+        ):
+            nonlocal encoded_video_chunk_count
+            nonlocal encoded_video_frame_count
+            nonlocal encoded_video_keyframe_count
+            nonlocal encoded_video_total_bytes
+            nonlocal encoded_video_first_timestamp
+            nonlocal encoded_video_last_timestamp
+
+            try:
+                body = request.post_data_buffer or b""
+
+                if not body:
+                    raise RuntimeError(
+                        "Empty encoded video batch"
+                    )
+
+                if len(body) < 8 or body[:4] != b"SLVF":
+                    raise RuntimeError(
+                        "Invalid encoded video batch header"
+                    )
+
+                if body[4] != 1:
+                    raise RuntimeError(
+                        f"Unsupported encoded video batch version: {body[4]}"
+                    )
+
+                offset = 8
+                batch_frames = 0
+
+                while offset < len(body):
+                    if offset + 13 > len(body):
+                        raise RuntimeError(
+                            "Truncated encoded video frame header"
+                        )
+
+                    timestamp_us = struct.unpack_from(
+                        "<Q",
+                        body,
+                        offset,
+                    )[0]
+                    offset += 8
+
+                    frame_type = body[offset]
+                    offset += 1
+
+                    frame_size = struct.unpack_from(
+                        "<I",
+                        body,
+                        offset,
+                    )[0]
+                    offset += 4
+
+                    if frame_size <= 0:
+                        raise RuntimeError(
+                            "Encoded video frame has invalid size"
+                        )
+
+                    end = offset + frame_size
+                    if end > len(body):
+                        raise RuntimeError(
+                            "Truncated encoded video frame payload"
+                        )
+
+                    frame_data = body[offset:end]
+                    offset = end
+
+                    if encoded_video_first_timestamp is None:
+                        encoded_video_first_timestamp = timestamp_us
+
+                    if (
+                        encoded_video_last_timestamp is not None
+                        and timestamp_us < encoded_video_last_timestamp
+                    ):
+                        raise RuntimeError(
+                            "Encoded video timestamp moved backwards"
+                        )
+
+                    encoded_video_last_timestamp = timestamp_us
+
+                    encoded_video_file.write(
+                        struct.pack(
+                            "<IQ",
+                            frame_size,
+                            max(
+                                0,
+                                timestamp_us
+                                - encoded_video_first_timestamp,
+                            ),
+                        )
+                    )
+                    encoded_video_file.write(frame_data)
+
+                    encoded_video_frame_count += 1
+                    batch_frames += 1
+                    encoded_video_total_bytes += frame_size
+
+                    if frame_type == 1:
+                        encoded_video_keyframe_count += 1
+
+                encoded_video_file.flush()
+                encoded_video_chunk_count += 1
+
+                await route.fulfill(
+                    status=200,
+                    body=b"OK",
+                )
+
+                log(
+                    "Encoded video batch received: "
+                    f"batch={encoded_video_chunk_count} "
+                    f"frames={batch_frames} "
+                    f"total_frames={encoded_video_frame_count}"
+                )
+
+            except Exception as e:
+                log(
+                    f"Encoded video batch handler error: {e}"
+                )
+
+                try:
+                    await route.fulfill(
+                        status=500,
+                        body=b"ERROR",
+                    )
+                except Exception:
+                    pass
+
         await page.route(
             "**/__slr_chunk",
             handle_chunk,
@@ -4530,6 +5350,11 @@ async def run_recording(playwright):
         await page.route(
             "**/__slr_audio_chunk",
             handle_audio_chunk,
+        )
+
+        await page.route(
+            "**/__slr_encoded_video_chunk",
+            handle_encoded_video_chunk,
         )
 
         log_section(
@@ -4653,6 +5478,18 @@ async def run_recording(playwright):
             )
         )
 
+        # The encoded WebRTC path writes IVF frames locally.  The IVF header
+        # is finalized only after the first real encoded frame stream is
+        # accepted, because the selected track dimensions are known then.
+        encoded_video_width = int(
+            prepared.get("videoWidth")
+            or 0
+        )
+        encoded_video_height = int(
+            prepared.get("videoHeight")
+            or 0
+        )
+
         # ----------------------------------------------------
         # Ensure selected video is actually playing
         # ----------------------------------------------------
@@ -4724,96 +5561,249 @@ async def run_recording(playwright):
 
         first_chunk = None
         accepted_candidate = None
+        video_capture_mode = "mediarecorder"
+        encoded_video_started = False
 
-        for candidate in candidates:
-            attempt_id = f"{candidate['index']}-{time.monotonic_ns()}"
+        # ----------------------------------------------------
+        # Preferred video path: capture the already-encoded VP8
+        # frames directly from the selected WebRTC receiver.
+        # ----------------------------------------------------
+        encoded_video_width = encoded_video_width or 720
+        encoded_video_height = encoded_video_height or 1280
 
-            start_result = await page.evaluate(
-                """
-                ([videoBitrate, audioBitrate, timeslice, candidateIndex, attemptId]) =>
-                    window.__superliveStartRec(
-                        videoBitrate,
-                        audioBitrate,
-                        timeslice,
-                        candidateIndex,
-                        attemptId
-                    )
-                """,
-                [
-                    VIDEO_BITRATE,
-                    AUDIO_BITRATE,
-                    1000,
-                    candidate["index"],
-                    attempt_id,
-                ],
+        if encoded_video_width <= 0 or encoded_video_height <= 0:
+            raise RuntimeError(
+                "Selected video dimensions are unavailable for IVF header"
             )
 
-            log(
-                "MediaRecorder startup attempt: "
-                + json.dumps(start_result, ensure_ascii=False)
+        encoded_video_file = open(
+            encoded_video_ivf_path,
+            "wb",
+        )
+        encoded_video_file.write(
+            struct.pack(
+                "<4sHH4sHHIIII",
+                b"DKIF",
+                0,
+                32,
+                b"VP80",
+                encoded_video_width,
+                encoded_video_height,
+                1_000_000,
+                1,
+                0,
+                0,
+                0,
+                0,
             )
+        )
+        encoded_video_file.flush()
 
-            attempt_result = await page.evaluate(
-                """
-                () => window.__superliveWaitChunk(4000)
-                """
+        encoded_capability = await page.evaluate(
+            """
+            (trackId) => {
+                const track = (window.__superliveVideoTracks || [])
+                    .find(item => item && item.id === trackId);
+                return window.__superliveEnableEncodedVideo
+                    ? window.__superliveEnableEncodedVideo(track)
+                    : {supported: false, reason: "encoded_api_missing"};
+            }
+            """,
+            prepared.get("sourceVideoTrackId"),
+        )
+
+        log(
+            "Encoded WebRTC video capability: "
+            + json.dumps(
+                encoded_capability,
+                ensure_ascii=False,
             )
+        )
 
-            if (
-                attempt_result
-                and attempt_result.get("ok")
-                and attempt_result.get("chunkCount", 0) >= 1
-            ):
-                first_chunk = attempt_result
-                accepted_candidate = candidate
+        if encoded_capability.get("supported"):
+            try:
+                encoded_wait = await page.evaluate(
+                    """
+                    () => window.__superliveWaitEncodedVideoFrame
+                        ? window.__superliveWaitEncodedVideoFrame(5000)
+                        : {ok: false, reason: "encoded_wait_missing"}
+                    """
+                )
+
                 log(
-                    "MediaRecorder candidate accepted: "
+                    "First encoded WebRTC video frame: "
+                    + json.dumps(
+                        encoded_wait,
+                        ensure_ascii=False,
+                    )
+                )
+
+                if encoded_wait.get("ok"):
+                    encoded_video_mode = True
+                    encoded_video_started = True
+                    video_capture_mode = "webrtc-encoded-vp8"
+                    log(
+                        "Using direct encoded WebRTC VP8 capture; "
+                        "MediaRecorder video encoder is bypassed"
+                    )
+                else:
+                    raise RuntimeError(
+                        "Encoded WebRTC transform was installed but did not "
+                        "produce a first frame: "
+                        + json.dumps(encoded_wait, ensure_ascii=False)
+                    )
+
+            except Exception as e:
+                log(
+                    "Encoded WebRTC video path rejected; "
+                    f"falling back to MediaRecorder: {e}"
+                )
+                encoded_video_mode = False
+                encoded_video_started = False
+                video_capture_mode = "mediarecorder"
+
+                try:
+                    if encoded_video_file is not None:
+                        encoded_video_file.close()
+                except Exception:
+                    pass
+                encoded_video_file = None
+
+                try:
+                    encoded_video_ivf_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+        if not encoded_video_started:
+            try:
+                if encoded_video_file is not None:
+                    encoded_video_file.close()
+            except Exception:
+                pass
+            encoded_video_file = None
+            try:
+                encoded_video_ivf_path.unlink()
+            except FileNotFoundError:
+                pass
+
+            webm_file = open(
+                webm_path,
+                "wb",
+            )
+
+            # ----------------------------------------------------
+            # Fallback: existing transactional MediaRecorder path.
+            # ----------------------------------------------------
+            for candidate in candidates:
+                chunk_count = 0
+                total_bytes = 0
+                attempt_id = f"{candidate['index']}-{time.monotonic_ns()}"
+
+                start_result = await page.evaluate(
+                    """
+                    ([videoBitrate, audioBitrate, timeslice, candidateIndex, attemptId]) =>
+                        window.__superliveStartRec(
+                            videoBitrate,
+                            audioBitrate,
+                            timeslice,
+                            candidateIndex,
+                            attemptId
+                        )
+                    """,
+                    [
+                        VIDEO_BITRATE,
+                        AUDIO_BITRATE,
+                        1000,
+                        candidate["index"],
+                        attempt_id,
+                    ],
+                )
+
+                log(
+                    "MediaRecorder startup attempt: "
+                    + json.dumps(start_result, ensure_ascii=False)
+                )
+
+                attempt_result = await page.evaluate(
+                    """
+                    () => window.__superliveWaitChunk(4000)
+                    """
+                )
+
+                if (
+                    attempt_result
+                    and attempt_result.get("ok")
+                    and attempt_result.get("chunkCount", 0) >= 1
+                ):
+                    first_chunk = attempt_result
+                    accepted_candidate = candidate
+                    log(
+                        "MediaRecorder candidate accepted: "
+                        + json.dumps(
+                            {"candidate": candidate, "result": attempt_result},
+                            ensure_ascii=False,
+                        )
+                    )
+                    break
+
+                log(
+                    "MediaRecorder candidate rejected: "
                     + json.dumps(
                         {"candidate": candidate, "result": attempt_result},
                         ensure_ascii=False,
                     )
                 )
-                break
+
+                try:
+                    await page.evaluate(
+                        """
+                        () => window.__superliveStopRec
+                            ? window.__superliveStopRec()
+                            : false
+                        """
+                    )
+                except Exception as e:
+                    log(
+                        f"Failed to stop rejected recorder candidate: {e}"
+                    )
+
+                if webm_file is not None:
+                    webm_file.seek(0)
+                    webm_file.truncate(0)
+                    webm_file.flush()
+
+                chunk_count = 0
+                total_bytes = 0
+                await asyncio.sleep(1)
+
+            if accepted_candidate is None:
+                raise RuntimeError(
+                    "All MediaRecorder candidates failed to produce a first chunk; "
+                    + json.dumps(
+                        {
+                            "candidates": candidates,
+                            "lastDiagnostics": first_chunk,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
 
             log(
-                "MediaRecorder candidate rejected: "
-                + json.dumps(
-                    {"candidate": candidate, "result": attempt_result},
-                    ensure_ascii=False,
-                )
+                "First recording chunk received: "
+                + json.dumps(first_chunk, ensure_ascii=False)
             )
-
-            try:
-                await page.evaluate(
-                    """
-                    () => window.__superliveStopRec
-                        ? window.__superliveStopRec()
-                        : false
-                    """
-                )
-            except Exception as e:
-                log(
-                    f"Failed to stop rejected recorder candidate: {e}"
-                )
-
-            await asyncio.sleep(1)
-
-        if accepted_candidate is None:
-            raise RuntimeError(
-                "All MediaRecorder candidates failed to produce a first chunk; "
+        else:
+            log(
+                "Encoded video capture accepted: "
                 + json.dumps(
                     {
-                        "candidates": candidates,
-                        "lastDiagnostics": first_chunk,
+                        "mode": video_capture_mode,
+                        "width": encoded_video_width,
+                        "height": encoded_video_height,
                     },
                     ensure_ascii=False,
                 )
             )
-
-        log(
-            "First recording chunk received: "
-            + json.dumps(first_chunk, ensure_ascii=False)
-        )
 
         # ----------------------------------------------------
         # Start independent audio recorder
@@ -4965,6 +5955,16 @@ async def run_recording(playwright):
                     )
                 )
 
+                encoded_status = {}
+                if encoded_video_mode:
+                    encoded_status = await page.evaluate(
+                        """
+                        () => window.__superliveGetEncodedVideoStatus
+                            ? window.__superliveGetEncodedVideoStatus()
+                            : {}
+                        """
+                    )
+
                 video_state = status.get(
                     "videoReadyState"
                 )
@@ -4979,7 +5979,7 @@ async def run_recording(playwright):
                     )
                     break
 
-                if (
+                if not encoded_video_mode and (
                     idle_ms
                     > STREAM_IDLE_TIMEOUT * 1000
                 ):
@@ -4990,6 +5990,25 @@ async def run_recording(playwright):
                     )
                     break
 
+                if encoded_video_mode:
+                    if encoded_status.get("uploadError"):
+                        raise RuntimeError(
+                            "Encoded video capture upload error: "
+                            + str(encoded_status.get("uploadError"))
+                        )
+                    if (
+                        encoded_status.get("frameCount", 0) > 0
+                        and encoded_status.get("uploadedFrameCount", 0)
+                        < encoded_status.get("frameCount", 0)
+                        and encoded_status.get("pendingDataTasks", 0) == 0
+                        and not encoded_status.get("uploading")
+                    ):
+                        # The browser only reaches this state when a batch was
+                        # dropped before the upload queue could recover.
+                        raise RuntimeError(
+                            "Encoded video upload counters stopped advancing"
+                        )
+
                 if (
                     time.monotonic()
                     - last_status_log
@@ -4998,6 +6017,15 @@ async def run_recording(playwright):
                     settings = status.get(
                         "videoSettings"
                     )
+
+                    if encoded_video_mode:
+                        log(
+                            "Encoded video status: "
+                            + json.dumps(
+                                encoded_status,
+                                ensure_ascii=False,
+                            )
+                        )
 
                     log(
                         "Recording status: "
@@ -5020,10 +6048,17 @@ async def run_recording(playwright):
                         f"{settings}"
                     )
 
-                    log(
-                        f"Local WebM received: "
-                        f"{total_bytes / 1024 / 1024:.2f} MB"
-                    )
+                    if encoded_video_mode:
+                        log(
+                            "Encoded VP8 received locally: "
+                            f"{encoded_video_total_bytes / 1024 / 1024:.2f} MB "
+                            f"frames={encoded_video_frame_count}"
+                        )
+                    else:
+                        log(
+                            f"Local WebM received: "
+                            f"{total_bytes / 1024 / 1024:.2f} MB"
+                        )
 
                     render_diag = status.get(
                         "renderDiagnostics"
@@ -5097,21 +6132,36 @@ async def run_recording(playwright):
         )
 
         log(
-            "Stopping MediaRecorder..."
+            "Stopping video capture..."
         )
 
         try:
-            stop_result = await page.evaluate(
-                """
-                () =>
-                    window.__superliveStopRec()
-                """
-            )
+            if encoded_video_mode:
+                stop_result = await page.evaluate(
+                    """
+                    () => window.__superliveStopEncodedVideo
+                        ? window.__superliveStopEncodedVideo()
+                        : null
+                    """
+                )
+                log(
+                    "Encoded WebRTC video capture stop result: "
+                    + json.dumps(
+                        stop_result,
+                        ensure_ascii=False,
+                    )
+                )
+            else:
+                stop_result = await page.evaluate(
+                    """
+                    () => window.__superliveStopRec()
+                    """
+                )
 
-            log(
-                "MediaRecorder stop requested: "
-                f"{stop_result}"
-            )
+                log(
+                    "MediaRecorder stop requested: "
+                    f"{stop_result}"
+                )
 
             if audio_expected:
                 audio_stop_result = await page.evaluate(
@@ -5135,41 +6185,47 @@ async def run_recording(playwright):
         # WAIT FOR ACTUAL FINAL DATAAVAILABLE
         # ----------------------------------------------------
 
-        log(
-            "Waiting for MediaRecorder final "
-            "dataavailable event..."
-        )
-
-        final_data_ready = False
-
-        try:
-            final_data_ready = (
-                await page.evaluate(
-                    """
-                    () =>
-                        window.__superliveWaitRecorderFinal(
-                            30000
-                        )
-                    """
-                )
-            )
-
-        except Exception as e:
+        if encoded_video_mode:
+            final_data_ready = True
             log(
-                "Final MediaRecorder wait error: "
-                f"{e}"
-            )
-
-        if final_data_ready:
-            log(
-                "MediaRecorder final dataavailable "
-                "processing completed"
+                "Encoded WebRTC video final batch processing completed"
             )
         else:
-            raise RuntimeError(
-                "Timed out waiting for MediaRecorder "
-                "final dataavailable event"
+            log(
+                "Waiting for MediaRecorder final "
+                "dataavailable event..."
             )
+
+            final_data_ready = False
+
+            try:
+                final_data_ready = (
+                    await page.evaluate(
+                        """
+                        () =>
+                            window.__superliveWaitRecorderFinal(
+                                30000
+                            )
+                        """
+                    )
+                )
+
+            except Exception as e:
+                log(
+                    "Final MediaRecorder wait error: "
+                    f"{e}"
+                )
+
+            if final_data_ready:
+                log(
+                    "MediaRecorder final dataavailable "
+                    "processing completed"
+                )
+            else:
+                raise RuntimeError(
+                    "Timed out waiting for MediaRecorder "
+                    "final dataavailable event"
+                )
 
         if audio_expected:
             audio_final_ready = await page.evaluate(
@@ -5243,151 +6299,133 @@ async def run_recording(playwright):
                     )
                 )
 
-            try:
-                status = await page.evaluate(
-                    """
-                    () =>
-                        window.__superliveGetStatus()
-                    """
-                )
-
-                queue_length = int(
-                    status.get(
-                        "queueLength",
-                        0,
+                try:
+                    status = await page.evaluate(
+                        """
+                        () => window.__superliveGetStatus()
+                        """
                     )
-                )
 
-                uploading = bool(
-                    status.get(
-                        "isUploading",
-                        False,
-                    )
-                )
-
-                recorder_chunks = int(
-                    status.get(
-                        "chunkCount",
-                        0,
-                    )
-                )
-
-                uploaded_chunks = int(
-                    status.get(
-                        "uploadedChunkCount",
-                        0,
-                    )
-                )
-
-                pending_tasks = int(
-                    status.get(
-                        "pendingDataTasks",
-                        0,
-                    )
-                )
-
-                upload_error = status.get(
-                    "uploadError"
-                )
-
-                audio_status = {}
-                if audio_expected:
-                    try:
-                        audio_status = await page.evaluate(
+                    if encoded_video_mode:
+                        encoded_status = await page.evaluate(
                             """
-                            () =>
-                                window.__superliveGetAudioStatus()
+                            () => window.__superliveGetEncodedVideoStatus
+                                ? window.__superliveGetEncodedVideoStatus()
+                                : {}
                             """
                         )
-                    except Exception as e:
-                        raise RuntimeError(
-                            "Unable to read independent audio recorder status: "
-                            + str(e)
+                        queue_length = int(encoded_status.get("queueLength", 0))
+                        uploading = bool(encoded_status.get("uploading", False))
+                        recorder_chunks = int(encoded_status.get("frameCount", 0))
+                        uploaded_chunks = int(encoded_status.get("uploadedFrameCount", 0))
+                        pending_tasks = int(encoded_status.get("pendingDataTasks", 0))
+                        upload_error = encoded_status.get("uploadError")
+                    else:
+                        queue_length = int(status.get("queueLength", 0))
+                        uploading = bool(status.get("isUploading", False))
+                        recorder_chunks = int(status.get("chunkCount", 0))
+                        uploaded_chunks = int(status.get("uploadedChunkCount", 0))
+                        pending_tasks = int(status.get("pendingDataTasks", 0))
+                        upload_error = status.get("uploadError")
+
+                    audio_status = {}
+                    if audio_expected:
+                        try:
+                            audio_status = await page.evaluate(
+                                """
+                                () =>
+                                    window.__superliveGetAudioStatus()
+                                """
+                            )
+                        except Exception as e:
+                            raise RuntimeError(
+                                "Unable to read independent audio recorder status: "
+                                + str(e)
+                            )
+    
+                    if (
+                        time.monotonic()
+                        - last_drain_log
+                        >= 10
+                    ):
+                        log(
+                            "Drain status: "
+                            f"recorder_chunks="
+                            f"{recorder_chunks} "
+                            f"uploaded="
+                            f"{uploaded_chunks} "
+                            f"queue="
+                            f"{queue_length} "
+                            f"uploading="
+                            f"{uploading} "
+                            f"pending="
+                            f"{pending_tasks}"
                         )
-
-                if (
-                    time.monotonic()
-                    - last_drain_log
-                    >= 10
-                ):
-                    log(
-                        "Drain status: "
-                        f"recorder_chunks="
-                        f"{recorder_chunks} "
-                        f"uploaded="
-                        f"{uploaded_chunks} "
-                        f"queue="
-                        f"{queue_length} "
-                        f"uploading="
-                        f"{uploading} "
-                        f"pending="
-                        f"{pending_tasks}"
-                    )
-
+    
+                        if upload_error:
+                            log(
+                                "Current upload error: "
+                                f"{upload_error}"
+                            )
+    
+                        if audio_expected:
+                            log(
+                                "Independent audio drain status: "
+                                + json.dumps(
+                                    audio_status,
+                                    ensure_ascii=False,
+                                )
+                            )
+    
+                        log(
+                            f"Local WebM received: "
+                            f"{total_bytes / 1024 / 1024:.2f} MB"
+                        )
+    
+                        log(
+                            f"Local audio WebM received: "
+                            f"{audio_total_bytes / 1024 / 1024:.2f} MB"
+                        )
+    
+                        last_drain_log = (
+                            time.monotonic()
+                        )
+    
                     if upload_error:
                         log(
-                            "Current upload error: "
+                            "WARNING: upload error is "
+                            f"currently recorded: "
                             f"{upload_error}"
                         )
-
+    
+                    audio_drained = True
                     if audio_expected:
-                        log(
-                            "Independent audio drain status: "
-                            + json.dumps(
-                                audio_status,
-                                ensure_ascii=False,
-                            )
+                        audio_drained = (
+                            int(audio_status.get("queueLength", 0)) == 0
+                            and not bool(audio_status.get("isUploading"))
+                            and int(audio_status.get("pendingDataTasks", 0)) == 0
+                            and int(audio_status.get("uploadedChunkCount", 0))
+                                == int(audio_status.get("chunkCount", 0))
+                            and int(audio_status.get("chunkCount", 0)) > 0
+                            and not audio_status.get("uploadError")
                         )
-
+    
+                    if (
+                        queue_length == 0
+                        and not uploading
+                        and pending_tasks == 0
+                        and uploaded_chunks == recorder_chunks
+                        and recorder_chunks > 0
+                        and not upload_error
+                        and audio_drained
+                    ):
+                        break
+    
+                except Exception as e:
                     log(
-                        f"Local WebM received: "
-                        f"{total_bytes / 1024 / 1024:.2f} MB"
+                        f"Queue drain status error: {e}"
                     )
-
-                    log(
-                        f"Local audio WebM received: "
-                        f"{audio_total_bytes / 1024 / 1024:.2f} MB"
-                    )
-
-                    last_drain_log = (
-                        time.monotonic()
-                    )
-
-                if upload_error:
-                    log(
-                        "WARNING: upload error is "
-                        f"currently recorded: "
-                        f"{upload_error}"
-                    )
-
-                audio_drained = True
-                if audio_expected:
-                    audio_drained = (
-                        int(audio_status.get("queueLength", 0)) == 0
-                        and not bool(audio_status.get("isUploading"))
-                        and int(audio_status.get("pendingDataTasks", 0)) == 0
-                        and int(audio_status.get("uploadedChunkCount", 0))
-                            == int(audio_status.get("chunkCount", 0))
-                        and int(audio_status.get("chunkCount", 0)) > 0
-                        and not audio_status.get("uploadError")
-                    )
-
-                if (
-                    queue_length == 0
-                    and not uploading
-                    and pending_tasks == 0
-                    and uploaded_chunks == recorder_chunks
-                    and recorder_chunks > 0
-                    and not upload_error
-                    and audio_drained
-                ):
-                    break
-
-            except Exception as e:
-                log(
-                    f"Queue drain status error: {e}"
-                )
-
+    
             await asyncio.sleep(
                 0.25
             )
@@ -5399,15 +6437,23 @@ async def run_recording(playwright):
         final_status = {}
 
         try:
-            final_status = await page.evaluate(
-                """
-                () =>
-                    window.__superliveGetStatus()
-                """
-            )
+            if encoded_video_mode:
+                final_status = await page.evaluate(
+                    """
+                    () => window.__superliveGetEncodedVideoStatus
+                        ? window.__superliveGetEncodedVideoStatus()
+                        : null
+                    """
+                ) or {}
+            else:
+                final_status = await page.evaluate(
+                    """
+                    () => window.__superliveGetStatus()
+                    """
+                )
 
             log(
-                "Final recorder status: "
+                "Final video recorder status: "
                 + json.dumps(
                     final_status,
                     ensure_ascii=False,
@@ -5416,43 +6462,46 @@ async def run_recording(playwright):
 
         except Exception as e:
             raise RuntimeError(
-                "Unable to obtain final recorder status: "
+                "Unable to obtain final video recorder status: "
                 + str(e)
             )
 
-        recorder_chunk_count = int(
-            final_status.get(
-                "chunkCount",
-                0,
-            )
-        )
-
-        uploaded_chunk_count = int(
-            final_status.get(
-                "uploadedChunkCount",
-                0,
-            )
-        )
+        if encoded_video_mode:
+            recorder_chunk_count = int(final_status.get("frameCount", 0))
+            uploaded_chunk_count = int(final_status.get("uploadedFrameCount", 0))
+        else:
+            recorder_chunk_count = int(final_status.get("chunkCount", 0))
+            uploaded_chunk_count = int(final_status.get("uploadedChunkCount", 0))
 
         if (
             recorder_chunk_count <= 0
-            or uploaded_chunk_count
-            != recorder_chunk_count
+            or uploaded_chunk_count != recorder_chunk_count
         ):
             raise RuntimeError(
-                "Chunk integrity check failed: "
-                f"recorder={recorder_chunk_count}, "
+                "Video capture integrity check failed: "
+                f"captured={recorder_chunk_count}, "
                 f"uploaded={uploaded_chunk_count}"
             )
 
-        if (
-            final_status.get("queueLength", 0) != 0
-            or final_status.get("isUploading")
-            or final_status.get("uploadError")
-        ):
-            raise RuntimeError(
-                "Queue is not fully drained or contains an upload error"
-            )
+        if encoded_video_mode:
+            if (
+                final_status.get("queueLength", 0) != 0
+                or final_status.get("uploading")
+                or final_status.get("uploadError")
+                or final_status.get("pendingDataTasks", 0) != 0
+            ):
+                raise RuntimeError(
+                    "Encoded video queue is not fully drained or contains an upload error"
+                )
+        else:
+            if (
+                final_status.get("queueLength", 0) != 0
+                or final_status.get("isUploading")
+                or final_status.get("uploadError")
+            ):
+                raise RuntimeError(
+                    "Queue is not fully drained or contains an upload error"
+                )
 
         if audio_expected:
             final_audio_status = await page.evaluate(
@@ -5486,11 +6535,19 @@ async def run_recording(playwright):
                     )
                 )
 
-        log(
-            f"Final WebM received: "
-            f"{total_bytes / 1024 / 1024:.2f} MB, "
-            f"chunks={chunk_count}"
-        )
+        if encoded_video_mode:
+            log(
+                "Final encoded VP8 received: "
+                f"{encoded_video_total_bytes / 1024 / 1024:.2f} MB, "
+                f"frames={encoded_video_frame_count}, "
+                f"batches={encoded_video_chunk_count}"
+            )
+        else:
+            log(
+                f"Final WebM received: "
+                f"{total_bytes / 1024 / 1024:.2f} MB, "
+                f"chunks={chunk_count}"
+            )
 
         await page.unroute(
             "**/__slr_chunk",
@@ -5502,16 +6559,61 @@ async def run_recording(playwright):
             handle_audio_chunk,
         )
 
+        await page.unroute(
+            "**/__slr_encoded_video_chunk",
+            handle_encoded_video_chunk,
+        )
+
         # ----------------------------------------------------
         # Close independent WebM files safely
         # ----------------------------------------------------
 
-        webm_file.flush()
-        os.fsync(webm_file.fileno())
-        webm_file.close()
-        webm_file = None
+        if encoded_video_mode:
+            if encoded_video_file is None:
+                raise RuntimeError(
+                    "Encoded video file handle is missing"
+                )
 
-        if audio_expected:
+            encoded_video_file.flush()
+            os.fsync(encoded_video_file.fileno())
+
+            # Patch IVF frame count in the fixed 32-byte header.
+            encoded_video_file.seek(24)
+            encoded_video_file.write(
+                struct.pack(
+                    "<I",
+                    encoded_video_frame_count,
+                )
+            )
+            encoded_video_file.flush()
+            os.fsync(encoded_video_file.fileno())
+            encoded_video_file.close()
+            encoded_video_file = None
+
+            log(
+                "Final encoded VP8 IVF: "
+                f"{encoded_video_ivf_path.stat().st_size / 1024 / 1024:.2f} MB, "
+                f"frames={encoded_video_frame_count}, "
+                f"keyframes={encoded_video_keyframe_count}"
+            )
+
+            remux_ivf_to_webm(
+                encoded_video_ivf_path,
+                webm_path,
+                encoded_video_frame_count,
+            )
+
+            try:
+                encoded_video_ivf_path.unlink()
+            except FileNotFoundError:
+                pass
+        else:
+            webm_file.flush()
+            os.fsync(webm_file.fileno())
+            webm_file.close()
+            webm_file = None
+
+        if audio_webm_file is not None:
             audio_webm_file.flush()
             os.fsync(audio_webm_file.fileno())
             audio_webm_file.close()
@@ -5711,6 +6813,11 @@ async def run_recording(playwright):
                 audio_webm_file.flush()
                 audio_webm_file.close()
                 audio_webm_file = None
+
+            if encoded_video_file is not None:
+                encoded_video_file.flush()
+                encoded_video_file.close()
+                encoded_video_file = None
 
         except Exception:
             pass
