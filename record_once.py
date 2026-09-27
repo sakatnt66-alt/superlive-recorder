@@ -1968,6 +1968,7 @@ WEBRTC_HOOK = r"""
         uploadQueue: [],
         uploading: false,
         flushTimer: null,
+        codecMimeType: null,
         frameCount: 0,
         keyFrameCount: 0,
         uploadedBatchCount: 0,
@@ -2105,10 +2106,20 @@ WEBRTC_HOOK = r"""
                                 const copy = new Uint8Array(source.byteLength);
                                 copy.set(source);
 
+                                let metadata = null;
+                                try {
+                                    metadata = encodedFrame.getMetadata
+                                        ? encodedFrame.getMetadata()
+                                        : null;
+                                } catch (ignored) {}
+
                                 port.postMessage({
                                     timestamp: Number(encodedFrame.timestamp || 0),
                                     duration: Number(encodedFrame.duration || 0),
                                     type: encodedFrame.type || "delta",
+                                    mimeType: metadata && metadata.mimeType
+                                        ? String(metadata.mimeType)
+                                        : null,
                                     data: copy.buffer,
                                 }, [copy.buffer]);
                             } catch (error) {
@@ -2183,6 +2194,32 @@ WEBRTC_HOOK = r"""
                 }
 
                 if (message.type === "key") {
+                    // RFC 6386 VP8 key-frame payloads contain the mandatory
+                    // 9d 01 2a sync code at bytes 3..5. Validate it before
+                    // accepting the first key frame into the capture queue.
+                    const keyBytes = new Uint8Array(data);
+                    if (
+                        keyBytes.byteLength < 6
+                        || keyBytes[3] !== 0x9d
+                        || keyBytes[4] !== 0x01
+                        || keyBytes[5] !== 0x2a
+                    ) {
+                        state.uploadError =
+                            "Encoded VP8 key frame failed sync-code validation: "
+                            + Array.from(keyBytes.slice(0, 12))
+                                .map(value => value.toString(16).padStart(2, "0"))
+                                .join("");
+
+                        if (state.firstFrameReject) {
+                            state.firstFrameReject(
+                                new Error(state.uploadError)
+                            );
+                            state.firstFrameReject = null;
+                            state.firstFrameResolve = null;
+                        }
+                        return;
+                    }
+
                     state.seenKeyFrame = true;
                     state.keyFrameCount++;
                 } else if (!state.seenKeyFrame) {
@@ -2213,7 +2250,27 @@ WEBRTC_HOOK = r"""
                 }
 
                 state.lastTimestamp = timestamp;
-                state.frameQueue.push({timestamp, data});
+
+                if (message.mimeType) {
+                    const mimeType = String(message.mimeType).toLowerCase();
+                    if (state.codecMimeType === null) {
+                        state.codecMimeType = mimeType;
+                    } else if (state.codecMimeType !== mimeType) {
+                        state.uploadError =
+                            "Encoded video codec changed during capture: "
+                            + state.codecMimeType
+                            + " -> "
+                            + mimeType;
+                        return;
+                    }
+                }
+
+                state.frameQueue.push({
+                    timestamp,
+                    duration: Number(message.duration || 0),
+                    type: message.type === "key" ? "key" : "delta",
+                    data,
+                });
 
                 if (!state.flushTimer) {
                     state.flushTimer = setTimeout(
@@ -2360,7 +2417,7 @@ WEBRTC_HOOK = r"""
         }
     };
 
-    window.__superliveEnableEncodedVideo = (track) => {
+    window.__superliveEnableEncodedVideo = async (track) => {
         const state = window.__superliveEncodedVideo;
 
         if (!track || track.kind !== "video") {
@@ -2411,11 +2468,67 @@ WEBRTC_HOOK = r"""
             };
         }
 
-        if (!receiverCodecs.includes("video/vp8")) {
+        // getParameters().codecs describes receiver codec parameters.
+        // It does not prove which codec carries the current inbound RTP.
+        // Resolve the actual inbound-rtp codec through codecId.
+        let actualCodecMimeType = null;
+        let inboundCodecId = null;
+        let codecLookupError = null;
+
+        // Codec stats can briefly lag receiver creation. Give the receiver
+        // a short bounded window to expose codecId instead of falling back
+        // unnecessarily to MediaRecorder.
+        for (let attempt = 0; attempt < 12; attempt++) {
+            try {
+                const stats = await receiver.getStats();
+                let inbound = null;
+
+                stats.forEach(report => {
+                    if (
+                        !inbound
+                        && report
+                        && report.type === "inbound-rtp"
+                        && (report.kind === "video" || report.mediaType === "video")
+                        && report.codecId
+                    ) {
+                        inbound = report;
+                    }
+                });
+
+                if (inbound) {
+                    inboundCodecId = String(inbound.codecId);
+                    const codec = stats.get(inbound.codecId);
+                    if (codec && codec.mimeType) {
+                        actualCodecMimeType =
+                            String(codec.mimeType).toLowerCase();
+                        break;
+                    }
+                }
+            } catch (error) {
+                codecLookupError = String(error);
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 250));
+        }
+
+        if (codecLookupError && !actualCodecMimeType) {
             return {
                 supported: false,
-                reason: "selected_webRTC_codec_is_not_vp8",
-                codecs: receiverCodecs,
+                reason: "actual_inbound_codec_lookup_failed",
+                error: codecLookupError,
+                receiverCodecs,
+            };
+        }
+
+        if (actualCodecMimeType !== "video/vp8") {
+            return {
+                supported: false,
+                reason: actualCodecMimeType
+                    ? "selected_webRTC_codec_is_not_vp8"
+                    : "actual_inbound_vp8_codec_not_found",
+                actualCodecMimeType,
+                inboundCodecId,
+                receiverCodecs,
             };
         }
 
@@ -2445,10 +2558,12 @@ WEBRTC_HOOK = r"""
         }
 
         state.attachedTrackId = track.id;
+        state.codecMimeType = actualCodecMimeType;
         state.started = true;
         state.stopping = false;
         state.firstTimestamp = null;
         state.lastTimestamp = null;
+        state.codecMimeType = actualCodecMimeType;
         state.seenKeyFrame = false;
         state.frameCount = 0;
         state.keyFrameCount = 0;
@@ -2482,6 +2597,8 @@ WEBRTC_HOOK = r"""
             supported: true,
             receiverFound: true,
             trackId: track.id,
+            codecMimeType: actualCodecMimeType,
+            inboundCodecId,
         };
     };
 
@@ -2580,6 +2697,7 @@ WEBRTC_HOOK = r"""
             started: state.started,
             stopping: state.stopping,
             attachedTrackId: state.attachedTrackId || null,
+            codecMimeType: state.codecMimeType || null,
             receiverTrackIds: Array.from(state.receivers.keys()),
             receiverFound: state.receiverFound,
             frameCount: state.frameCount,
@@ -5281,6 +5399,15 @@ async def run_recording(playwright):
                     frame_data = body[offset:end]
                     offset = end
 
+                    # RFC 6386: VP8 key frames carry the 3-byte sync code
+                    # 9d 01 2a at bytes 3..5. Validate before writing IVF.
+                    if frame_type == 1:
+                        if frame_size < 6 or frame_data[3:6] != b"\x9d\x01\x2a":
+                            raise RuntimeError(
+                                "Encoded VP8 key frame failed sync-code validation: "
+                                + frame_data[:12].hex()
+                            )
+
                     if encoded_video_first_timestamp is None:
                         encoded_video_first_timestamp = timestamp_us
 
@@ -6644,6 +6771,12 @@ async def run_recording(playwright):
                 f"frames={encoded_video_frame_count}, "
                 f"keyframes={encoded_video_keyframe_count}"
             )
+
+            if encoded_video_keyframe_count <= 0:
+                raise RuntimeError(
+                    "Encoded VP8 capture contains no validated key frame; "
+                    "refusing to remux/upload"
+                )
 
             remux_ivf_to_webm(
                 encoded_video_ivf_path,
