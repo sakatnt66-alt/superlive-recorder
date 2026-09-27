@@ -2450,6 +2450,7 @@ WEBRTC_HOOK = r"""
 
             const entry = {
                 trackId: track.id,
+                receiver,
                 worker,
                 workerUrl,
                 port: channel.port1,
@@ -3711,6 +3712,68 @@ WEBRTC_HOOK = r"""
             inboundAudio: results.filter(
                 item => item.kind === "audio"
             ),
+        };
+    };
+
+    window.__superliveGetEncodedAttachedTrackStats = async () => {
+        const state = window.__superliveEncodedVideo;
+        const trackId = state && state.attachedTrackId
+            ? state.attachedTrackId
+            : null;
+
+        if (!trackId) {
+            return {
+                trackId: null,
+                trackReadyState: null,
+                receiverFound: false,
+                inbound: null,
+            };
+        }
+
+        const entry = state.receivers.get(trackId) || null;
+        const track = entry && entry.receiver
+            ? entry.receiver.track
+            : null;
+
+        let inbound = null;
+        if (entry && entry.receiver) {
+            try {
+                const stats = await entry.receiver.getStats();
+                stats.forEach(report => {
+                    if (
+                        !inbound
+                        && report
+                        && report.type === "inbound-rtp"
+                        && (report.kind === "video" || report.mediaType === "video")
+                    ) {
+                        inbound = {
+                            trackIdentifier: report.trackIdentifier || trackId,
+                            ssrc: report.ssrc ?? null,
+                            framesReceived: report.framesReceived ?? null,
+                            packetsReceived: report.packetsReceived ?? null,
+                            bytesReceived: report.bytesReceived ?? null,
+                            framesDecoded: report.framesDecoded ?? null,
+                            packetsLost: report.packetsLost ?? null,
+                            framesPerSecond: report.framesPerSecond ?? null,
+                        };
+                    }
+                });
+            } catch (error) {
+                return {
+                    trackId,
+                    trackReadyState: track ? track.readyState : null,
+                    receiverFound: !!entry.receiver,
+                    inbound: null,
+                    error: String(error),
+                };
+            }
+        }
+
+        return {
+            trackId,
+            trackReadyState: track ? track.readyState : null,
+            receiverFound: !!(entry && entry.receiver),
+            inbound,
         };
     };
 
@@ -6352,10 +6415,27 @@ async def run_recording(playwright):
                         last_detection_log = now
 
                 if result.get("ready"):
-                    video_ready = True
-
                     selection = result.get("selection") or {}
                     selected = selection.get("selected") or {}
+
+                    # When STREAM_ID is known, never start recording from a
+                    # fallback live player.  The selector may temporarily find
+                    # another valid WebRTC video before the requested stream's
+                    # DOM association appears.  Starting there creates a short
+                    # wrong-broadcast clip before the real target arrives.
+                    if STREAM_ID and selected.get("sameTargetDom") is not True:
+                        now = time.monotonic()
+                        if now - last_detection_log >= 10:
+                            log(
+                                "Live video candidates found, but requested "
+                                "STREAM_ID is not explicitly associated yet; "
+                                "waiting for target video"
+                            )
+                            last_detection_log = now
+                        await asyncio.sleep(1)
+                        continue
+
+                    video_ready = True
 
                     log(
                         "Live video detected: "
@@ -6863,6 +6943,7 @@ async def run_recording(playwright):
         last_encoded_frame_count = 0
         last_encoded_frame_progress_at = time.monotonic()
         last_inbound_video_signature = None
+        last_inbound_video_track_id = None
         last_inbound_video_progress_at = time.monotonic()
 
         while True:
@@ -7000,48 +7081,63 @@ async def run_recording(playwright):
                         - last_encoded_frame_progress_at
                     )
 
-                    # Detect a real stream stop by watching the WebRTC
-                    # inbound counters as well as the encoded-frame counter.
-                    # Some SuperLive receiver objects remain present after the
-                    # stream ends, so `inboundVideo == []` is not a reliable
-                    # end-of-stream condition by itself.
+                    # Detect stream end using ONLY the WebRTC receiver that
+                    # the encoded recorder is actually attached to.  The page
+                    # may keep other broadcasts/receivers alive after the
+                    # requested stream ends; global inboundVideo progress from
+                    # those tracks must never keep this recording alive.
                     try:
-                        end_stats = await page.evaluate(
+                        attached_stats = await page.evaluate(
                             """
                             () =>
-                                window.__superliveGetWebRTCStats
-                                    ? window.__superliveGetWebRTCStats()
+                                window.__superliveGetEncodedAttachedTrackStats
+                                    ? window.__superliveGetEncodedAttachedTrackStats()
                                     : null
                             """
                         )
                     except Exception:
-                        end_stats = None
+                        attached_stats = None
 
-                    inbound_video = []
-                    if isinstance(end_stats, dict):
-                        inbound_video = end_stats.get("inboundVideo") or []
-
-                    inbound_signature_parts = []
-                    for item in inbound_video:
-                        if not isinstance(item, dict):
-                            continue
-                        inbound_signature_parts.append(
-                            (
-                                str(item.get("trackIdentifier") or ""),
-                                int(item.get("ssrc") or 0),
-                                int(item.get("framesReceived") or 0),
-                                int(item.get("packetsReceived") or 0),
-                                int(item.get("bytesReceived") or 0),
-                            )
-                        )
-
-                    inbound_signature = tuple(
-                        sorted(inbound_signature_parts)
+                    attached_track_id = (
+                        attached_stats.get("trackId")
+                        if isinstance(attached_stats, dict)
+                        else None
                     )
 
-                    if inbound_signature != last_inbound_video_signature:
-                        last_inbound_video_signature = inbound_signature
+                    if attached_track_id != last_inbound_video_track_id:
+                        last_inbound_video_track_id = attached_track_id
+                        last_inbound_video_signature = None
                         last_inbound_video_progress_at = time.monotonic()
+
+                    attached_inbound = None
+                    if isinstance(attached_stats, dict):
+                        attached_inbound = attached_stats.get("inbound")
+
+                    if isinstance(attached_inbound, dict):
+                        attached_signature = (
+                            str(attached_inbound.get("trackIdentifier") or attached_track_id or ""),
+                            int(attached_inbound.get("ssrc") or 0),
+                            int(attached_inbound.get("framesReceived") or 0),
+                            int(attached_inbound.get("packetsReceived") or 0),
+                            int(attached_inbound.get("bytesReceived") or 0),
+                        )
+
+                        if attached_signature != last_inbound_video_signature:
+                            last_inbound_video_signature = attached_signature
+                            last_inbound_video_progress_at = time.monotonic()
+                    else:
+                        # A missing inbound report or ended track is itself
+                        # evidence that the attached receiver stopped.  Reset
+                        # only when the attached identity changes; otherwise
+                        # allow the idle timer to mature.
+                        if (
+                            isinstance(attached_stats, dict)
+                            and attached_stats.get("trackReadyState") == "ended"
+                        ):
+                            last_inbound_video_progress_at = min(
+                                last_inbound_video_progress_at,
+                                time.monotonic() - STREAM_END_IDLE_TIMEOUT,
+                            )
 
                     inbound_idle_seconds = (
                         time.monotonic()
@@ -7054,9 +7150,10 @@ async def run_recording(playwright):
                         and inbound_idle_seconds >= STREAM_END_IDLE_TIMEOUT
                     ):
                         log(
-                            "Stream end detected: no encoded video frame progress "
-                            f"for {encoded_idle_seconds:.1f}s and no WebRTC inbound "
-                            f"counter progress for {inbound_idle_seconds:.1f}s"
+                            "Stream end detected on attached encoded track: "
+                            f"track={attached_track_id} "
+                            f"encoded_idle={encoded_idle_seconds:.1f}s "
+                            f"attached_receiver_idle={inbound_idle_seconds:.1f}s"
                         )
                         break
 
