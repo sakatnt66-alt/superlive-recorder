@@ -227,8 +227,8 @@ TEMP_DIR = Path(
 RECORDING_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-VIDEO_BITRATE = 5_000_000
-AUDIO_BITRATE = 192_000
+VIDEO_BITRATE = 3_000_000
+AUDIO_BITRATE = 128_000
 
 VIDEO_WAIT_SECONDS = 60
 PAGE_TIMEOUT_MS = 30_000
@@ -2819,6 +2819,14 @@ WEBRTC_HOOK = r"""
                 candidateTracks.push(recordingAudioTrack);
             }
 
+            try {
+                if (recordingVideoTrack && "contentHint" in recordingVideoTrack) {
+                    recordingVideoTrack.contentHint = "motion";
+                }
+            } catch (e) {
+                // contentHint is an optional optimization; ignore unsupported browsers.
+            }
+
             window.__superliveRecordingCandidates.push({
                 name,
                 stream: new MediaStream(candidateTracks),
@@ -2841,22 +2849,22 @@ WEBRTC_HOOK = r"""
          * selected WebRTC/capture video source. Audio is recorded
          * independently and muxed losslessly after capture.
          *
-         * Prefer the original WebRTC video first because its
-         * inbound stats show ~25-30 decoded FPS, whereas the
-         * rendered <video> callback was ~17-19 FPS.
+         * Prefer an isolated clone of the selected WebRTC video first.
+         * This keeps MediaRecorder away from the page-owned source track
+         * while preserving the exact selected WebRTC source.
          */
-
-        addRecordingCandidate(
-            "webrtc-video-only",
-            selectedVideoTrack,
-            null
-        );
 
         addRecordingCandidate(
             "webrtc-video-only-clone",
             selectedVideoTrack,
             null,
             true
+        );
+
+        addRecordingCandidate(
+            "webrtc-video-only",
+            selectedVideoTrack,
+            null
         );
 
         if (
@@ -3133,6 +3141,20 @@ WEBRTC_HOOK = r"""
             audioBitsPerSecond:
                 audioBitrate
         };
+
+        /* Keep the encoder focused on motion rather than quality-at-all-costs.
+         * On the live 720x1280 source, higher bitrates previously increased
+         * encoder pressure without restoring the missing frames. */
+        try {
+            if (recordingStream.getVideoTracks) {
+                const videoTrack = recordingStream.getVideoTracks()[0];
+                if (videoTrack && "contentHint" in videoTrack) {
+                    videoTrack.contentHint = "motion";
+                }
+            }
+        } catch (e) {
+            // Optional optimization only.
+        }
 
         const recorder =
             new MediaRecorder(
@@ -4426,25 +4448,6 @@ async def run_recording(playwright):
             "Selected video playback check: "
             + json.dumps(
                 play_result,
-                ensure_ascii=False,
-            )
-        )
-
-        # ----------------------------------------------------
-        # Start rendered-frame diagnostic
-        # ----------------------------------------------------
-
-        render_diag_start = await page.evaluate(
-            """
-            () =>
-                window.__superliveStartRenderDiagnostics()
-            """
-        )
-
-        log(
-            "Rendered-frame diagnostic started: "
-            + json.dumps(
-                render_diag_start,
                 ensure_ascii=False,
             )
         )
