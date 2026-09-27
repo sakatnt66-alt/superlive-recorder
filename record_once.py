@@ -5593,8 +5593,6 @@ async def run_recording(playwright):
                 1,
                 0,
                 0,
-                0,
-                0,
             )
         )
         encoded_video_file.flush()
