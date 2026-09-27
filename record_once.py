@@ -2253,6 +2253,7 @@ WEBRTC_HOOK = r"""
         stopping: false,
         lastTimestamp: null,
         firstTimestamp: null,
+        timestampRegressionCount: 0,
     };
 
 
@@ -2527,8 +2528,7 @@ WEBRTC_HOOK = r"""
                     state.lastTimestamp !== null
                     && timestamp < state.lastTimestamp
                 ) {
-                    state.uploadError =
-                        "Encoded video timestamp moved backwards";
+                    state.timestampRegressionCount++;
                 }
 
                 state.lastTimestamp = timestamp;
@@ -2848,6 +2848,7 @@ WEBRTC_HOOK = r"""
         state.stopping = false;
         state.firstTimestamp = null;
         state.lastTimestamp = null;
+        state.timestampRegressionCount = 0;
         state.codecMimeType = actualCodecMimeType;
         state.seenKeyFrame = false;
         state.frameCount = 0;
@@ -2971,6 +2972,7 @@ WEBRTC_HOOK = r"""
             uploadError: state.uploadError,
             firstTimestamp: state.firstTimestamp,
             lastTimestamp: state.lastTimestamp,
+            timestampRegressionCount: state.timestampRegressionCount,
             seenKeyFrame: state.seenKeyFrame,
         };
     };
@@ -2995,6 +2997,7 @@ WEBRTC_HOOK = r"""
             uploadError: state.uploadError,
             firstTimestamp: state.firstTimestamp,
             lastTimestamp: state.lastTimestamp,
+            timestampRegressionCount: state.timestampRegressionCount,
         };
     };
 
@@ -5536,6 +5539,7 @@ async def run_recording(playwright):
     encoded_video_mode = False
     encoded_h264_mode = False
     encoded_video_timestamp_deltas = []
+    encoded_video_timestamp_regressions = 0
 
     try:
         # Video output is opened lazily: encoded WebRTC capture writes IVF
@@ -5634,6 +5638,7 @@ async def run_recording(playwright):
             nonlocal encoded_video_last_timestamp
             nonlocal encoded_h264_mode
             nonlocal encoded_video_timestamp_deltas
+            nonlocal encoded_video_timestamp_regressions
 
             try:
                 body = request.post_data_buffer or b""
@@ -5655,6 +5660,17 @@ async def run_recording(playwright):
 
                 offset = 8
                 batch_frames = 0
+
+                # Build the complete batch first. Nothing is written to disk
+                # until every frame in the batch has passed validation. This
+                # prevents a retry after HTTP 500 from duplicating a prefix
+                # of a partially accepted batch.
+                pending_frames = []
+                pending_deltas = []
+                pending_keyframes = 0
+                pending_bytes = 0
+                pending_regressions = 0
+                batch_previous_timestamp = encoded_video_last_timestamp
 
                 while offset < len(body):
                     if offset + 13 > len(body):
@@ -5693,66 +5709,103 @@ async def run_recording(playwright):
                     frame_data = body[offset:end]
                     offset = end
 
-                    # RFC 6386: VP8 key frames carry the 3-byte sync code
-                    # 9d 01 2a at bytes 3..5. Validate before writing IVF.
-                    if frame_type == 1:
-                        if frame_size < 6 or frame_data[3:6] != b"\x9d\x01\x2a":
-                            raise RuntimeError(
-                                "Encoded VP8 key frame failed sync-code validation: "
-                                + frame_data[:12].hex()
-                            )
-
-                    if encoded_video_first_timestamp is None:
-                        encoded_video_first_timestamp = timestamp_us
-
+                    # Timestamp order is diagnostic only. Encoded WebRTC
+                    # frames can arrive with a timestamp regression even
+                    # though the encoded access units themselves are valid.
+                    # Never reject/drop the frame for that reason.
                     if (
-                        encoded_video_last_timestamp is not None
-                        and timestamp_us < encoded_video_last_timestamp
+                        batch_previous_timestamp is not None
+                        and timestamp_us < batch_previous_timestamp
                     ):
-                        raise RuntimeError(
-                            "Encoded video timestamp moved backwards"
-                        )
+                        pending_regressions += 1
+                    elif batch_previous_timestamp is not None:
+                        delta = timestamp_us - batch_previous_timestamp
+                        if 1000 <= delta <= 1_000_000:
+                            pending_deltas.append(delta)
 
-                    encoded_video_last_timestamp = timestamp_us
+                    batch_previous_timestamp = timestamp_us
 
-                    if encoded_h264_mode:
+                    if frame_type == 1 and encoded_h264_mode:
                         annexb = h264_payload_to_annexb(frame_data)
-                        if frame_type == 1 and not h264_contains_idr(annexb):
+                        if not h264_contains_idr(annexb):
                             raise RuntimeError(
                                 "Encoded H.264 key frame contains no IDR NAL"
                             )
-                        if frame_type != 1 and encoded_video_keyframe_count <= 0:
-                            continue
-                        h264_video_file.write(annexb)
-                        if (
-                            encoded_video_last_timestamp is not None
-                            and timestamp_us > encoded_video_last_timestamp
-                        ):
-                            delta = timestamp_us - encoded_video_last_timestamp
-                            if 1000 <= delta <= 1_000_000:
-                                encoded_video_timestamp_deltas.append(delta)
-                                if len(encoded_video_timestamp_deltas) > 2000:
-                                    encoded_video_timestamp_deltas.pop(0)
+                        pending_frames.append((frame_type, timestamp_us, frame_data, annexb))
+                    elif encoded_h264_mode:
+                        annexb = h264_payload_to_annexb(frame_data)
+                        pending_frames.append((frame_type, timestamp_us, frame_data, annexb))
                     else:
+                        if frame_type == 1:
+                            if frame_size < 6 or frame_data[3:6] != b"\x9d\x01\x2a":
+                                raise RuntimeError(
+                                    "Encoded VP8 key frame failed sync-code validation: "
+                                    + frame_data[:12].hex()
+                                )
+                        pending_frames.append((frame_type, timestamp_us, frame_data, None))
+
+                if not pending_frames:
+                    raise RuntimeError("Encoded video batch contains no frames")
+
+                # Ignore delta frames before the first keyframe. This mirrors
+                # the browser-side guard without changing the encoded payload.
+                accepted_frames = []
+                seen_key = encoded_video_keyframe_count > 0
+                for frame_type, timestamp_us, frame_data, annexb in pending_frames:
+                    if frame_type == 1:
+                        seen_key = True
+                        pending_keyframes += 1
+                    elif not seen_key:
+                        continue
+                    accepted_frames.append((frame_type, timestamp_us, frame_data, annexb))
+                    pending_bytes += len(frame_data)
+
+                if not accepted_frames:
+                    raise RuntimeError(
+                        "Encoded video batch contains no frame at/after a validated keyframe"
+                    )
+
+                if encoded_video_first_timestamp is None:
+                    encoded_video_first_timestamp = accepted_frames[0][1]
+
+                # Commit only after the whole batch is validated.
+                for frame_type, timestamp_us, frame_data, annexb in accepted_frames:
+                    if encoded_h264_mode:
+                        h264_video_file.write(annexb)
+                    else:
+                        relative_timestamp = max(
+                            0,
+                            timestamp_us - encoded_video_first_timestamp
+                            if encoded_video_first_timestamp is not None
+                            else 0,
+                        )
                         encoded_video_file.write(
                             struct.pack(
                                 "<IQ",
-                                frame_size,
-                                max(
-                                    0,
-                                    timestamp_us
-                                    - encoded_video_first_timestamp,
-                                ),
+                                len(frame_data),
+                                relative_timestamp,
                             )
                         )
                         encoded_video_file.write(frame_data)
 
-                    encoded_video_frame_count += 1
-                    batch_frames += 1
-                    encoded_video_total_bytes += frame_size
+                encoded_video_last_timestamp = batch_previous_timestamp
+                encoded_video_timestamp_deltas.extend(pending_deltas)
+                if len(encoded_video_timestamp_deltas) > 2000:
+                    del encoded_video_timestamp_deltas[:-2000]
+                encoded_video_frame_count += len(accepted_frames)
+                encoded_video_keyframe_count += pending_keyframes
+                encoded_video_total_bytes += pending_bytes
+                batch_frames = len(accepted_frames)
 
-                    if frame_type == 1:
-                        encoded_video_keyframe_count += 1
+                # Timestamp regressions are logged/diagnosed, never treated
+                # as upload errors.
+                if pending_regressions:
+                    encoded_video_timestamp_regressions += pending_regressions
+                    log(
+                        "Encoded video timestamp regression tolerated: "
+                        f"batch={pending_regressions} "
+                        f"total={encoded_video_timestamp_regressions}"
+                    )
 
                 encoded_video_file.flush()
                 encoded_video_chunk_count += 1
@@ -6878,6 +6931,12 @@ async def run_recording(playwright):
                         """
                     )
 
+                if upload_error:
+                    raise RuntimeError(
+                        "Encoded video upload failed: "
+                        + str(upload_error)
+                    )
+
                 if time.monotonic() - last_drain_log >= 10:
                     log(
                         "Drain status: "
@@ -6927,6 +6986,11 @@ async def run_recording(playwright):
 
             except Exception as e:
                 log(f"Queue drain status error: {e}")
+                if 'upload_error' in locals() and upload_error:
+                    raise RuntimeError(
+                        "Encoded video upload failed: "
+                        + str(upload_error)
+                    ) from e
 
             await asyncio.sleep(0.25)
 
@@ -7089,9 +7153,13 @@ async def run_recording(playwright):
                         "refusing to remux/upload"
                     )
                 if not encoded_video_timestamp_deltas:
-                    raise RuntimeError(
-                        "Encoded H.264 capture has no usable frame timestamps"
+                    log(
+                        "WARNING: Encoded H.264 capture has no usable positive "
+                        "timestamp deltas; using 30 FPS for raw-H.264 remux timing"
                     )
+                    encoded_video_timestamp_deltas = [
+                        round(1_000_000 / 30)
+                    ]
                 sorted_deltas = sorted(encoded_video_timestamp_deltas)
                 median_delta = sorted_deltas[len(sorted_deltas) // 2]
                 source_fps = 1_000_000.0 / median_delta
@@ -7100,6 +7168,7 @@ async def run_recording(playwright):
                     f"{h264_path.stat().st_size / 1024 / 1024:.2f} MB, "
                     f"frames={encoded_video_frame_count}, "
                     f"keyframes={encoded_video_keyframe_count}, "
+                    f"timestamp_regressions={encoded_video_timestamp_regressions}, "
                     f"median_frame_delta_us={median_delta}, "
                     f"source_fps={source_fps:.3f}"
                 )
