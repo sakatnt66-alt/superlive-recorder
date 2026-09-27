@@ -2916,20 +2916,119 @@ WEBRTC_HOOK = r"""
         }
 
         try {
-            if (!window.__superliveSelectTargetVideo) {
-                return {changed: false, reason: "selector_unavailable"};
+            let nextVideo =
+                window.__superliveSelectedVideo || null;
+            let nextTrack = null;
+            let selectedFromTargetVideo = false;
+
+            /*
+             * IMPORTANT:
+             *
+             * Rebinding is NOT a fresh global target-selection operation.
+             * The initial selector has already identified the requested
+             * livestream.  If WebRTC replaces its receiver track, first
+             * follow the SAME <video> element and its current srcObject.
+             *
+             * The old implementation called the global selector here.  On
+             * pages containing several simultaneous players, that allowed a
+             * different live player to become the recording source when its
+             * track happened to rank higher at that moment.
+             */
+            if (nextVideo) {
+                try {
+                    const stream = nextVideo.srcObject || null;
+                    const targetStillAttached =
+                        typeof domContainsTargetId === "function"
+                        && domContainsTargetId(nextVideo);
+                    const candidate = stream
+                        ? stream
+                            .getVideoTracks()
+                            .find(t => t && t.readyState === "live")
+                        : null;
+
+                    if (candidate && targetStillAttached) {
+                        nextTrack = candidate;
+                        selectedFromTargetVideo = true;
+                    }
+                } catch (error) {
+                    // Fall through to the strict target selector below.
+                }
             }
 
-            await window.__superliveSelectTargetVideo();
-            const nextTrack =
-                window.__superliveSelectedVideoTrack || null;
+            if (!nextTrack) {
+                if (!window.__superliveSelectTargetVideo) {
+                    return {changed: false, reason: "selector_unavailable"};
+                }
+
+                const selection =
+                    await window.__superliveSelectTargetVideo();
+
+                if (
+                    !selection
+                    || !selection.selected
+                    || selection.selected.sameTargetDom !== true
+                ) {
+                    return {
+                        changed: false,
+                        reason: "requested_target_not_present",
+                        sameTargetDom: selection
+                            && selection.selected
+                            ? selection.selected.sameTargetDom
+                            : null,
+                    };
+                }
+
+                nextVideo =
+                    window.__superliveSelectedVideo || null;
+                nextTrack =
+                    window.__superliveSelectedVideoTrack || null;
+            }
 
             if (!nextTrack || nextTrack.kind !== "video") {
                 return {changed: false, reason: "no_live_target_track"};
             }
 
             if (nextTrack.id === state.attachedTrackId) {
-                return {changed: false, reason: "same_track"};
+                return {
+                    changed: false,
+                    reason: "same_track",
+                    selectedFromTargetVideo,
+                };
+            }
+
+            /*
+             * Never switch to another page player.  If the candidate came
+             * from the previously selected video element, that element is
+             * the identity anchor.  If it came from a selector refresh, the
+             * selector must have explicitly associated it with STREAM_ID.
+             */
+            if (!selectedFromTargetVideo) {
+                try {
+                    const selection =
+                        await window.__superliveSelectTargetVideo();
+                    if (
+                        !selection
+                        || !selection.selected
+                        || selection.selected.trackId !== nextTrack.id
+                        || selection.selected.sameTargetDom !== true
+                    ) {
+                        return {
+                            changed: false,
+                            reason: "replacement_not_explicit_target",
+                            trackId: nextTrack.id,
+                            sameTargetDom: selection
+                                && selection.selected
+                                ? selection.selected.sameTargetDom
+                                : null,
+                        };
+                    }
+                } catch (error) {
+                    return {
+                        changed: false,
+                        reason: "replacement_target_validation_failed",
+                        error: String(error),
+                    };
+                }
             }
 
             const peer =
