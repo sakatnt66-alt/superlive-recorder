@@ -5939,12 +5939,20 @@ async def run_recording(playwright):
                 break
 
             try:
-                status = await page.evaluate(
-                    """
-                    () =>
-                        window.__superliveGetStatus()
-                    """
-                )
+                if encoded_video_mode:
+                    status = await page.evaluate(
+                        """
+                        () => window.__superliveGetEncodedVideoStatus
+                            ? window.__superliveGetEncodedVideoStatus()
+                            : {}
+                        """
+                    )
+                else:
+                    status = await page.evaluate(
+                        """
+                        () => window.__superliveGetStatus()
+                        """
+                    )
 
                 idle_ms = float(
                     status.get(
@@ -5955,13 +5963,7 @@ async def run_recording(playwright):
 
                 encoded_status = {}
                 if encoded_video_mode:
-                    encoded_status = await page.evaluate(
-                        """
-                        () => window.__superliveGetEncodedVideoStatus
-                            ? window.__superliveGetEncodedVideoStatus()
-                            : {}
-                        """
-                    )
+                    encoded_status = status
 
                 video_state = status.get(
                     "videoReadyState"
@@ -6269,164 +6271,120 @@ async def run_recording(playwright):
         )
 
         while True:
-            drain_elapsed = (
-                time.monotonic()
-                - drain_started
-            )
+            drain_elapsed = time.monotonic() - drain_started
 
-            if (
-                drain_elapsed
-                >= FINAL_QUEUE_DRAIN_TIMEOUT_SECONDS
-            ):
+            if drain_elapsed >= FINAL_QUEUE_DRAIN_TIMEOUT_SECONDS:
                 try:
-                    status = await page.evaluate(
-                        """
-                        () =>
-                            window.__superliveGetStatus()
-                        """
-                    )
-                except Exception:
-                    status = {}
-
-                raise RuntimeError(
-                    "Recording upload queue did not drain "
-                    "within the safety timeout: "
-                    + json.dumps(
-                        status,
-                        ensure_ascii=False,
-                    )
-                )
-
-                try:
-                    status = await page.evaluate(
-                        """
-                        () => window.__superliveGetStatus()
-                        """
-                    )
-
                     if encoded_video_mode:
-                        encoded_status = await page.evaluate(
+                        timeout_status = await page.evaluate(
                             """
                             () => window.__superliveGetEncodedVideoStatus
                                 ? window.__superliveGetEncodedVideoStatus()
                                 : {}
                             """
                         )
-                        queue_length = int(encoded_status.get("queueLength", 0))
-                        uploading = bool(encoded_status.get("uploading", False))
-                        recorder_chunks = int(encoded_status.get("frameCount", 0))
-                        uploaded_chunks = int(encoded_status.get("uploadedFrameCount", 0))
-                        pending_tasks = int(encoded_status.get("pendingDataTasks", 0))
-                        upload_error = encoded_status.get("uploadError")
                     else:
-                        queue_length = int(status.get("queueLength", 0))
-                        uploading = bool(status.get("isUploading", False))
-                        recorder_chunks = int(status.get("chunkCount", 0))
-                        uploaded_chunks = int(status.get("uploadedChunkCount", 0))
-                        pending_tasks = int(status.get("pendingDataTasks", 0))
-                        upload_error = status.get("uploadError")
+                        timeout_status = await page.evaluate(
+                            """
+                            () => window.__superliveGetStatus()
+                            """
+                        )
+                except Exception:
+                    timeout_status = {}
 
-                    audio_status = {}
-                    if audio_expected:
-                        try:
-                            audio_status = await page.evaluate(
-                                """
-                                () =>
-                                    window.__superliveGetAudioStatus()
-                                """
-                            )
-                        except Exception as e:
-                            raise RuntimeError(
-                                "Unable to read independent audio recorder status: "
-                                + str(e)
-                            )
-    
-                    if (
-                        time.monotonic()
-                        - last_drain_log
-                        >= 10
-                    ):
-                        log(
-                            "Drain status: "
-                            f"recorder_chunks="
-                            f"{recorder_chunks} "
-                            f"uploaded="
-                            f"{uploaded_chunks} "
-                            f"queue="
-                            f"{queue_length} "
-                            f"uploading="
-                            f"{uploading} "
-                            f"pending="
-                            f"{pending_tasks}"
-                        )
-    
-                        if upload_error:
-                            log(
-                                "Current upload error: "
-                                f"{upload_error}"
-                            )
-    
-                        if audio_expected:
-                            log(
-                                "Independent audio drain status: "
-                                + json.dumps(
-                                    audio_status,
-                                    ensure_ascii=False,
-                                )
-                            )
-    
-                        log(
-                            f"Local WebM received: "
-                            f"{total_bytes / 1024 / 1024:.2f} MB"
-                        )
-    
-                        log(
-                            f"Local audio WebM received: "
-                            f"{audio_total_bytes / 1024 / 1024:.2f} MB"
-                        )
-    
-                        last_drain_log = (
-                            time.monotonic()
-                        )
-    
-                    if upload_error:
-                        log(
-                            "WARNING: upload error is "
-                            f"currently recorded: "
-                            f"{upload_error}"
-                        )
-    
-                    audio_drained = True
-                    if audio_expected:
-                        audio_drained = (
-                            int(audio_status.get("queueLength", 0)) == 0
-                            and not bool(audio_status.get("isUploading"))
-                            and int(audio_status.get("pendingDataTasks", 0)) == 0
-                            and int(audio_status.get("uploadedChunkCount", 0))
-                                == int(audio_status.get("chunkCount", 0))
-                            and int(audio_status.get("chunkCount", 0)) > 0
-                            and not audio_status.get("uploadError")
-                        )
-    
-                    if (
-                        queue_length == 0
-                        and not uploading
-                        and pending_tasks == 0
-                        and uploaded_chunks == recorder_chunks
-                        and recorder_chunks > 0
-                        and not upload_error
-                        and audio_drained
-                    ):
-                        break
-    
-                except Exception as e:
-                    log(
-                        f"Queue drain status error: {e}"
+                raise RuntimeError(
+                    "Recording upload queue did not drain "
+                    "within the safety timeout: "
+                    + json.dumps(timeout_status, ensure_ascii=False)
+                )
+
+            try:
+                if encoded_video_mode:
+                    encoded_status = await page.evaluate(
+                        """
+                        () => window.__superliveGetEncodedVideoStatus
+                            ? window.__superliveGetEncodedVideoStatus()
+                            : {}
+                        """
                     )
-    
-            await asyncio.sleep(
-                0.25
-            )
+                    queue_length = int(encoded_status.get("queueLength", 0))
+                    uploading = bool(encoded_status.get("uploading", False))
+                    recorder_chunks = int(encoded_status.get("frameCount", 0))
+                    uploaded_chunks = int(encoded_status.get("uploadedFrameCount", 0))
+                    pending_tasks = int(encoded_status.get("pendingDataTasks", 0))
+                    upload_error = encoded_status.get("uploadError")
+                else:
+                    status = await page.evaluate(
+                        """
+                        () => window.__superliveGetStatus()
+                        """
+                    )
+                    queue_length = int(status.get("queueLength", 0))
+                    uploading = bool(status.get("isUploading", False))
+                    recorder_chunks = int(status.get("chunkCount", 0))
+                    uploaded_chunks = int(status.get("uploadedChunkCount", 0))
+                    pending_tasks = int(status.get("pendingDataTasks", 0))
+                    upload_error = status.get("uploadError")
+
+                audio_status = {}
+                if audio_expected:
+                    audio_status = await page.evaluate(
+                        """
+                        () => window.__superliveGetAudioStatus()
+                        """
+                    )
+
+                if time.monotonic() - last_drain_log >= 10:
+                    log(
+                        "Drain status: "
+                        f"recorder_chunks={recorder_chunks} "
+                        f"uploaded={uploaded_chunks} "
+                        f"queue={queue_length} "
+                        f"uploading={uploading} "
+                        f"pending={pending_tasks}"
+                    )
+                    if upload_error:
+                        log(f"Current upload error: {upload_error}")
+                    if audio_expected:
+                        log(
+                            "Independent audio drain status: "
+                            + json.dumps(audio_status, ensure_ascii=False)
+                        )
+                    log(
+                        f"Local WebM received: {total_bytes / 1024 / 1024:.2f} MB"
+                    )
+                    log(
+                        f"Local audio WebM received: {audio_total_bytes / 1024 / 1024:.2f} MB"
+                    )
+                    last_drain_log = time.monotonic()
+
+                audio_drained = True
+                if audio_expected:
+                    audio_drained = (
+                        int(audio_status.get("queueLength", 0)) == 0
+                        and not bool(audio_status.get("isUploading"))
+                        and int(audio_status.get("pendingDataTasks", 0)) == 0
+                        and int(audio_status.get("uploadedChunkCount", 0))
+                            == int(audio_status.get("chunkCount", 0))
+                        and int(audio_status.get("chunkCount", 0)) > 0
+                        and not audio_status.get("uploadError")
+                    )
+
+                if (
+                    queue_length == 0
+                    and not uploading
+                    and pending_tasks == 0
+                    and uploaded_chunks == recorder_chunks
+                    and recorder_chunks > 0
+                    and not upload_error
+                    and audio_drained
+                ):
+                    break
+
+            except Exception as e:
+                log(f"Queue drain status error: {e}")
+
+            await asyncio.sleep(0.25)
 
         # ----------------------------------------------------
         # FINAL STATUS
