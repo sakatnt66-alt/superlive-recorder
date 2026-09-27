@@ -1499,6 +1499,277 @@ def remux_ivf_to_webm(
         )
 
 
+
+def h264_payload_to_annexb(payload: bytes) -> bytes:
+    """Normalize one encoded H.264 access unit to Annex-B NAL units."""
+    payload = bytes(payload or b"")
+    if not payload:
+        raise RuntimeError("Empty encoded H.264 frame")
+
+    if payload.startswith(b"\x00\x00\x00\x01") or payload.startswith(b"\x00\x00\x01"):
+        return payload
+
+    # Some implementations expose AVC length-prefixed NAL units. Convert
+    # those NAL units to Annex-B without decoding or re-encoding the video.
+    out = bytearray()
+    offset = 0
+    nal_count = 0
+    while offset + 4 <= len(payload):
+        nal_size = int.from_bytes(payload[offset:offset + 4], "big")
+        offset += 4
+        if nal_size <= 0 or offset + nal_size > len(payload):
+            break
+        out += b"\x00\x00\x00\x01"
+        out += payload[offset:offset + nal_size]
+        offset += nal_size
+        nal_count += 1
+
+    if nal_count > 0 and offset == len(payload):
+        return bytes(out)
+
+    raise RuntimeError(
+        "Unsupported H.264 encoded-frame payload format; "
+        f"first_bytes={payload[:16].hex()}"
+    )
+
+
+def h264_contains_idr(annexb: bytes) -> bool:
+    """Return True when an Annex-B access unit contains an H.264 IDR NAL."""
+    data = memoryview(annexb)
+    n = len(data)
+    i = 0
+    while i + 4 <= n:
+        if data[i:i + 4].tobytes() == b"\x00\x00\x00\x01":
+            start = i + 4
+        elif i + 3 <= n and data[i:i + 3].tobytes() == b"\x00\x00\x01":
+            start = i + 3
+        else:
+            i += 1
+            continue
+        if start < n and (data[start] & 0x1F) == 5:
+            return True
+        i = start
+    return False
+
+
+def remux_h264_to_mkv(
+    h264_path: Path,
+    mkv_path: Path,
+    expected_video_packets: int,
+    frame_rate: float,
+):
+    """Remux captured encoded H.264 into Matroska without re-encoding."""
+    if not h264_path.exists() or h264_path.stat().st_size <= 0:
+        raise RuntimeError("Encoded H.264 capture is missing or empty")
+
+    frame_rate = max(1.0, min(240.0, float(frame_rate)))
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-y",
+        "-framerate",
+        f"{frame_rate:.6f}",
+        "-f",
+        "h264",
+        "-i",
+        str(h264_path),
+        "-map",
+        "0:v:0",
+        "-c:v",
+        "copy",
+        "-f",
+        "matroska",
+        str(mkv_path),
+    ]
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=300,
+    )
+    if result.stderr:
+        log("H.264 -> Matroska output:\n" + result.stderr.strip())
+    if result.returncode != 0:
+        raise RuntimeError(
+            "FFmpeg H.264 -> Matroska remux failed:\n" + result.stderr
+        )
+    if not mkv_path.exists() or mkv_path.stat().st_size <= 10 * 1024:
+        raise RuntimeError("FFmpeg did not create a valid H.264 Matroska file")
+
+    actual_packets = get_video_packet_count(get_video_info(mkv_path))
+    log(
+        "Encoded H.264 Matroska packet integrity: "
+        f"expected={expected_video_packets} actual={actual_packets} "
+        f"source_fps={frame_rate:.3f}"
+    )
+    if actual_packets != expected_video_packets:
+        raise RuntimeError(
+            "Encoded H.264 packet count changed during Matroska remux: "
+            f"expected={expected_video_packets}, actual={actual_packets}"
+        )
+
+
+def mux_mkv_video_audio(video_path, audio_path, output_path):
+    """Losslessly mux H.264 video and Opus audio into Matroska."""
+    video_info = get_video_info(video_path)
+    audio_info = get_video_info(audio_path)
+    if not video_info or not audio_info:
+        raise RuntimeError("Unable to inspect H.264/Opus streams before muxing")
+
+    source_video_packets = get_video_packet_count(video_info)
+    source_audio_packets = get_audio_packet_count(audio_info)
+    if source_video_packets <= 0 or source_audio_packets <= 0:
+        raise RuntimeError(
+            "H.264/Opus source packet counts are invalid: "
+            f"video={source_video_packets}, audio={source_audio_packets}"
+        )
+
+    if output_path.exists():
+        output_path.unlink()
+
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+        "-copyts", "-i", str(video_path),
+        "-copyts", "-i", str(audio_path),
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c", "copy",
+        "-avoid_negative_ts", "disabled",
+        "-f", "matroska", str(output_path),
+    ]
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=300,
+    )
+    if result.stderr:
+        log("FFmpeg Matroska AV mux output:\n" + result.stderr.strip())
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Lossless Matroska H.264/Opus mux failed:\n" + result.stderr
+        )
+
+    output_info = get_video_info(output_path)
+    if not output_info:
+        raise RuntimeError("Unable to inspect muxed Matroska output")
+    output_video_packets = get_video_packet_count(output_info)
+    output_audio_packets = get_audio_packet_count(output_info)
+    log(
+        "Muxed Matroska packet counts: "
+        f"video={output_video_packets}/{source_video_packets} "
+        f"audio={output_audio_packets}/{source_audio_packets}"
+    )
+    if output_video_packets != source_video_packets:
+        raise RuntimeError("H.264 video packet loss/change detected during Matroska mux")
+    if output_audio_packets != source_audio_packets:
+        raise RuntimeError("Opus audio packet loss/change detected during Matroska mux")
+
+    streams = output_info.get("streams", [])
+    if not any(s.get("codec_type") == "video" for s in streams):
+        raise RuntimeError("Muxed Matroska has no video stream")
+    if not any(s.get("codec_type") == "audio" for s in streams):
+        raise RuntimeError("Muxed Matroska has no audio stream")
+
+
+def split_mkv_if_needed(mkv_path):
+    """Split Matroska by remuxing only, preserving H.264/Opus packets."""
+    mkv_path = Path(mkv_path)
+    size_mb = mkv_path.stat().st_size / (1024 * 1024)
+    log(f"Matroska size: {size_mb:.2f} MB")
+    if size_mb <= TELEGRAM_TARGET_SIZE_MB:
+        return [mkv_path]
+
+    info = get_video_info(mkv_path)
+    duration = get_duration(info)
+    source_video_packets = get_video_packet_count(info)
+    source_audio_packets = get_audio_packet_count(info)
+    has_audio_stream = any(
+        s.get("codec_type") == "audio" for s in (info or {}).get("streams", [])
+    )
+    if source_video_packets <= 0 or (has_audio_stream and source_audio_packets <= 0):
+        raise RuntimeError("Unable to verify Matroska packet counts before splitting")
+
+    if duration <= 1:
+        estimated_duration = (
+            mkv_path.stat().st_size * 8 / max(1, VIDEO_BITRATE + AUDIO_BITRATE)
+        )
+        duration = max(10, estimated_duration)
+
+    target_bytes = TELEGRAM_TARGET_SIZE_MB * 1024 * 1024
+    estimated_parts = max(2, int(mkv_path.stat().st_size / target_bytes) + 1)
+    segment_time = max(10, duration / estimated_parts)
+    output_glob = f"{mkv_path.stem}_part_*.mkv"
+
+    for attempt in range(1, 7):
+        for old_part in sorted(mkv_path.parent.glob(output_glob)):
+            try:
+                old_part.unlink()
+            except Exception:
+                pass
+
+        log(
+            f"Splitting Matroska attempt {attempt}/6: "
+            f"segment_time={segment_time:.1f}s"
+        )
+        output_pattern = mkv_path.parent / f"{mkv_path.stem}_part_%03d.mkv"
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+            "-i", str(mkv_path),
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-c", "copy",
+            "-f", "segment",
+            "-segment_time", str(segment_time),
+            "-segment_time_delta", "1.0",
+            "-reset_timestamps", "1",
+            "-segment_format", "matroska",
+            str(output_pattern),
+        ]
+        result = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=300,
+        )
+        if result.stderr:
+            log("FFmpeg Matroska split output:\n" + result.stderr.strip())
+        if result.returncode != 0:
+            raise RuntimeError("FFmpeg Matroska split failed:\n" + result.stderr)
+
+        parts = sorted(mkv_path.parent.glob(output_glob))
+        if not parts:
+            raise RuntimeError("Matroska split produced no parts")
+        if any(part.stat().st_size > TELEGRAM_MAX_SIZE_MB * 1024 * 1024 for part in parts):
+            segment_time *= 0.70
+            continue
+
+        total_video = 0
+        total_audio = 0
+        valid = True
+        for part in parts:
+            part_info = get_video_info(part)
+            pv = get_video_packet_count(part_info)
+            pa = get_audio_packet_count(part_info)
+            if pv <= 0 or (has_audio_stream and pa <= 0):
+                valid = False
+                break
+            total_video += pv
+            total_audio += pa
+
+        log(
+            "Matroska split packet totals: "
+            f"video={total_video}/{source_video_packets} "
+            f"audio={total_audio}/{source_audio_packets}"
+        )
+        if valid and total_video == source_video_packets and total_audio == source_audio_packets:
+            return parts
+
+        segment_time *= 0.85
+
+    raise RuntimeError("Unable to split Matroska without packet loss or oversized parts")
+
+
 def mux_webm_video_audio(
     video_path,
     audio_path,
@@ -2194,29 +2465,40 @@ WEBRTC_HOOK = r"""
                 }
 
                 if (message.type === "key") {
-                    // RFC 6386 VP8 key-frame payloads contain the mandatory
-                    // 9d 01 2a sync code at bytes 3..5. Validate it before
-                    // accepting the first key frame into the capture queue.
                     const keyBytes = new Uint8Array(data);
-                    if (
-                        keyBytes.byteLength < 6
-                        || keyBytes[3] !== 0x9d
-                        || keyBytes[4] !== 0x01
-                        || keyBytes[5] !== 0x2a
-                    ) {
-                        state.uploadError =
-                            "Encoded VP8 key frame failed sync-code validation: "
-                            + Array.from(keyBytes.slice(0, 12))
-                                .map(value => value.toString(16).padStart(2, "0"))
-                                .join("");
+                    const codec = String(state.codecMimeType || "").toLowerCase();
 
-                        if (state.firstFrameReject) {
-                            state.firstFrameReject(
-                                new Error(state.uploadError)
-                            );
-                            state.firstFrameReject = null;
-                            state.firstFrameResolve = null;
+                    if (codec === "video/vp8") {
+                        // RFC 6386 VP8 key-frame payloads contain the mandatory
+                        // 9d 01 2a sync code at bytes 3..5.
+                        if (
+                            keyBytes.byteLength < 6
+                            || keyBytes[3] !== 0x9d
+                            || keyBytes[4] !== 0x01
+                            || keyBytes[5] !== 0x2a
+                        ) {
+                            state.uploadError =
+                                "Encoded VP8 key frame failed sync-code validation: "
+                                + Array.from(keyBytes.slice(0, 12))
+                                    .map(value => value.toString(16).padStart(2, "0"))
+                                    .join("");
+                            if (state.firstFrameReject) {
+                                state.firstFrameReject(new Error(state.uploadError));
+                                state.firstFrameReject = null;
+                                state.firstFrameResolve = null;
+                            }
+                            return;
                         }
+                    } else if (codec === "video/h264") {
+                        // The Python side performs the authoritative H.264 NAL
+                        // validation because it also normalizes Annex-B/AVC.
+                        if (keyBytes.byteLength < 5) {
+                            state.uploadError = "Encoded H.264 key frame is too small";
+                            return;
+                        }
+                    } else {
+                        state.uploadError =
+                            "Unsupported encoded video codec: " + codec;
                         return;
                     }
 
@@ -2520,12 +2802,15 @@ WEBRTC_HOOK = r"""
             };
         }
 
-        if (actualCodecMimeType !== "video/vp8") {
+        if (
+            actualCodecMimeType !== "video/vp8"
+            && actualCodecMimeType !== "video/h264"
+        ) {
             return {
                 supported: false,
                 reason: actualCodecMimeType
-                    ? "selected_webRTC_codec_is_not_vp8"
-                    : "actual_inbound_vp8_codec_not_found",
+                    ? "selected_webRTC_codec_is_not_supported_for_direct_capture"
+                    : "actual_inbound_codec_not_found",
                 actualCodecMimeType,
                 inboundCodecId,
                 receiverCodecs,
@@ -5221,6 +5506,10 @@ async def run_recording(playwright):
         / f"recording_{timestamp}_av.webm"
     )
 
+    h264_path = TEMP_DIR / f"recording_{timestamp}_encoded.h264"
+    h264_mkv_path = TEMP_DIR / f"recording_{timestamp}_encoded.mkv"
+    h264_muxed_mkv_path = TEMP_DIR / f"recording_{timestamp}_av.mkv"
+
     mp4_path = (
         RECORDING_DIR
         / f"recording_{timestamp}.mp4"
@@ -5243,7 +5532,10 @@ async def run_recording(playwright):
         / f"recording_{timestamp}_encoded.ivf"
     )
     encoded_video_file = None
+    h264_video_file = None
     encoded_video_mode = False
+    encoded_h264_mode = False
+    encoded_video_timestamp_deltas = []
 
     try:
         # Video output is opened lazily: encoded WebRTC capture writes IVF
@@ -5340,6 +5632,8 @@ async def run_recording(playwright):
             nonlocal encoded_video_total_bytes
             nonlocal encoded_video_first_timestamp
             nonlocal encoded_video_last_timestamp
+            nonlocal encoded_h264_mode
+            nonlocal encoded_video_timestamp_deltas
 
             try:
                 body = request.post_data_buffer or b""
@@ -5421,18 +5715,37 @@ async def run_recording(playwright):
 
                     encoded_video_last_timestamp = timestamp_us
 
-                    encoded_video_file.write(
-                        struct.pack(
-                            "<IQ",
-                            frame_size,
-                            max(
-                                0,
-                                timestamp_us
-                                - encoded_video_first_timestamp,
-                            ),
+                    if encoded_h264_mode:
+                        annexb = h264_payload_to_annexb(frame_data)
+                        if frame_type == 1 and not h264_contains_idr(annexb):
+                            raise RuntimeError(
+                                "Encoded H.264 key frame contains no IDR NAL"
+                            )
+                        if frame_type != 1 and encoded_video_keyframe_count <= 0:
+                            continue
+                        h264_video_file.write(annexb)
+                        if (
+                            encoded_video_last_timestamp is not None
+                            and timestamp_us > encoded_video_last_timestamp
+                        ):
+                            delta = timestamp_us - encoded_video_last_timestamp
+                            if 1000 <= delta <= 1_000_000:
+                                encoded_video_timestamp_deltas.append(delta)
+                                if len(encoded_video_timestamp_deltas) > 2000:
+                                    encoded_video_timestamp_deltas.pop(0)
+                    else:
+                        encoded_video_file.write(
+                            struct.pack(
+                                "<IQ",
+                                frame_size,
+                                max(
+                                    0,
+                                    timestamp_us
+                                    - encoded_video_first_timestamp,
+                                ),
+                            )
                         )
-                    )
-                    encoded_video_file.write(frame_data)
+                        encoded_video_file.write(frame_data)
 
                     encoded_video_frame_count += 1
                     batch_frames += 1
@@ -5795,26 +6108,19 @@ async def run_recording(playwright):
                 "Selected video dimensions are unavailable for IVF header"
             )
 
-        encoded_video_file = open(
-            encoded_video_ivf_path,
-            "wb",
-        )
+        # The direct path writes either VP8 IVF or raw H.264 Annex-B frames.
+        # The actual inbound codec is selected below from inbound-rtp stats.
+        encoded_video_file = open(encoded_video_ivf_path, "wb")
         encoded_video_file.write(
             struct.pack(
                 "<4sHH4sHHIIII",
-                b"DKIF",
-                0,
-                32,
-                b"VP80",
-                encoded_video_width,
-                encoded_video_height,
-                1_000_000,
-                1,
-                0,
-                0,
+                b"DKIF", 0, 32, b"VP80",
+                encoded_video_width, encoded_video_height,
+                1_000_000, 1, 0, 0,
             )
         )
         encoded_video_file.flush()
+        h264_video_file = open(h264_path, "wb")
 
         encoded_capability = await page.evaluate(
             """
@@ -5838,6 +6144,9 @@ async def run_recording(playwright):
         )
 
         if encoded_capability.get("supported"):
+            encoded_h264_mode = (
+                encoded_capability.get("codecMimeType") == "video/h264"
+            )
             try:
                 encoded_wait = await page.evaluate(
                     """
@@ -5858,10 +6167,14 @@ async def run_recording(playwright):
                 if encoded_wait.get("ok"):
                     encoded_video_mode = True
                     encoded_video_started = True
-                    video_capture_mode = "webrtc-encoded-vp8"
+                    video_capture_mode = (
+                        "webrtc-encoded-h264" if encoded_h264_mode
+                        else "webrtc-encoded-vp8"
+                    )
                     log(
-                        "Using direct encoded WebRTC VP8 capture; "
-                        "MediaRecorder video encoder is bypassed"
+                        "Using direct encoded WebRTC "
+                        + ("H.264" if encoded_h264_mode else "VP8")
+                        + " capture; MediaRecorder video encoder is bypassed"
                     )
                 else:
                     raise RuntimeError(
@@ -5885,6 +6198,12 @@ async def run_recording(playwright):
                 except Exception:
                     pass
                 encoded_video_file = None
+                try:
+                    if h264_video_file is not None:
+                        h264_video_file.close()
+                except Exception:
+                    pass
+                h264_video_file = None
 
                 try:
                     encoded_video_ivf_path.unlink()
@@ -5898,6 +6217,12 @@ async def run_recording(playwright):
             except Exception:
                 pass
             encoded_video_file = None
+            try:
+                if h264_video_file is not None:
+                    h264_video_file.close()
+            except Exception:
+                pass
+            h264_video_file = None
             try:
                 encoded_video_ivf_path.unlink()
             except FileNotFoundError:
@@ -6712,7 +7037,8 @@ async def run_recording(playwright):
 
         if encoded_video_mode:
             log(
-                "Final encoded VP8 received: "
+                "Final encoded video received: "
+                f"codec={encoded_capability.get('codecMimeType') if isinstance(encoded_capability, dict) else None}, "
                 f"{encoded_video_total_bytes / 1024 / 1024:.2f} MB, "
                 f"frames={encoded_video_frame_count}, "
                 f"batches={encoded_video_chunk_count}"
@@ -6740,54 +7066,74 @@ async def run_recording(playwright):
         )
 
         # ----------------------------------------------------
-        # Close independent WebM files safely
+        # Close independent encoded-video files safely
         # ----------------------------------------------------
 
         if encoded_video_mode:
-            if encoded_video_file is None:
-                raise RuntimeError(
-                    "Encoded video file handle is missing"
+            if encoded_h264_mode:
+                if h264_video_file is None:
+                    raise RuntimeError("Encoded H.264 file handle is missing")
+                h264_video_file.flush()
+                os.fsync(h264_video_file.fileno())
+                h264_video_file.close()
+                h264_video_file = None
+
+                if encoded_video_file is not None:
+                    encoded_video_file.close()
+                    encoded_video_file = None
+                encoded_video_ivf_path.unlink(missing_ok=True)
+
+                if encoded_video_keyframe_count <= 0:
+                    raise RuntimeError(
+                        "Encoded H.264 capture contains no validated IDR key frame; "
+                        "refusing to remux/upload"
+                    )
+                if not encoded_video_timestamp_deltas:
+                    raise RuntimeError(
+                        "Encoded H.264 capture has no usable frame timestamps"
+                    )
+                sorted_deltas = sorted(encoded_video_timestamp_deltas)
+                median_delta = sorted_deltas[len(sorted_deltas) // 2]
+                source_fps = 1_000_000.0 / median_delta
+                log(
+                    "Final encoded H.264: "
+                    f"{h264_path.stat().st_size / 1024 / 1024:.2f} MB, "
+                    f"frames={encoded_video_frame_count}, "
+                    f"keyframes={encoded_video_keyframe_count}, "
+                    f"median_frame_delta_us={median_delta}, "
+                    f"source_fps={source_fps:.3f}"
                 )
-
-            encoded_video_file.flush()
-            os.fsync(encoded_video_file.fileno())
-
-            # Patch IVF frame count in the fixed 32-byte header.
-            encoded_video_file.seek(24)
-            encoded_video_file.write(
-                struct.pack(
-                    "<I",
-                    encoded_video_frame_count,
+                remux_h264_to_mkv(
+                    h264_path, h264_mkv_path,
+                    encoded_video_frame_count, source_fps,
                 )
-            )
-            encoded_video_file.flush()
-            os.fsync(encoded_video_file.fileno())
-            encoded_video_file.close()
-            encoded_video_file = None
+                webm_path = h264_mkv_path
+            else:
+                if encoded_video_file is None:
+                    raise RuntimeError("Encoded VP8 IVF file handle is missing")
+                encoded_video_file.flush()
+                os.fsync(encoded_video_file.fileno())
+                encoded_video_file.seek(24)
+                encoded_video_file.write(struct.pack("<I", encoded_video_frame_count))
+                encoded_video_file.flush()
+                os.fsync(encoded_video_file.fileno())
+                encoded_video_file.close()
+                encoded_video_file = None
 
-            log(
-                "Final encoded VP8 IVF: "
-                f"{encoded_video_ivf_path.stat().st_size / 1024 / 1024:.2f} MB, "
-                f"frames={encoded_video_frame_count}, "
-                f"keyframes={encoded_video_keyframe_count}"
-            )
-
-            if encoded_video_keyframe_count <= 0:
-                raise RuntimeError(
-                    "Encoded VP8 capture contains no validated key frame; "
-                    "refusing to remux/upload"
+                log(
+                    "Final encoded VP8 IVF: "
+                    f"{encoded_video_ivf_path.stat().st_size / 1024 / 1024:.2f} MB, "
+                    f"frames={encoded_video_frame_count}, "
+                    f"keyframes={encoded_video_keyframe_count}"
                 )
-
-            remux_ivf_to_webm(
-                encoded_video_ivf_path,
-                webm_path,
-                encoded_video_frame_count,
-            )
-
-            try:
-                encoded_video_ivf_path.unlink()
-            except FileNotFoundError:
-                pass
+                if encoded_video_keyframe_count <= 0:
+                    raise RuntimeError(
+                        "Encoded VP8 capture contains no validated key frame; refusing to remux/upload"
+                    )
+                remux_ivf_to_webm(
+                    encoded_video_ivf_path, webm_path, encoded_video_frame_count
+                )
+                encoded_video_ivf_path.unlink(missing_ok=True)
         else:
             webm_file.flush()
             os.fsync(webm_file.fileno())
@@ -6826,22 +7172,28 @@ async def run_recording(playwright):
                     "Independent audio WebM failed verification"
                 )
 
-            mux_webm_video_audio(
-                webm_path,
-                audio_webm_path,
-                muxed_webm_path,
-            )
-
-            # The muxed file becomes the ONLY file eligible for
-            # timing analysis, splitting, and Telegram upload.
-            webm_path.unlink(missing_ok=True)
-            audio_webm_path.unlink(missing_ok=True)
-            webm_path = muxed_webm_path
-
-            log(
-                "Lossless WebM AV mux completed; both streams are present "
-                "and packet counts were preserved."
-            )
+            if encoded_h264_mode:
+                mux_mkv_video_audio(
+                    webm_path, audio_webm_path, h264_muxed_mkv_path
+                )
+                webm_path.unlink(missing_ok=True)
+                audio_webm_path.unlink(missing_ok=True)
+                webm_path = h264_muxed_mkv_path
+                log(
+                    "Lossless Matroska H.264/Opus mux completed; both streams "
+                    "are present and packet counts were preserved."
+                )
+            else:
+                mux_webm_video_audio(
+                    webm_path, audio_webm_path, muxed_webm_path
+                )
+                webm_path.unlink(missing_ok=True)
+                audio_webm_path.unlink(missing_ok=True)
+                webm_path = muxed_webm_path
+                log(
+                    "Lossless WebM AV mux completed; both streams are present "
+                    "and packet counts were preserved."
+                )
 
         # ----------------------------------------------------
         # STRICT VIDEO TIMING ANALYSIS
@@ -6885,8 +7237,10 @@ async def run_recording(playwright):
             "DIRECT WEBM MODE (NO MP4 CONVERSION)"
         )
 
-        parts = split_webm_if_needed(
-            webm_path
+        parts = (
+            split_mkv_if_needed(webm_path)
+            if encoded_h264_mode
+            else split_webm_if_needed(webm_path)
         )
 
         # ----------------------------------------------------
@@ -6904,7 +7258,9 @@ async def run_recording(playwright):
             start=1,
         ):
             caption = (
-                "🎥 Recording (WebM)"
+                "🎥 Recording (Matroska/H.264)"
+                if encoded_h264_mode
+                else "🎥 Recording (WebM)"
             )
 
             if total_parts > 1:
@@ -6933,7 +7289,7 @@ async def run_recording(playwright):
             )
 
         # ----------------------------------------------------
-        # Cleanup WebM parts
+        # Cleanup final media parts
         # ----------------------------------------------------
 
         for part in parts:
@@ -6943,7 +7299,7 @@ async def run_recording(playwright):
 
             except Exception as e:
                 log(
-                    f"Could not remove WebM part "
+                    f"Could not remove media part "
                     f"{part}: {e}"
                 )
 
@@ -6952,7 +7308,7 @@ async def run_recording(playwright):
                 webm_path.unlink()
             except Exception as e:
                 log(
-                    f"Could not remove original WebM: {e}"
+                    f"Could not remove original media file: {e}"
                 )
 
         # ----------------------------------------------------
