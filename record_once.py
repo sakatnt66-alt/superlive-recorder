@@ -2785,6 +2785,170 @@ WEBRTC_HOOK = r"""
         /* Transactional MediaRecorder candidates. A recorder is only
          * accepted after it emits a real dataavailable chunk. */
         window.__superliveRecordingCandidates = [];
+        window.__superliveVideoTransformCleanups = [];
+
+        /*
+         * Some Chromium builds encode a direct WebRTC MediaStreamTrack
+         * noticeably below the receiver's decoded frame rate. The source
+         * track itself can still be healthy at ~30 FPS.
+         *
+         * Use the browser's MediaStreamTrackProcessor/Generator pair as a
+         * very small transport boundary: every VideoFrame is pulled from
+         * the already-selected WebRTC track and written to a fresh local
+         * video track before MediaRecorder sees it. No canvas, captureStream
+         * rendering, frame-rate synthesis, or re-encoding is introduced at
+         * this stage. MediaRecorder remains the only video encoder.
+         *
+         * This is an optional candidate. If the browser does not support
+         * these APIs, the existing direct-WebRTC candidate remains intact.
+         */
+        const createProcessedVideoTrack = (sourceTrack) => {
+            if (!sourceTrack || sourceTrack.readyState !== "live") {
+                return null;
+            }
+
+            if (
+                typeof MediaStreamTrackProcessor !== "function"
+                || typeof MediaStreamTrackGenerator !== "function"
+            ) {
+                return null;
+            }
+
+            let processor;
+            let generator;
+            let reader;
+            let writer;
+
+            try {
+                processor = new MediaStreamTrackProcessor({
+                    track: sourceTrack
+                });
+
+                generator = new MediaStreamTrackGenerator({
+                    kind: "video"
+                });
+
+                reader = processor.readable.getReader();
+                writer = generator.writable.getWriter();
+
+                if ("contentHint" in generator) {
+                    generator.contentHint = "motion";
+                }
+
+                const state = {
+                    active: true,
+                    frameCount: 0,
+                    error: null,
+                };
+
+                const pump = (async () => {
+                    try {
+                        while (state.active) {
+                            const result = await reader.read();
+
+                            if (result.done) {
+                                break;
+                            }
+
+                            const frame = result.value;
+
+                            try {
+                                state.frameCount++;
+                                await writer.write(frame);
+                            } finally {
+                                try {
+                                    frame.close();
+                                } catch (e) {
+                                    // VideoFrame.close() is best-effort cleanup.
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        if (state.active) {
+                            state.error = String(e);
+                            console.warn(
+                                "superlive processed video track error",
+                                e
+                            );
+                        }
+                    } finally {
+                        state.active = false;
+
+                        try {
+                            writer.releaseLock();
+                        } catch (e) {
+                            // Best-effort cleanup.
+                        }
+
+                        try {
+                            reader.releaseLock();
+                        } catch (e) {
+                            // Best-effort cleanup.
+                        }
+
+                        try {
+                            generator.stop();
+                        } catch (e) {
+                            // Best-effort cleanup.
+                        }
+                    }
+                })();
+
+                const cleanup = () => {
+                    if (!state.active) {
+                        return;
+                    }
+
+                    state.active = false;
+
+                    try {
+                        reader.cancel();
+                    } catch (e) {
+                        // Best-effort cleanup.
+                    }
+
+                    try {
+                        writer.abort();
+                    } catch (e) {
+                        // Best-effort cleanup.
+                    }
+
+                    try {
+                        generator.stop();
+                    } catch (e) {
+                        // Best-effort cleanup.
+                    }
+                };
+
+                window.__superliveVideoTransformCleanups.push(cleanup);
+
+                return {
+                    track: generator,
+                    state,
+                    pump,
+                    cleanup,
+                };
+            } catch (e) {
+                try {
+                    if (reader) reader.cancel();
+                } catch (ignored) {}
+
+                try {
+                    if (writer) writer.abort();
+                } catch (ignored) {}
+
+                try {
+                    if (generator) generator.stop();
+                } catch (ignored) {}
+
+                console.warn(
+                    "superlive processed video track unavailable",
+                    e
+                );
+
+                return null;
+            }
+        };
 
         const addRecordingCandidate = (
             name,
@@ -2838,6 +3002,17 @@ WEBRTC_HOOK = r"""
                 sourceAudioTrack: audioTrack || null,
             });
         };
+
+        const processedVideo =
+            createProcessedVideoTrack(selectedVideoTrack);
+
+        if (processedVideo && processedVideo.track) {
+            addRecordingCandidate(
+                "webrtc-processed-video-only",
+                processedVideo.track,
+                null
+            );
+        }
 
         /*
          * FINAL RECORDING STRATEGY:
@@ -3488,8 +3663,41 @@ WEBRTC_HOOK = r"""
                         !== "inactive"
                 ) {
                     activeRecorder.stop();
+
+                    if (
+                        window.__superliveVideoTransformCleanups
+                    ) {
+                        for (const cleanup of
+                            window.__superliveVideoTransformCleanups) {
+                            try {
+                                cleanup();
+                            } catch (e) {
+                                console.warn(
+                                    "superlive processed video cleanup error",
+                                    e
+                                );
+                            }
+                        }
+                    }
+
                     return true;
                 }
+
+                if (
+                    window.__superliveVideoTransformCleanups
+                ) {
+                    for (const cleanup of
+                        window.__superliveVideoTransformCleanups) {
+                    try {
+                        cleanup();
+                    } catch (e) {
+                        console.warn(
+                            "superlive processed video cleanup error",
+                            e
+                        );
+                    }
+                }
+            }
 
                 window
                     .__superliveRecorderStopFired =
