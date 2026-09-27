@@ -227,7 +227,7 @@ TEMP_DIR = Path(
 RECORDING_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-VIDEO_BITRATE = 3_000_000
+VIDEO_BITRATE = 2_000_000
 AUDIO_BITRATE = 128_000
 
 VIDEO_WAIT_SECONDS = 60
@@ -542,9 +542,12 @@ def analyze_webm_video_timing(path):
     Strict failures:
       * missing/unparseable video timestamps
       * non-finite timestamps
-      * duplicate PTS values
       * backwards PTS values
       * backwards DTS values
+
+    Duplicate PTS values are reported as a diagnostic but are not treated
+    as packet loss: MediaRecorder can emit an isolated duplicate timestamp
+    while preserving the encoded packet itself. The packet is retained.
 
     A low effective FPS or a large positive gap is reported as a diagnostic,
     not treated as packet loss by itself. Variable frame rate can be valid.
@@ -735,10 +738,9 @@ def analyze_webm_video_timing(path):
             f"PTS values: {invalid_rows}; refusing to upload"
         )
 
-    if duplicate_pts or backwards_pts:
+    if backwards_pts:
         raise RuntimeError(
-            "Original WebM video PTS timeline is not strictly increasing: "
-            f"duplicate_pts={duplicate_pts}, "
+            "Original WebM video PTS timeline moves backwards: "
             f"backwards_pts={backwards_pts}; refusing to upload"
         )
 
