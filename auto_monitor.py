@@ -8,9 +8,6 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-# ============================================================
-# CONFIG
-# ============================================================
 WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
 AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "")
 
@@ -23,8 +20,8 @@ MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "5"))
 API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "20"))
 
 PLAYWRIGHT_CONCURRENCY = int(os.environ.get("PLAYWRIGHT_CONCURRENCY", "2"))
-PLAYWRIGHT_WAIT_MS = int(os.environ.get("PLAYWRIGHT_WAIT_MS", "10000"))
-PLAYWRIGHT_RETRY_WAIT_MS = int(os.environ.get("PLAYWRIGHT_RETRY_WAIT_MS", "5000"))
+PLAYWRIGHT_WAIT_MS = int(os.environ.get("PLAYWRIGHT_WAIT_MS", "12000"))
+PLAYWRIGHT_RETRY_WAIT_MS = int(os.environ.get("PLAYWRIGHT_RETRY_WAIT_MS", "6000"))
 PAGE_TIMEOUT_MS = int(os.environ.get("PAGE_TIMEOUT_MS", "30000"))
 PLAYWRIGHT_MAX_USERS_PER_CYCLE = int(os.environ.get("PLAYWRIGHT_MAX_USERS_PER_CYCLE", "12"))
 
@@ -41,12 +38,8 @@ LIVE_PREMIUM = "LIVE_PREMIUM"
 OFFLINE = "OFFLINE"
 UNKNOWN = "UNKNOWN"
 
-# ============================================================
-# LOGGING
-# ============================================================
 def log(message: str) -> None:
     print(f"[AUTO] {message}", flush=True)
-
 
 def log_detection(user_id: str, result: Dict[str, Any], source: str) -> None:
     status = result.get("status", UNKNOWN)
@@ -75,15 +68,12 @@ def log_detection(user_id: str, result: Dict[str, Any], source: str) -> None:
             f"live={video_info.get('liveVideoCandidate', False)},"
             f"belongsToUser={video_info.get('belongsToUser', False)},"
             f"premium_json={video_info.get('premiumFromJson', False)},"
-            f"stream_ended={video_info.get('streamEnded', False)}"
+            f"stream_ended={video_info.get('streamEnded', False)},"
+            f"title_name={video_info.get('titleName', '')[:40]}"
         )
 
-# ============================================================
-# TELEGRAM REPORT
-# ============================================================
 def html_escape(text: str) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
 
 def split_telegram_text(text: str, limit: int = 3900) -> List[str]:
     lines = text.split("\n")
@@ -106,7 +96,6 @@ def split_telegram_text(text: str, limit: int = 3900) -> List[str]:
         chunks.append(current)
     return chunks or [""]
 
-
 def send_telegram_report(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log("Telegram report skipped: credentials missing")
@@ -128,7 +117,6 @@ def send_telegram_report(text: str) -> bool:
     if ok:
         log("Telegram report sent successfully")
     return ok
-
 
 def build_report(elapsed_seconds: float, stats: Dict[str, Any]) -> str:
     lines = []
@@ -154,9 +142,6 @@ def build_report(elapsed_seconds: float, stats: Dict[str, Any]) -> str:
     lines.append(f"🔴 تم تشغيل {stats['started_recordings']} تسجيل(ات) جديد(ة).")
     return "\n".join(lines)
 
-# ============================================================
-# WORKER API CLIENT
-# ============================================================
 def api_request_sync(path: str, method: str = "GET", payload: Optional[dict] = None):
     url = f"{WORKER_URL}{path}"
     headers = {
@@ -189,10 +174,8 @@ def api_request_sync(path: str, method: str = "GET", payload: Optional[dict] = N
     except Exception as e:
         return 0, {"error": str(e)}
 
-
 async def api_request(path: str, method: str = "GET", payload: Optional[dict] = None):
     return await asyncio.to_thread(api_request_sync, path, method, payload)
-
 
 async def load_watchlist():
     status, data = await api_request("/api/watchlist", "GET")
@@ -213,7 +196,6 @@ async def load_watchlist():
             stored_names[username] = str(display_name).strip()
     return users, stored_names
 
-
 async def load_active_recordings() -> Dict[str, Any]:
     status, data = await api_request("/api/active-recordings", "GET")
     if status != 200:
@@ -231,7 +213,6 @@ async def load_active_recordings() -> Dict[str, Any]:
         "active_ids": active_ids,
     }
 
-
 async def acquire_monitor_lock() -> bool:
     try:
         status, data = await api_request("/api/monitor-lock/acquire", "POST")
@@ -240,13 +221,11 @@ async def acquire_monitor_lock() -> bool:
         log(f"Monitor lock acquire error: {e}")
         return True
 
-
 async def release_monitor_lock():
     try:
         await api_request("/api/monitor-lock/release", "POST")
     except Exception as e:
         log(f"Monitor lock release error: {e}")
-
 
 async def trigger_auto_recording(user_id: str, stream_url: str, stream_name: str = ""):
     payload = {"stream_url": stream_url, "source": "auto", "stream_name": stream_name}
@@ -261,7 +240,6 @@ async def trigger_auto_recording(user_id: str, stream_url: str, stream_name: str
         return False, "not_in_watchlist"
     return False, data.get("error", f"http_{status}")
 
-
 async def update_watchlist_name(user_id: str, display_name: str):
     try:
         payload = {"display_name": display_name}
@@ -271,9 +249,6 @@ async def update_watchlist_name(user_id: str, display_name: str):
     except Exception as e:
         log(f"Name save error for {user_id}: {e}")
 
-# ============================================================
-# JSON PREMIUM DETECTION
-# ============================================================
 def check_json_for_premium(json_bodies: List[str], user_id: str) -> bool:
     for body in json_bodies:
         if user_id not in body:
@@ -291,7 +266,6 @@ def check_json_for_premium(json_bodies: List[str], user_id: str) -> bool:
         except Exception:
             pass
     return False
-
 
 def _check_obj_for_premium(obj, user_id, depth=0):
     if depth > 6:
@@ -322,9 +296,6 @@ def _check_obj_for_premium(obj, user_id, depth=0):
                 return True
     return False
 
-# ============================================================
-# NAME EXTRACTION - HARDENED
-# ============================================================
 def normalize_display_name(value):
     if value is None:
         return None
@@ -332,7 +303,6 @@ def normalize_display_name(value):
     s = s.replace("&amp;", "&")
     s = re.sub(r"<[^>]+>", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    # Max 40 chars - real usernames are short
     if len(s) < 2 or len(s) > 40:
         return None
     if s.isdigit():
@@ -345,7 +315,6 @@ def normalize_display_name(value):
         return None
     if not re.search(r"[\u0600-\u06FFa-zA-Z\U0001F300-\U0001FAFF\u2600-\u27BF]", s):
         return None
-    # Reject names with more than 4 words
     word_count = len(s.split())
     if word_count > 4:
         return None
@@ -356,41 +325,96 @@ def normalize_display_name(value):
         "views", "viewers", "followers", "fans", "likes",
         "watching", "subscribe", "follow", "following",
         "k", "m", "b", "undefined", "super",
+        "membre", "member", "user", "guest",
+        "membre super", "super membre",
+        "membre superlive", "superlive member",
     }
     if lowered in blocked:
         return None
-    # Reject site descriptions and slogans
     if "rencontrez" in lowered or "diffusions" in lowered or "regardez" in lowered:
         return None
     if "nouvelles personnes" in lowered:
         return None
+    if "membre super" in lowered or "super membre" in lowered:
+        return None
     return s
 
-# ============================================================
-# CLASSIFICATION ENGINE - WITH belongsToUser CHECK
-# ============================================================
+def extract_name_from_json(json_bodies: List[str], user_id: str) -> Optional[str]:
+    for body in json_bodies:
+        if user_id not in body:
+            continue
+        try:
+            obj = json.loads(body)
+            name = _find_username_in_obj(obj, user_id, depth=0)
+            if name:
+                normalized = normalize_display_name(name)
+                if normalized:
+                    return normalized
+        except Exception:
+            continue
+    return None
+
+def _find_username_in_obj(obj, user_id, depth=0):
+    if depth > 8:
+        return None
+    if isinstance(obj, dict):
+        has_user_id = False
+        for key, value in obj.items():
+            if isinstance(value, (str, int, float)) and str(value) == str(user_id):
+                key_lower = str(key).lower()
+                if any(token in key_lower for token in ('id', 'user', 'stream', 'channel', 'broadcaster')):
+                    has_user_id = True
+                    break
+        if has_user_id:
+            for key in ('username', 'nickname', 'display_name', 'name', 'streamer_name', 'broadcaster_name', 'user_name'):
+                if key in obj:
+                    val = obj[key]
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+        for value in obj.values():
+            result = _find_username_in_obj(value, user_id, depth + 1)
+            if result:
+                return result
+    elif isinstance(obj, list):
+        for item in obj[:100]:
+            result = _find_username_in_obj(item, user_id, depth + 1)
+            if result:
+                return result
+    return None
+
 def classify_final(video_info: Dict[str, Any], json_bodies: List[str], user_id: str) -> str:
     src_object_count = int(video_info.get("srcObjectCount", 0))
     live_video_candidate = bool(video_info.get("liveVideoCandidate", False))
     stream_ended = bool(video_info.get("streamEnded", False))
     belongs_to_user = bool(video_info.get("belongsToUser", False))
-
-    has_active_video = src_object_count > 0 and live_video_candidate and belongs_to_user
+    main_video_active = bool(video_info.get("mainVideoActive", False))
 
     is_premium = check_json_for_premium(json_bodies, user_id)
 
-    if has_active_video:
+    if stream_ended and not main_video_active:
+        return OFFLINE
+
+    if not live_video_candidate and stream_ended:
+        return OFFLINE
+
+    if not live_video_candidate and not stream_ended:
+        return UNKNOWN
+
+    if live_video_candidate and belongs_to_user and main_video_active:
         if is_premium:
             return LIVE_PREMIUM
         return LIVE_NORMAL
 
-    if stream_ended:
-        return OFFLINE
+    if live_video_candidate and not belongs_to_user:
+        return UNKNOWN
+
+    if live_video_candidate and belongs_to_user and not main_video_active:
+        return UNKNOWN
 
     return UNKNOWN
 
 # ============================================================
-# PLAYWRIGHT DETECTION - WITH DOM IDENTITY CHECK
+# CRITICAL FIX: PAGE_INFO_JS with STRICT video identification
 # ============================================================
 PAGE_INFO_JS = r"""
 (userId) => {
@@ -399,115 +423,81 @@ PAGE_INFO_JS = r"""
     let visibleCount = 0;
     let liveVideoCandidate = false;
     let belongsToUser = false;
+    let mainVideoActive = false;
     let streamEnded = false;
-    let streamerName = '';
+    let titleName = '';
 
-    const isGenericName = (name) => {
-        if (!name) return true;
-        const lowered = name.toLowerCase().trim();
-        const generic = [
-            'super', 'superlive', 'super live', 'superlivetv',
-            'live', 'direct', 'en direct', 'stream', 'video',
-            'recording', 'watching', 'watch', 'play', 'player',
-            'home', 'search', 'explore', 'trending',
-            'rencontrez', 'diffusions', 'regardez', 'nouvelles',
-            'personnes',
-        ];
-        if (generic.includes(lowered)) return true;
-        const wordCount = lowered.split(/\s+/).length;
-        if (wordCount > 4) return true;
-        return false;
-    };
-
-    const cleanName = (raw) => {
-        if (!raw) return '';
-        let name = String(raw).trim();
-        name = name.replace(/\s*[\|\-\u2013\u2014]\s*(SuperLive|superlivetv|Super Live|Super).*$/i, '');
-        name = name.replace(/\s*(en direct|live|direct|streaming).*$/i, '');
-        name = name.trim();
-        if (name.length < 2 || name.length > 40) return '';
-        if (isGenericName(name)) return '';
-        return name;
-    };
-
+    // ============================================================
+    // EXTRACT NAME FROM PAGE TITLE (most reliable source)
+    // The page title/og:title always contains the TARGET user's name
+    // regardless of what recommended streams are showing.
+    // ============================================================
     try {
         const ogTitle = document.querySelector('meta[property="og:title"]');
         if (ogTitle && ogTitle.content) {
-            const cleaned = cleanName(ogTitle.content);
-            if (cleaned) streamerName = cleaned;
+            titleName = ogTitle.content.trim();
         }
     } catch (e) {}
 
-    if (!streamerName) {
+    if (!titleName) {
         try {
-            const cleaned = cleanName(document.title || '');
-            if (cleaned) streamerName = cleaned;
+            titleName = (document.title || '').trim();
         } catch (e) {}
     }
 
-    if (!streamerName) {
-        try {
-            const h1 = document.querySelector('h1');
-            if (h1 && h1.innerText) {
-                const cleaned = cleanName(h1.innerText);
-                if (cleaned) streamerName = cleaned;
-            }
-        } catch (e) {}
-    }
-
-    if (!streamerName) {
-        try {
-            const selectors = [
-                '[class*="username"]', '[class*="streamer-name"]',
-                '[class*="streamer_name"]', '[class*="profile-name"]',
-                '[class*="profile_name"]', '[class*="user-name"]',
-                '[class*="user_name"]', '[class*="nickname"]',
-                '[class*="nick-name"]', '[class*="broadcaster-name"]',
-                '[class*="broadcaster_name"]', '[class*="channel-name"]',
-                '[class*="channel_name"]',
-            ];
-            for (const sel of selectors) {
-                try {
-                    const el = document.querySelector(sel);
-                    if (el && el.innerText) {
-                        const cleaned = cleanName(el.innerText);
-                        if (cleaned) {
-                            streamerName = cleaned;
-                            break;
-                        }
-                    }
-                } catch (e) {}
-            }
-        } catch (e) {}
+    // Clean site name suffix from title
+    if (titleName) {
+        titleName = titleName.replace(/\s*[\|\-\u2013\u2014]\s*(SuperLive|superlivetv|Super Live|Super).*$/i, '').trim();
+        titleName = titleName.replace(/\s*(en direct|live|direct|streaming).*$/i, '').trim();
     }
 
     // ============================================================
-    // DOM IDENTITY CHECK - same logic as record_once.py
+    // CHECK STREAM ENDED
     // ============================================================
-    const domContainsTargetId = (element) => {
+    try {
+        const bodyText = document.body ? document.body.innerText : '';
+        if (bodyText.includes("Le direct s'est termin\u00e9") || bodyText.includes("Stream ended")) {
+            streamEnded = true;
+        }
+    } catch (e) {}
+
+    // ============================================================
+    // STRICT VIDEO IDENTIFICATION
+    //
+    // KEY FIX: We now use a STRICT check that only looks at the
+    // video element itself and its IMMEDIATE container (max 3 levels).
+    // We do NOT traverse 8 levels up which would match the page
+    // header/breadcrumb/URL containing the user ID.
+    //
+    // Additionally, we identify the MAIN video (first/largest) and
+    // check if IT specifically is active and associated with the user.
+    // ============================================================
+    const strictDomContainsTargetId = (element) => {
         if (!userId || !element) return false;
         let node = element;
         let depth = 0;
-        while (node && depth < 8) {
+        // CRITICAL: Only check 3 levels up (video + immediate container)
+        // NOT 8 levels which would match page header/breadcrumb
+        while (node && depth < 3) {
             try {
-                const values = [
-                    node.id,
-                    node.className,
-                    node.getAttribute && node.getAttribute("data-stream-id"),
-                    node.getAttribute && node.getAttribute("data-id"),
-                    node.getAttribute && node.getAttribute("data-livestream-id"),
-                    node.getAttribute && node.getAttribute("data-channel-id"),
-                    node.getAttribute && node.getAttribute("data-video-id"),
-                    node.getAttribute && node.getAttribute("href"),
-                ];
-                if (values.some(value => value != null && String(value).includes(userId))) {
+                const dataStreamId = node.getAttribute && node.getAttribute("data-stream-id");
+                const dataId = node.getAttribute && node.getAttribute("data-id");
+                const dataLivestreamId = node.getAttribute && node.getAttribute("data-livestream-id");
+                const dataChannelId = node.getAttribute && node.getAttribute("data-channel-id");
+                const dataVideoId = node.getAttribute && node.getAttribute("data-video-id");
+                const href = node.getAttribute && node.getAttribute("href");
+
+                const directValues = [dataStreamId, dataId, dataLivestreamId, dataChannelId, dataVideoId, href];
+                if (directValues.some(value => value != null && String(value).includes(userId))) {
                     return true;
                 }
+
+                // Check direct child links (not deep descendants)
                 if (node.querySelectorAll) {
-                    const descendants = node.querySelectorAll(
-                        'a[href*="' + userId + '"], [data-stream-id*="' + userId + '"], [data-livestream-id*="' + userId + '"], [data-video-id*="' + userId + '"]'
+                    const directLinks = node.querySelectorAll(
+                        'a[href*="/livestream/' + userId + '"], a[href*="/' + userId + '"]'
                     );
-                    if (descendants.length > 0) {
+                    if (directLinks.length > 0) {
                         return true;
                     }
                 }
@@ -518,13 +508,32 @@ PAGE_INFO_JS = r"""
         return false;
     };
 
-    try {
-        const bodyText = document.body ? document.body.innerText : '';
-        if (bodyText.includes("Le direct s'est termin\u00e9") || bodyText.includes("Stream ended")) {
-            streamEnded = true;
-        }
-    } catch (e) {}
+    // ============================================================
+    // IDENTIFY THE MAIN VIDEO
+    // The main video is the FIRST video on the page or the LARGEST one.
+    // It's the one that should show the target user's stream.
+    // Recommended videos are usually smaller and appear later.
+    // ============================================================
+    let mainVideo = null;
+    let mainVideoArea = 0;
 
+    for (const video of videos) {
+        const rect = video.getBoundingClientRect();
+        const area = rect.width * rect.height;
+        if (area > mainVideoArea) {
+            mainVideoArea = area;
+            mainVideo = video;
+        }
+    }
+
+    // If no largest found, use the first video
+    if (!mainVideo && videos.length > 0) {
+        mainVideo = videos[0];
+    }
+
+    // ============================================================
+    // CHECK ALL VIDEOS
+    // ============================================================
     for (const video of videos) {
         if (video.srcObject) {
             srcObjectCount++;
@@ -536,13 +545,48 @@ PAGE_INFO_JS = r"""
         }
         if (video.srcObject && video.readyState >= 2 && visible) {
             liveVideoCandidate = true;
-            if (domContainsTargetId(video)) {
+
+            // STRICT check: only 3 levels up
+            if (strictDomContainsTargetId(video)) {
                 belongsToUser = true;
             }
         }
     }
 
-    if (streamEnded && srcObjectCount > 0 && liveVideoCandidate && belongsToUser) {
+    // ============================================================
+    // CHECK IF THE MAIN VIDEO IS ACTIVE AND BELONGS TO USER
+    // This is the critical check that prevents recording
+    // recommended streams.
+    // ============================================================
+    if (mainVideo) {
+        const mainHasSrcObject = !!mainVideo.srcObject;
+        const mainIsVisible = mainVideo.getBoundingClientRect().width > 100;
+        const mainIsReady = mainVideo.readyState >= 2;
+        const mainBelongs = strictDomContainsTargetId(mainVideo);
+
+        if (mainHasSrcObject && mainIsVisible && mainIsReady && mainBelongs) {
+            mainVideoActive = true;
+        }
+
+        // If the main video has NO srcObject but other videos do,
+        // those other videos are likely recommended streams.
+        if (!mainHasSrcObject && srcObjectCount > 0) {
+            belongsToUser = false;
+            mainVideoActive = false;
+        }
+    }
+
+    // ============================================================
+    // FINAL SAFETY CHECK:
+    // If there are more than 2 videos with srcObject, and the main
+    // video doesn't clearly belong to the user, mark as uncertain.
+    // ============================================================
+    if (srcObjectCount > 2 && !mainVideoActive) {
+        belongsToUser = false;
+    }
+
+    // Override streamEnded if main video is actually active
+    if (streamEnded && mainVideoActive) {
         streamEnded = false;
     }
 
@@ -552,12 +596,12 @@ PAGE_INFO_JS = r"""
         visibleCount,
         liveVideoCandidate,
         belongsToUser,
+        mainVideoActive,
         streamEnded,
-        streamerName
+        titleName
     };
 }
 """
-
 
 async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Semaphore) -> Dict[str, Any]:
     async with semaphore:
@@ -568,7 +612,7 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
         video_info = {
             "videoCount": 0, "srcObjectCount": 0, "visibleCount": 0,
             "liveVideoCandidate": False, "belongsToUser": False,
-            "streamEnded": False, "streamerName": "",
+            "mainVideoActive": False, "streamEnded": False, "titleName": "",
         }
 
         async def on_response(response):
@@ -601,7 +645,7 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
                 video_info = {
                     "videoCount": 0, "srcObjectCount": 0, "visibleCount": 0,
                     "liveVideoCandidate": False, "belongsToUser": False,
-                    "streamEnded": False, "streamerName": "",
+                    "mainVideoActive": False, "streamEnded": False, "titleName": "",
                 }
 
             if not video_info.get("liveVideoCandidate") and video_info.get("srcObjectCount", 0) == 0:
@@ -624,42 +668,42 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
 
         final_status = classify_final(video_info, json_bodies, user_id)
 
+        # ============================================================
+        # NAME EXTRACTION - PRIORITY ORDER:
+        # 1. JSON API responses (most reliable, tied to user_id)
+        # 2. Page title / og:title (always shows target user's name)
+        # 3. Only if belongsToUser AND mainVideoActive, use DOM
+        # ============================================================
         display_name = None
-        streamer_name = video_info.get("streamerName", "")
-        if streamer_name:
-            normalized = normalize_display_name(streamer_name)
-            if normalized:
-                display_name = normalized
 
+        # Priority 1: JSON API
+        json_name = extract_name_from_json(json_bodies, user_id)
+        if json_name:
+            display_name = json_name
+
+        # Priority 2: Page title (only if no JSON name found)
         if not display_name:
-            for body in json_bodies[:10]:
-                try:
-                    obj = json.loads(body)
-                    if isinstance(obj, dict):
-                        for key in ("username", "nickname", "display_name", "name", "streamer_name", "broadcaster_name"):
-                            val = obj.get(key)
-                            if val:
-                                normalized = normalize_display_name(val)
-                                if normalized and user_id in body:
-                                    display_name = normalized
-                                    break
-                        if display_name:
-                            break
-                except Exception:
-                    continue
+            title_name = video_info.get("titleName", "")
+            if title_name:
+                normalized_title = normalize_display_name(title_name)
+                if normalized_title:
+                    display_name = normalized_title
 
         video_info["premiumFromJson"] = check_json_for_premium(json_bodies, user_id)
 
         result = {
             "status": final_status,
-            "reason": f"video={video_info.get('liveVideoCandidate')},belongs={video_info.get('belongsToUser')},premium_json={video_info.get('premiumFromJson')},ended={video_info.get('streamEnded')}",
+            "reason": f"video={video_info.get('liveVideoCandidate')},"
+                      f"belongs={video_info.get('belongsToUser')},"
+                      f"mainActive={video_info.get('mainVideoActive')},"
+                      f"premium_json={video_info.get('premiumFromJson')},"
+                      f"ended={video_info.get('streamEnded')}",
             "stream_url": url,
             "display_name": display_name,
             "video_info": video_info,
         }
 
         return result
-
 
 async def playwright_classify_many(user_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     results = {}
@@ -713,9 +757,6 @@ async def playwright_classify_many(user_ids: List[str]) -> Dict[str, Dict[str, A
                 }
     return results
 
-# ============================================================
-# MAIN MONITOR
-# ============================================================
 async def async_main() -> int:
     monitor_start_time = time.monotonic()
     stats = {
@@ -901,7 +942,6 @@ async def async_main() -> int:
     finally:
         await release_monitor_lock()
 
-
 def main() -> int:
     try:
         return asyncio.run(async_main())
@@ -911,7 +951,6 @@ def main() -> int:
     except Exception as e:
         log(f"FATAL monitor error: {e}")
         return 1
-
 
 if __name__ == "__main__":
     sys.exit(main())
