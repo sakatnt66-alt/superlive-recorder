@@ -1,5 +1,5 @@
 // worker.js - SuperLive Recorder + Auto Monitor + Watchlist + Cron
-// Version: 9.0 - Syntax Fixed
+// Version: 10.0 - Bot Fix
 
 export default {
   async fetch(request, env, ctx) {
@@ -716,6 +716,7 @@ async function handleTelegramWebhook(request, env) {
     const update = await request.json();
 
     if (update.callback_query) {
+      ctx = null;
       return handleCallbackQuery(update.callback_query, env);
     }
 
@@ -742,64 +743,69 @@ async function handleMessage(message, env) {
   const command = parts[0].toLowerCase();
   const args = parts.slice(1);
 
-  if (command === '/start' || command === '/help') {
-    await sendMainMenu(chatId, env);
-    return new Response('OK');
-  }
-
-  if (command === '/status') {
-    await handleStatus(chatId, env);
-    return new Response('OK');
-  }
-
-  if (command === '/cleanup') {
-    await handleCleanupCommand(chatId, env);
-    return new Response('OK');
-  }
-
-  if (command === '/stop') {
-    const streamId = args[0] || null;
-    await handleStop(chatId, streamId, env);
-    return new Response('OK');
-  }
-
-  if (command === '/addwatch') {
-    const streamId = args[0] || null;
-    await handleAddWatch(chatId, streamId, env);
-    return new Response('OK');
-  }
-
-  if (command === '/removewatch') {
-    const streamId = args[0] || null;
-    await handleRemoveWatch(chatId, streamId, env);
-    return new Response('OK');
-  }
-
-  if (command === '/watchlist') {
-    await handleWatchlistCommand(chatId, env);
-    return new Response('OK');
-  }
-
-  if (command === '/testmonitor') {
-    await handleTestMonitor(chatId, env);
-    return new Response('OK');
-  }
-
-  const streamUrl = extractStreamUrl(text);
-  if (streamUrl) {
-    const streamId = extractStreamId(streamUrl);
-    if (streamId) {
-      await handleRecord(chatId, streamUrl, env);
+  try {
+    if (command === '/start' || command === '/help') {
+      await sendMainMenu(chatId, env);
       return new Response('OK');
     }
-  }
 
-  await sendTelegramMessage(env, chatId,
-    '🤖 أرسل رابط البث المباشر للبدء بالتسجيل!\n' +
-    'مثال:\n' +
-    '<code>https://superlivetv.com/fr/livestream/123456</code>',
-    { parse_mode: 'HTML' }
-  );
+    if (command === '/status') {
+      await handleStatus(chatId, env);
+      return new Response('OK');
+    }
+
+    if (command === '/cleanup') {
+      await handleCleanupCommand(chatId, env);
+      return new Response('OK');
+    }
+
+    if (command === '/stop') {
+      const streamId = args[0] || null;
+      await handleStop(chatId, streamId, env);
+      return new Response('OK');
+    }
+
+    if (command === '/addwatch') {
+      const streamId = args[0] || null;
+      await handleAddWatch(chatId, streamId, env);
+      return new Response('OK');
+    }
+
+    if (command === '/removewatch') {
+      const streamId = args[0] || null;
+      await handleRemoveWatch(chatId, streamId, env);
+      return new Response('OK');
+    }
+
+    if (command === '/watchlist') {
+      await handleWatchlistCommand(chatId, env);
+      return new Response('OK');
+    }
+
+    if (command === '/testmonitor') {
+      await handleTestMonitor(chatId, env);
+      return new Response('OK');
+    }
+
+    const streamUrl = extractStreamUrl(text);
+    if (streamUrl) {
+      const streamId = extractStreamId(streamUrl);
+      if (streamId) {
+        await handleRecord(chatId, streamUrl, env);
+        return new Response('OK');
+      }
+    }
+
+    await sendTelegramMessage(env, chatId,
+      '🤖 أرسل رابط البث المباشر للبدء بالتسجيل!\n' +
+      'مثال:\n' +
+      '<code>https://superlivetv.com/fr/livestream/123456</code>',
+      { parse_mode: 'HTML' }
+    );
+  } catch (error) {
+    console.error('handleMessage error:', error);
+    await sendTelegramMessage(env, chatId, `❌ خطأ: ${error.message}`, { parse_mode: 'HTML' });
+  }
 
   return new Response('OK');
 }
