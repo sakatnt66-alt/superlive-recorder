@@ -14,6 +14,10 @@ from typing import Any, Dict, List, Optional, Set
 WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
 AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "")
 
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+SEND_REPORT = os.environ.get("SEND_REPORT", "1") not in ("0", "false", "False")
+
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "5"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "15"))
 API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "20"))
@@ -68,6 +72,59 @@ def log_detection(user_id: str, result: Dict[str, Any], source: str) -> None:
     log(f"status={status}")
     log(f"action={action}")
     log(f"reason={reason}")
+
+# ============================================================
+# TELEGRAM REPORT
+# ============================================================
+def send_telegram_report(text: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Telegram report skipped: credentials missing")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+    }
+
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "AutoMonitor/1.0",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=20) as response:
+            response.read()
+        log("Telegram report sent successfully")
+        return True
+    except Exception as e:
+        log(f"Telegram report error: {e}")
+        return False
+
+
+def build_report(elapsed_seconds: float, stats: Dict[str, int]) -> str:
+    lines = []
+    lines.append(f"✅ انتهى الفحص في {elapsed_seconds:.1f} ثانية.")
+    lines.append("")
+    lines.append(f"📊 إحصائيات القائمة ({stats['total_watchlist']} مستخدم):")
+    lines.append(f"• قيد التسجيل مسبقاً: {stats['already_recording']}")
+    lines.append(f"• تم فحصه الآن: {stats['checked_now']}")
+    lines.append("")
+    lines.append("📈 نتائج الفحص:")
+    lines.append(f"• 🟢 بث عادي: {stats['live_normal']}")
+    lines.append(f"• 🟡 بث مدفوع (تم التجاهل): {stats['live_premium']}")
+    lines.append(f"• ⚪ غير متصل: {stats['offline']}")
+    if stats.get("unknown", 0) > 0:
+        lines.append(f"• ❓ غير مؤكد: {stats['unknown']}")
+    lines.append("")
+    lines.append(f"🔴 تم تشغيل {stats['started_recordings']} تسجيل(ات) جديد(ة).")
+    return "\n".join(lines)
 
 # ============================================================
 # WORKER API CLIENT
@@ -241,15 +298,12 @@ def score_text(text: str):
 
 
 def decide_scores(live_score: int, premium_score: int, offline_score: int) -> str:
-    # Premium overrides live when premium evidence is strong.
     if premium_score >= 100 and live_score >= 20:
         return LIVE_PREMIUM
 
-    # Offline only if strong offline and no strong live contradiction.
     if offline_score >= 100 and live_score < 50:
         return OFFLINE
 
-    # Normal live only if strong live, no premium, no offline.
     if live_score >= 100 and premium_score < 100 and offline_score < 100:
         return LIVE_NORMAL
 
@@ -301,8 +355,6 @@ def analyze_texts(texts: List[str], user_id: str) -> Dict[str, Any]:
         if not text:
             continue
 
-        # Require the user id to be present in the analyzed source.
-        # Playwright sources are intentionally prefixed with the user id.
         if user_id not in text:
             continue
 
@@ -576,6 +628,19 @@ async def playwright_classify_many(user_ids: List[str]) -> Dict[str, Dict[str, A
 # MAIN MONITOR
 # ============================================================
 async def async_main() -> int:
+    monitor_start_time = time.monotonic()
+
+    stats = {
+        "total_watchlist": 0,
+        "already_recording": 0,
+        "checked_now": 0,
+        "live_normal": 0,
+        "live_premium": 0,
+        "offline": 0,
+        "unknown": 0,
+        "started_recordings": 0,
+    }
+
     log("Starting monitor")
 
     if not WORKER_URL:
@@ -596,6 +661,7 @@ async def async_main() -> int:
         return 1
 
     log(f"Watchlist loaded: {len(watchlist)} users")
+    stats["total_watchlist"] = len(watchlist)
 
     if not watchlist:
         log("Watchlist is empty. Nothing to do.")
@@ -615,6 +681,12 @@ async def async_main() -> int:
 
     if active["active_count"] >= active["max_concurrent"]:
         log("Concurrency limit already reached. No recording slots are available.")
+
+        elapsed = time.monotonic() - monitor_start_time
+        if SEND_REPORT:
+            report = build_report(elapsed, stats)
+            send_telegram_report(report)
+
         log("Monitor completed")
         return 0
 
@@ -624,6 +696,7 @@ async def async_main() -> int:
     users_to_check: List[str] = []
     for user_id in watchlist:
         if user_id in active["active_ids"]:
+            stats["already_recording"] += 1
             log(f"username={user_id}")
             log("status=ALREADY_RECORDING")
             log("action=SKIP")
@@ -633,6 +706,12 @@ async def async_main() -> int:
 
     if not users_to_check:
         log("All watchlist users are already recording.")
+
+        elapsed = time.monotonic() - monitor_start_time
+        if SEND_REPORT:
+            report = build_report(elapsed, stats)
+            send_telegram_report(report)
+
         log("Monitor completed")
         return 0
 
@@ -645,6 +724,7 @@ async def async_main() -> int:
     async def check_user_http(user_id: str):
         async with http_semaphore:
             log(f"Checking: {user_id}")
+            stats["checked_now"] += 1
             try:
                 result = await asyncio.to_thread(http_classify_user, user_id)
             except Exception as e:
@@ -688,6 +768,22 @@ async def async_main() -> int:
             log_detection(user_id, result, "playwright")
 
     # --------------------------------------------------------
+    # Update classification stats
+    # --------------------------------------------------------
+    for user_id in users_to_check:
+        result = results.get(user_id, {})
+        status = result.get("status", UNKNOWN)
+
+        if status == LIVE_NORMAL:
+            stats["live_normal"] += 1
+        elif status == LIVE_PREMIUM:
+            stats["live_premium"] += 1
+        elif status == OFFLINE:
+            stats["offline"] += 1
+        else:
+            stats["unknown"] += 1
+
+    # --------------------------------------------------------
     # Refresh active recordings before triggering
     # --------------------------------------------------------
     try:
@@ -695,6 +791,12 @@ async def async_main() -> int:
     except Exception as e:
         log(f"Failed to refresh active recordings before trigger: {e}")
         log("Skipping all trigger actions to stay fail-safe.")
+
+        elapsed = time.monotonic() - monitor_start_time
+        if SEND_REPORT:
+            report = build_report(elapsed, stats)
+            send_telegram_report(report)
+
         log("Monitor completed")
         return 0
 
@@ -703,6 +805,12 @@ async def async_main() -> int:
 
     if slots_available <= 0:
         log("No recording slots available after refresh.")
+
+        elapsed = time.monotonic() - monitor_start_time
+        if SEND_REPORT:
+            report = build_report(elapsed, stats)
+            send_telegram_report(report)
+
         log("Monitor completed")
         return 0
 
@@ -748,6 +856,7 @@ async def async_main() -> int:
             log("trigger=SUCCESS")
             log("workflow=record.yml")
             log("recording_engine=existing_record_once.py")
+            stats["started_recordings"] += 1
             slots_available -= 1
             active["active_ids"].add(user_id)
             active["active_count"] += 1
@@ -765,6 +874,15 @@ async def async_main() -> int:
             log(f"username={user_id}")
             log("trigger=FAILED")
             log(f"reason={reason}")
+
+    # --------------------------------------------------------
+    # Send final report
+    # --------------------------------------------------------
+    elapsed = time.monotonic() - monitor_start_time
+
+    if SEND_REPORT:
+        report = build_report(elapsed, stats)
+        send_telegram_report(report)
 
     log("Monitor completed")
     return 0
