@@ -1,13 +1,9 @@
 // worker.js - SuperLive Recorder + Auto Monitor + Watchlist + Cron
-// Version: 8.0 - Full Auto Monitor Integration
+// Version: 9.0 - Syntax Fixed
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-
-    // ============================================================
-    // AUTO MONITOR API (requires X-Auto-Token)
-    // ============================================================
 
     if (url.pathname === '/api/watchlist' && request.method === 'GET') {
       return handleWatchlistList(request, env);
@@ -45,10 +41,6 @@ export default {
       return handleMonitorLockRelease(request, env);
     }
 
-    // ============================================================
-    // ORIGINAL STATE MANAGEMENT API (used by record_once.py)
-    // ============================================================
-
     if (url.pathname.startsWith('/api/update-state/') && request.method === 'POST') {
       return handleUpdateState(request, url, env);
     }
@@ -65,17 +57,9 @@ export default {
       return handleCheckStop(request, url, env);
     }
 
-    // ============================================================
-    // TELEGRAM WEBHOOK
-    // ============================================================
-
     if (url.pathname === '/telegram/webhook' && request.method === 'POST') {
       return handleTelegramWebhook(request, env);
     }
-
-    // ============================================================
-    // HEALTH CHECK
-    // ============================================================
 
     if (url.pathname === '/health') {
       return new Response(JSON.stringify({
@@ -89,19 +73,12 @@ export default {
     return new Response('Not Found', { status: 404 });
   },
 
-  // ============================================================
-  // CLOUDFLARE CRON TRIGGER - Auto Monitor every 3 minutes
-  // ============================================================
   async scheduled(event, env, ctx) {
     console.log(`[AUTO-CRON] Cron triggered at ${new Date().toISOString()}`);
     ctx.waitUntil(handleAutoMonitorCron(env));
   }
 };
 
-
-// ============================================================
-// AUTO API AUTHORIZATION
-// ============================================================
 function isAutoApiAuthorized(request, env) {
   if (!env.AUTO_API_TOKEN) return true;
   const token = request.headers.get('X-Auto-Token');
@@ -114,11 +91,6 @@ function unauthorizedResponse() {
     headers: { 'Content-Type': 'application/json' }
   });
 }
-
-
-// ============================================================
-// WATCHLIST API HANDLERS
-// ============================================================
 
 async function handleWatchlistList(request, env) {
   if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
@@ -280,17 +252,10 @@ async function getWatchlist(env) {
         }
         watchlist.push(entry);
       }
-    } catch (e) {
-      // Skip corrupted entries
-    }
+    } catch (e) {}
   }
   return watchlist;
 }
-
-
-// ============================================================
-// ACTIVE RECORDINGS API
-// ============================================================
 
 async function handleActiveRecordings(request, env) {
   if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
@@ -304,9 +269,7 @@ async function handleActiveRecordings(request, env) {
         if (recording && recording.status === 'recording') {
           activeRecordings.push(recording);
         }
-      } catch (e) {
-        // Skip corrupted entries
-      }
+      } catch (e) {}
     }
 
     return new Response(JSON.stringify({
@@ -323,11 +286,6 @@ async function handleActiveRecordings(request, env) {
     });
   }
 }
-
-
-// ============================================================
-// AUTO TRIGGER RECORDING API
-// ============================================================
 
 async function handleAutoTrigger(request, url, env) {
   if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
@@ -346,7 +304,6 @@ async function handleAutoTrigger(request, url, env) {
     const streamName = body.stream_name || '';
     const source = body.source || 'auto';
 
-    // Check if in watchlist
     const watchlistKey = `watchlist:${streamId}`;
     const watchlistEntry = await env.SUPERLIVE_STATE.get(watchlistKey, 'json');
     if (!watchlistEntry) {
@@ -360,7 +317,6 @@ async function handleAutoTrigger(request, url, env) {
       });
     }
 
-    // Check if already recording
     const recordingKey = `recording:${streamId}`;
     const existing = await env.SUPERLIVE_STATE.get(recordingKey, 'json');
     if (existing && existing.status === 'recording') {
@@ -374,7 +330,6 @@ async function handleAutoTrigger(request, url, env) {
       });
     }
 
-    // Check concurrency limit
     await autoCleanup(env);
     const activeCount = await countActiveRecordings(env);
     if (activeCount >= 5) {
@@ -389,7 +344,6 @@ async function handleAutoTrigger(request, url, env) {
       });
     }
 
-    // Create recording state
     const recordingState = {
       stream_id: streamId,
       stream_url: streamUrl,
@@ -406,7 +360,6 @@ async function handleAutoTrigger(request, url, env) {
 
     await env.SUPERLIVE_STATE.put(recordingKey, JSON.stringify(recordingState));
 
-    // Trigger GitHub workflow
     const triggerResult = await triggerRecordWorkflow(env, streamUrl, streamId, streamName);
 
     if (triggerResult.success) {
@@ -449,11 +402,6 @@ async function handleAutoTrigger(request, url, env) {
   }
 }
 
-
-// ============================================================
-// TRIGGER MONITOR API
-// ============================================================
-
 async function handleTriggerMonitorApi(request, env) {
   if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
   try {
@@ -485,11 +433,6 @@ async function handleTriggerMonitorApi(request, env) {
   }
 }
 
-
-// ============================================================
-// MONITOR LOCK API
-// ============================================================
-
 async function handleMonitorLockAcquire(request, env) {
   if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
   try {
@@ -498,7 +441,6 @@ async function handleMonitorLockAcquire(request, env) {
 
     if (existing && existing.locked) {
       const lockAge = Date.now() - new Date(existing.locked_at).getTime();
-      // Lock expires after 15 minutes
       if (lockAge < 15 * 60 * 1000) {
         return new Response(JSON.stringify({
           acquired: false,
@@ -541,16 +483,10 @@ async function handleMonitorLockRelease(request, env) {
   }
 }
 
-
-// ============================================================
-// AUTO MONITOR CRON HANDLER
-// ============================================================
-
 async function handleAutoMonitorCron(env) {
   try {
     console.log('[AUTO-CRON] Starting scheduled check...');
 
-    // 1. Check if watchlist has users
     const watchlist = await getWatchlist(env);
     if (!watchlist || watchlist.length === 0) {
       console.log('[AUTO-CRON] Watchlist is empty, skipping');
@@ -559,7 +495,6 @@ async function handleAutoMonitorCron(env) {
 
     console.log(`[AUTO-CRON] Watchlist has ${watchlist.length} users`);
 
-    // 2. Check monitor lock
     const lock = await env.SUPERLIVE_STATE.get('monitor:lock', 'json');
     if (lock && lock.locked) {
       const lockAge = Date.now() - new Date(lock.locked_at).getTime();
@@ -570,14 +505,12 @@ async function handleAutoMonitorCron(env) {
       console.log('[AUTO-CRON] Monitor lock expired, proceeding');
     }
 
-    // 3. Check if monitor is already running via GitHub Actions
     const isBusy = await isAutoMonitorBusy(env);
     if (isBusy) {
       console.log('[AUTO-CRON] Auto monitor is already running on GitHub, skipping');
       return;
     }
 
-    // 4. Trigger auto monitor workflow
     const result = await triggerMonitorWorkflow(env, 'cloudflare_cron');
     if (result.success) {
       console.log('[AUTO-CRON] Auto monitor triggered successfully');
@@ -593,7 +526,6 @@ async function isAutoMonitorBusy(env) {
   if (!env.GITHUB_REPO || !env.GITHUB_TOKEN) return false;
 
   try {
-    // Check in-progress runs
     const url = `https://api.github.com/repos/${env.GITHUB_REPO}/actions/runs?per_page=10&status=in_progress`;
     const response = await fetch(url, {
       headers: {
@@ -616,7 +548,6 @@ async function isAutoMonitorBusy(env) {
       }
     }
 
-    // Check queued runs
     const queuedUrl = `https://api.github.com/repos/${env.GITHUB_REPO}/actions/runs?per_page=10&status=queued`;
     const queuedResponse = await fetch(queuedUrl, {
       headers: {
@@ -644,11 +575,6 @@ async function isAutoMonitorBusy(env) {
     return false;
   }
 }
-
-
-// ============================================================
-// ORIGINAL STATE MANAGEMENT API HANDLERS
-// ============================================================
 
 async function handleUpdateState(request, url, env) {
   try {
@@ -784,11 +710,6 @@ async function handleCheckStop(request, url, env) {
     });
   }
 }
-
-
-// ============================================================
-// TELEGRAM WEBHOOK
-// ============================================================
 
 async function handleTelegramWebhook(request, env) {
   try {
@@ -933,11 +854,6 @@ async function handleCallbackQuery(callbackQuery, env) {
 
   return new Response('OK');
 }
-
-
-// ============================================================
-// COMMAND HANDLERS
-// ============================================================
 
 async function handleRecord(chatId, streamUrl, env) {
   const streamId = extractStreamId(streamUrl);
@@ -1429,11 +1345,6 @@ async function sendMainMenu(chatId, env) {
   });
 }
 
-
-// ============================================================
-// HELPER FUNCTIONS
-// ============================================================
-
 async function autoCleanup(env) {
   try {
     const { keys } = await env.SUPERLIVE_STATE.list({ prefix: 'recording:' });
@@ -1515,11 +1426,6 @@ function escapeHtml(text) {
     .replace(/>/g, '&gt;');
 }
 
-
-// ============================================================
-// TELEGRAM SEND FUNCTIONS
-// ============================================================
-
 async function sendTelegramMessage(env, chatId, text, options = {}) {
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
   const payload = {
@@ -1536,4 +1442,108 @@ async function sendTelegramMessage(env, chatId, text, options = {}) {
       body: JSON.stringify(payload)
     });
 
-    if
+    if (!response.ok) {
+      console.error('Telegram API error:', await response.text());
+    }
+  } catch (error) {
+    console.error('Failed to send message:', error);
+  }
+}
+
+async function answerCallbackQuery(callbackQueryId, env, text) {
+  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`;
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        callback_query_id: callbackQueryId,
+        text: text
+      })
+    });
+  } catch (error) {
+    console.error('Failed to answer callback:', error);
+  }
+}
+
+async function triggerRecordWorkflow(env, streamUrl, streamId, streamName) {
+  return triggerGitHubDispatch(env, 'record_stream', {
+    stream_url: streamUrl,
+    stream_id: streamId,
+    stream_name: streamName || ''
+  });
+}
+
+async function triggerMonitorWorkflow(env, source) {
+  return triggerGitHubDispatch(env, 'auto_monitor', {
+    source: source || 'unknown'
+  });
+}
+
+async function triggerGitHubDispatch(env, eventType, payload) {
+  if (!env.GITHUB_REPO) {
+    return { success: false, error: 'GITHUB_REPO غير مُعد' };
+  }
+
+  if (!env.GITHUB_TOKEN) {
+    return { success: false, error: 'GITHUB_TOKEN غير مُعد' };
+  }
+
+  if (!env.GITHUB_TOKEN.startsWith('ghp_') && !env.GITHUB_TOKEN.startsWith('github_pat_')) {
+    return {
+      success: false,
+      error: 'GITHUB_TOKEN خاطئ (يجب أن يبدأ بـ ghp_ أو github_pat_)'
+    };
+  }
+
+  try {
+    const repo = env.GITHUB_REPO;
+    const url = `https://api.github.com/repos/${repo}/dispatches`;
+
+    const requestBody = {
+      event_type: eventType,
+      client_payload: payload
+    };
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `token ${env.GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'SuperLive-Recorder-Worker'
+      },
+      body: JSON.stringify(requestBody)
+    });
+
+    if (response.status === 204) {
+      return { success: true };
+    }
+
+    const errorText = await response.text();
+    let errorDetails = '';
+
+    try {
+      const errorJson = JSON.parse(errorText);
+      errorDetails = errorJson.message || errorText;
+    } catch {
+      errorDetails = errorText;
+    }
+
+    let errorMessage = `GitHub API error: ${response.status}`;
+
+    if (response.status === 401) {
+      errorMessage = 'فشل المصادقة مع GitHub';
+    } else if (response.status === 403) {
+      errorMessage = 'صلاحيات غير كافية';
+    } else if (response.status === 404) {
+      errorMessage = `المستودع غير موجود: ${repo}`;
+    } else if (response.status === 422) {
+      errorMessage = `طلب غير صالح: ${errorDetails}`;
+    }
+
+    return { success: false, error: errorMessage };
+  } catch (error) {
+    return { success: false, error: `خطأ في الشبكة: ${error.message}` };
+  }
+}
