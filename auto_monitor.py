@@ -17,6 +17,8 @@ AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SEND_REPORT = os.environ.get("SEND_REPORT", "1") not in ("0", "false", "False")
+UPDATE_WATCHLIST_NAMES = os.environ.get("UPDATE_WATCHLIST_NAMES", "1") not in ("0", "false", "False")
+NAME_MIN_SCORE = int(os.environ.get("NAME_MIN_SCORE", "50"))
 
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "5"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "15"))
@@ -72,43 +74,88 @@ def log_detection(user_id: str, result: Dict[str, Any], source: str) -> None:
     log(f"status={status}")
     log(f"action={action}")
     log(f"reason={reason}")
+    if result.get("display_name"):
+        log(f"display_name={result['display_name']}")
 
 # ============================================================
 # TELEGRAM REPORT
 # ============================================================
+def html_escape(text: str) -> str:
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def split_telegram_text(text: str, limit: int = 3900) -> List[str]:
+    lines = text.split("\n")
+    chunks = []
+    current = ""
+
+    for line in lines:
+        if len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+
+            for i in range(0, len(line), limit):
+                chunks.append(line[i:i + limit])
+            continue
+
+        if len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+
+    if current:
+        chunks.append(current)
+
+    return chunks or [""]
+
+
 def send_telegram_report(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log("Telegram report skipped: credentials missing")
         return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-    }
+    chunks = split_telegram_text(text)
+    ok = True
 
-    try:
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "AutoMonitor/1.0",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=20) as response:
-            response.read()
+    for chunk in chunks:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": chunk,
+            "parse_mode": "HTML",
+        }
+
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=data,
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "AutoMonitor/1.0",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=20) as response:
+                response.read()
+        except Exception as e:
+            log(f"Telegram report error: {e}")
+            ok = False
+
+    if ok:
         log("Telegram report sent successfully")
-        return True
-    except Exception as e:
-        log(f"Telegram report error: {e}")
-        return False
+
+    return ok
 
 
-def build_report(elapsed_seconds: float, stats: Dict[str, int]) -> str:
+def build_report(elapsed_seconds: float, stats: Dict[str, Any]) -> str:
     lines = []
     lines.append(f"✅ انتهى الفحص في {elapsed_seconds:.1f} ثانية.")
     lines.append("")
@@ -120,11 +167,251 @@ def build_report(elapsed_seconds: float, stats: Dict[str, int]) -> str:
     lines.append(f"• 🟢 بث عادي: {stats['live_normal']}")
     lines.append(f"• 🟡 بث مدفوع (تم التجاهل): {stats['live_premium']}")
     lines.append(f"• ⚪ غير متصل: {stats['offline']}")
+
     if stats.get("unknown", 0) > 0:
         lines.append(f"• ❓ غير مؤكد: {stats['unknown']}")
+
+    names = stats.get("names", {})
+    if names:
+        lines.append("")
+        lines.append("👤 الأسماء:")
+        for user_id, display_name in names.items():
+            lines.append(f"• {user_id} → {html_escape(display_name)}")
+
     lines.append("")
     lines.append(f"🔴 تم تشغيل {stats['started_recordings']} تسجيل(ات) جديد(ة).")
+
     return "\n".join(lines)
+
+# ============================================================
+# DISPLAY NAME EXTRACTION
+# ============================================================
+NAME_KEY_SCORES = {
+    "username": 100,
+    "user_name": 100,
+    "nickname": 95,
+    "displayname": 90,
+    "display_name": 90,
+    "broadcaster_name": 85,
+    "channel_name": 85,
+    "streamer_name": 85,
+    "author_name": 80,
+    "name": 60,
+    "full_name": 60,
+    "fullname": 60,
+    "user": 45,
+    "channel": 40,
+    "broadcaster": 40,
+    "author": 35,
+    "title": 20,
+    "slug": 15,
+}
+
+
+def normalize_display_name(value):
+    if value is None:
+        return None
+
+    s = str(value).strip()
+    s = s.replace("&amp;", "&")
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    if len(s) < 2 or len(s) > 60:
+        return None
+
+    if s.isdigit():
+        return None
+
+    lowered = s.lower()
+    blocked = {
+        "live",
+        "offline",
+        "premium",
+        "superlive",
+        "super live",
+        "recording",
+        "unknown",
+        "none",
+        "null",
+        "video",
+        "stream",
+    }
+
+    if lowered in blocked:
+        return None
+
+    return s
+
+
+def dict_contains_user_id(data, user_id):
+    if not isinstance(data, dict):
+        return False
+
+    for key, value in data.items():
+        if isinstance(value, (str, int, float)):
+            if str(value) == str(user_id):
+                k = str(key).lower()
+                if any(token in k for token in (
+                    "id",
+                    "user",
+                    "stream",
+                    "channel",
+                    "broadcaster",
+                    "author",
+                    "owner",
+                )):
+                    return True
+
+    return False
+
+
+def scan_json_for_names(obj, user_id, candidates, depth=0, associated=False):
+    if depth > 8:
+        return
+
+    if isinstance(obj, dict):
+        current_associated = associated or dict_contains_user_id(obj, user_id)
+
+        for key, value in obj.items():
+            key_norm = str(key).lower().replace("-", "_").replace(" ", "_")
+
+            if isinstance(value, (dict, list)):
+                scan_json_for_names(
+                    value,
+                    user_id,
+                    candidates,
+                    depth + 1,
+                    current_associated,
+                )
+            else:
+                base_score = NAME_KEY_SCORES.get(key_norm)
+                if not base_score:
+                    continue
+
+                name = normalize_display_name(value)
+                if not name:
+                    continue
+
+                score = base_score + (20 if current_associated else 0)
+                candidates.append({
+                    "value": name,
+                    "source": f"json:{key_norm}",
+                    "score": min(130, score),
+                })
+
+    elif isinstance(obj, list):
+        for item in obj[:200]:
+            scan_json_for_names(
+                item,
+                user_id,
+                candidates,
+                depth + 1,
+                associated,
+            )
+
+
+def extract_json_name_candidates(user_id, json_bodies):
+    candidates = []
+
+    for body in json_bodies[:20]:
+        try:
+            obj = json.loads(body)
+        except Exception:
+            continue
+
+        scan_json_for_names(obj, user_id, candidates)
+
+    return candidates
+
+
+def choose_display_name(candidates):
+    dedup = {}
+
+    for candidate in candidates or []:
+        name = normalize_display_name(candidate.get("value"))
+        if not name:
+            continue
+
+        score = int(candidate.get("score", 0) or 0)
+        source = str(candidate.get("source", ""))
+
+        key = name.lower()
+
+        if key not in dedup or score > dedup[key]["score"]:
+            dedup[key] = {
+                "value": name,
+                "score": score,
+                "source": source,
+            }
+
+    if not dedup:
+        return None, 0, None
+
+    best = max(dedup.values(), key=lambda x: x["score"])
+    return best["value"], best["score"], best["source"]
+
+
+def extract_display_name_from_html(raw, user_id):
+    candidates = []
+
+    if not raw:
+        return candidates
+
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", raw, re.IGNORECASE | re.DOTALL)
+    if title_match:
+        title = re.sub(r"<[^>]+>", " ", title_match.group(1))
+        candidates.append({
+            "value": title,
+            "source": "html_title",
+            "score": 35,
+        })
+
+    og_match = re.search(
+        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
+        raw,
+        re.IGNORECASE,
+    )
+    if og_match:
+        candidates.append({
+            "value": og_match.group(1),
+            "source": "og_title",
+            "score": 40,
+        })
+
+    twitter_match = re.search(
+        r'<meta[^>]+name=["\']twitter:title["\'][^>]+content=["\']([^"\']+)',
+        raw,
+        re.IGNORECASE,
+    )
+    if twitter_match:
+        candidates.append({
+            "value": twitter_match.group(1),
+            "source": "twitter_title",
+            "score": 35,
+        })
+
+    return candidates
+
+
+async def update_watchlist_name(user_id: str, display_name: str):
+    try:
+        payload = {"display_name": display_name}
+        status, data = await api_request(
+            f"/api/watchlist/name/{user_id}",
+            "POST",
+            payload,
+        )
+
+        if status == 200:
+            log(f"Saved display name for {user_id}: {display_name}")
+        elif status == 404:
+            # User not in watchlist or endpoint missing.
+            pass
+        else:
+            log(f"Name save warning for {user_id}: HTTP {status}")
+    except Exception as e:
+        log(f"Name save error for {user_id}: {e}")
 
 # ============================================================
 # WORKER API CLIENT
@@ -170,18 +457,24 @@ async def api_request(path: str, method: str = "GET", payload: Optional[dict] = 
     return await asyncio.to_thread(api_request_sync, path, method, payload)
 
 
-async def load_watchlist() -> List[str]:
+async def load_watchlist():
     status, data = await api_request("/api/watchlist", "GET")
     if status != 200:
         raise RuntimeError(f"Failed to load watchlist: HTTP {status} - {data}")
 
     items = data.get("watchlist", [])
     users = []
+    stored_names = {}
+
     for item in items:
         username = str(item.get("username", "")).strip()
         if username:
             users.append(username)
-    return users
+            display_name = item.get("display_name")
+            if display_name:
+                stored_names[username] = str(display_name).strip()
+
+    return users, stored_names
 
 
 async def load_active_recordings() -> Dict[str, Any]:
@@ -204,10 +497,11 @@ async def load_active_recordings() -> Dict[str, Any]:
     }
 
 
-async def trigger_auto_recording(user_id: str, stream_url: str):
+async def trigger_auto_recording(user_id: str, stream_url: str, stream_name: str = ""):
     payload = {
         "stream_url": stream_url,
         "source": "auto",
+        "stream_name": stream_name,
     }
     status, data = await api_request(f"/api/auto-trigger/{user_id}", "POST", payload)
 
@@ -410,17 +704,26 @@ def http_classify_user(user_id: str) -> Dict[str, Any]:
                 "status": OFFLINE,
                 "reason": "http_404",
                 "stream_url": url,
+                "display_name": None,
+                "name_score": 0,
+                "name_source": None,
             }
         return {
             "status": UNKNOWN,
             "reason": f"http_{e.code}",
             "stream_url": url,
+            "display_name": None,
+            "name_score": 0,
+            "name_source": None,
         }
     except Exception as e:
         return {
             "status": UNKNOWN,
             "reason": str(e)[:120],
             "stream_url": url,
+            "display_name": None,
+            "name_score": 0,
+            "name_source": None,
         }
 
     if status_code != 200:
@@ -428,6 +731,9 @@ def http_classify_user(user_id: str) -> Dict[str, Any]:
             "status": UNKNOWN,
             "reason": f"http_status_{status_code}",
             "stream_url": url,
+            "display_name": None,
+            "name_score": 0,
+            "name_source": None,
         }
 
     if is_captcha_page(raw):
@@ -435,19 +741,114 @@ def http_classify_user(user_id: str) -> Dict[str, Any]:
             "status": UNKNOWN,
             "reason": "captcha_or_challenge",
             "stream_url": url,
+            "display_name": None,
+            "name_score": 0,
+            "name_source": None,
         }
 
     result = analyze_texts([raw], user_id)
     result["stream_url"] = url
+
+    name_candidates = extract_display_name_from_html(raw, user_id)
+    display_name, name_score, name_source = choose_display_name(name_candidates)
+
+    if display_name and name_score >= NAME_MIN_SCORE:
+        result["display_name"] = display_name
+    else:
+        result["display_name"] = None
+
+    result["name_score"] = name_score
+    result["name_source"] = name_source
+
     return result
 
 # ============================================================
 # PLAYWRIGHT DETECTION
 # ============================================================
+PAGE_NAME_EXTRACT_JS = r"""
+(userId) => {
+  const candidates = [];
+
+  const clean = (value) => {
+    if (!value) return '';
+    return String(value).trim().replace(/\s+/g, ' ');
+  };
+
+  const add = (value, source, score) => {
+    const v = clean(value);
+    if (!v) return;
+    if (v.length < 2 || v.length > 60) return;
+    if (/^\d+$/.test(v)) return;
+    candidates.push({ value: v, source, score });
+  };
+
+  try {
+    add(document.title, 'title', 30);
+
+    const og = document.querySelector('meta[property="og:title"]');
+    if (og && og.content) add(og.content, 'og_title', 35);
+
+    const twitter = document.querySelector('meta[name="twitter:title"]');
+    if (twitter && twitter.content) add(twitter.content, 'twitter_title', 30);
+
+    const h1 = document.querySelector('h1');
+    if (h1 && h1.innerText) add(h1.innerText, 'h1', 45);
+
+    const h2s = Array.from(document.querySelectorAll('h2')).slice(0, 5);
+    for (const h2 of h2s) add(h2.innerText, 'h2', 20);
+
+    const links = Array.from(document.querySelectorAll('a[href*="' + userId + '"]')).slice(0, 20);
+    for (const a of links) {
+      add(a.innerText, 'link_text', 80);
+      add(a.getAttribute('aria-label'), 'link_aria', 70);
+      add(a.getAttribute('title'), 'link_title', 60);
+    }
+
+    const selectors = [
+      '[data-id="' + userId + '"]',
+      '[data-user-id="' + userId + '"]',
+      '[data-stream-id="' + userId + '"]',
+      '[data-livestream-id="' + userId + '"]',
+      '[data-channel-id="' + userId + '"]'
+    ];
+
+    for (const selector of selectors) {
+      let elements = [];
+      try {
+        elements = Array.from(document.querySelectorAll(selector)).slice(0, 10);
+      } catch (e) {}
+
+      for (const el of elements) {
+        const nameEl = el.querySelector('[class*="name" i], [class*="nickname" i], [class*="username" i], h1, h2, h3');
+        if (nameEl && nameEl.innerText) add(nameEl.innerText, 'data_attr_name', 90);
+
+        add(el.getAttribute('aria-label'), 'data_attr_aria', 70);
+        add(el.getAttribute('title'), 'data_attr_title', 60);
+
+        const firstLine = (el.innerText || '').split('\n')[0];
+        add(firstLine, 'data_attr_text', 35);
+      }
+    }
+
+    const nameEls = Array.from(document.querySelectorAll(
+      '[class*="profile-name" i], [class*="user-name" i], [class*="username" i], [class*="nickname" i], [class*="streamer-name" i], [class*="broadcaster-name" i]'
+    )).slice(0, 20);
+
+    for (const el of nameEls) {
+      add(el.innerText, 'name_class', 55);
+    }
+  } catch (e) {}
+
+  return candidates;
+}
+"""
+
+
 async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Semaphore) -> Dict[str, Any]:
     async with semaphore:
         page = await context.new_page()
         texts: List[str] = []
+        json_bodies: List[str] = []
         json_count = 0
         url = BASE_LIVE_URL.format(user_id=user_id)
 
@@ -468,6 +869,7 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
 
                 if user_id in body or user_id in response_url:
                     json_count += 1
+                    json_bodies.append(body[:200000])
                     texts.append(f"SOURCE_JSON {user_id} " + body[:200000])
             except Exception:
                 pass
@@ -530,6 +932,13 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
                     "liveVideoCandidate": False,
                 }
 
+            try:
+                dom_name_candidates = await page.evaluate(PAGE_NAME_EXTRACT_JS, user_id)
+                if not isinstance(dom_name_candidates, list):
+                    dom_name_candidates = []
+            except Exception:
+                dom_name_candidates = []
+
             texts.append(f"SOURCE_HTML {user_id} " + html[:300000])
             texts.append(f"SOURCE_TEXT {user_id} " + body_text[:100000])
             texts.append(f"SOURCE_VIDEO {user_id} " + json.dumps(video_info))
@@ -540,6 +949,9 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
                 "status": UNKNOWN,
                 "reason": str(e)[:120],
                 "stream_url": url,
+                "display_name": None,
+                "name_score": 0,
+                "name_source": None,
             }
 
         await page.close()
@@ -550,10 +962,27 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
                 "status": UNKNOWN,
                 "reason": "captcha_or_challenge",
                 "stream_url": url,
+                "display_name": None,
+                "name_score": 0,
+                "name_source": None,
             }
 
         result = analyze_texts(texts, user_id)
         result["stream_url"] = url
+
+        json_name_candidates = extract_json_name_candidates(user_id, json_bodies)
+        all_name_candidates = json_name_candidates + dom_name_candidates
+
+        display_name, name_score, name_source = choose_display_name(all_name_candidates)
+
+        if display_name and name_score >= NAME_MIN_SCORE:
+            result["display_name"] = display_name
+        else:
+            result["display_name"] = None
+
+        result["name_score"] = name_score
+        result["name_source"] = name_source
+
         return result
 
 
@@ -572,6 +1001,9 @@ async def playwright_classify_many(user_ids: List[str]) -> Dict[str, Dict[str, A
                 "status": UNKNOWN,
                 "reason": "playwright_not_installed",
                 "stream_url": BASE_LIVE_URL.format(user_id=user_id),
+                "display_name": None,
+                "name_score": 0,
+                "name_source": None,
             }
         return results
 
@@ -605,6 +1037,9 @@ async def playwright_classify_many(user_ids: List[str]) -> Dict[str, Dict[str, A
                         "status": UNKNOWN,
                         "reason": str(result)[:120],
                         "stream_url": BASE_LIVE_URL.format(user_id=user_id),
+                        "display_name": None,
+                        "name_score": 0,
+                        "name_source": None,
                     }
                 else:
                     results[user_id] = result
@@ -620,6 +1055,9 @@ async def playwright_classify_many(user_ids: List[str]) -> Dict[str, Dict[str, A
                     "status": UNKNOWN,
                     "reason": "playwright_global_error",
                     "stream_url": BASE_LIVE_URL.format(user_id=user_id),
+                    "display_name": None,
+                    "name_score": 0,
+                    "name_source": None,
                 }
 
     return results
@@ -639,6 +1077,7 @@ async def async_main() -> int:
         "offline": 0,
         "unknown": 0,
         "started_recordings": 0,
+        "names": {},
     }
 
     log("Starting monitor")
@@ -655,7 +1094,7 @@ async def async_main() -> int:
     # Load watchlist
     # --------------------------------------------------------
     try:
-        watchlist = await load_watchlist()
+        watchlist, stored_names = await load_watchlist()
     except Exception as e:
         log(f"FATAL: {e}")
         return 1
@@ -697,6 +1136,10 @@ async def async_main() -> int:
     for user_id in watchlist:
         if user_id in active["active_ids"]:
             stats["already_recording"] += 1
+
+            if stored_names.get(user_id):
+                stats["names"][user_id] = stored_names[user_id]
+
             log(f"username={user_id}")
             log("status=ALREADY_RECORDING")
             log("action=SKIP")
@@ -732,6 +1175,9 @@ async def async_main() -> int:
                     "status": UNKNOWN,
                     "reason": str(e)[:120],
                     "stream_url": BASE_LIVE_URL.format(user_id=user_id),
+                    "display_name": None,
+                    "name_score": 0,
+                    "name_source": None,
                 }
             log_detection(user_id, result, "http")
             return user_id, result
@@ -768,7 +1214,7 @@ async def async_main() -> int:
             log_detection(user_id, result, "playwright")
 
     # --------------------------------------------------------
-    # Update classification stats
+    # Update classification stats and names
     # --------------------------------------------------------
     for user_id in users_to_check:
         result = results.get(user_id, {})
@@ -782,6 +1228,15 @@ async def async_main() -> int:
             stats["offline"] += 1
         else:
             stats["unknown"] += 1
+
+        discovered_name = result.get("display_name")
+        final_name = discovered_name or stored_names.get(user_id)
+
+        if final_name:
+            stats["names"][user_id] = final_name
+
+        if UPDATE_WATCHLIST_NAMES and discovered_name:
+            await update_watchlist_name(user_id, discovered_name)
 
     # --------------------------------------------------------
     # Refresh active recordings before triggering
@@ -842,14 +1297,17 @@ async def async_main() -> int:
             break
 
         stream_url = result.get("stream_url") or BASE_LIVE_URL.format(user_id=user_id)
+        stream_name = result.get("display_name") or stats["names"].get(user_id, "")
 
         log(f"username={user_id}")
         log("status=LIVE_NORMAL")
         log("Recording state: NOT_RECORDING")
         log(f"Slots: {active['active_count']}/{active['max_concurrent']}")
+        if stream_name:
+            log(f"display_name={stream_name}")
         log("Action: START_RECORDING")
 
-        ok, reason = await trigger_auto_recording(user_id, stream_url)
+        ok, reason = await trigger_auto_recording(user_id, stream_url, stream_name)
 
         if ok:
             log(f"username={user_id}")
