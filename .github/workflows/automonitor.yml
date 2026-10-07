@@ -7,7 +7,7 @@ on:
 
 concurrency:
   group: automonitor
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -68,11 +68,11 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SEND_REPORT: "1"
           UPDATE_WATCHLIST_NAMES: "1"
-          NAME_MIN_SCORE: "50"
           MAX_CONCURRENT: "5"
-          USE_PLAYWRIGHT: "1"
-          HTTP_CONCURRENCY: "8"
           PLAYWRIGHT_CONCURRENCY: "2"
+          PLAYWRIGHT_WAIT_MS: "10000"
+          PLAYWRIGHT_RETRY_WAIT_MS: "5000"
+          PAGE_TIMEOUT_MS: "30000"
           PLAYWRIGHT_MAX_USERS_PER_CYCLE: "12"
         run: |
           echo "[AUTO] Starting Auto Monitor workflow"
