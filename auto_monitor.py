@@ -36,9 +36,6 @@ USER_AGENT = (
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
-# ============================================================
-# STATUS CONSTANTS
-# ============================================================
 LIVE_NORMAL = "LIVE_NORMAL"
 LIVE_PREMIUM = "LIVE_PREMIUM"
 OFFLINE = "OFFLINE"
@@ -53,7 +50,6 @@ def log(message: str) -> None:
 
 def log_detection(user_id: str, result: Dict[str, Any], source: str) -> None:
     status = result.get("status", UNKNOWN)
-
     if status == LIVE_PREMIUM:
         action = "SKIP_PREMIUM"
     elif status == OFFLINE:
@@ -68,10 +64,8 @@ def log_detection(user_id: str, result: Dict[str, Any], source: str) -> None:
     log(f"status={status}")
     log(f"action={action}")
     log(f"reason={result.get('reason', 'unknown')}")
-
     if result.get("display_name"):
         log(f"display_name={result['display_name']}")
-
     video_info = result.get("video_info")
     if video_info:
         log(
@@ -79,6 +73,7 @@ def log_detection(user_id: str, result: Dict[str, Any], source: str) -> None:
             f"videos={video_info.get('videoCount', 0)},"
             f"srcObj={video_info.get('srcObjectCount', 0)},"
             f"live={video_info.get('liveVideoCandidate', False)},"
+            f"belongsToUser={video_info.get('belongsToUser', False)},"
             f"premium_json={video_info.get('premiumFromJson', False)},"
             f"stream_ended={video_info.get('streamEnded', False)}"
         )
@@ -87,12 +82,7 @@ def log_detection(user_id: str, result: Dict[str, Any], source: str) -> None:
 # TELEGRAM REPORT
 # ============================================================
 def html_escape(text: str) -> str:
-    return (
-        str(text)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def split_telegram_text(text: str, limit: int = 3900) -> List[str]:
@@ -312,7 +302,6 @@ def _check_obj_for_premium(obj, user_id, depth=0):
             if isinstance(value, (str, int, float)) and str(value) == str(user_id):
                 is_user_obj = True
                 break
-
         for key, value in obj.items():
             key_lower = str(key).lower()
             if key_lower in ('ispremium', 'is_premium', 'premium', 'ispaywall', 'paywall'):
@@ -324,20 +313,17 @@ def _check_obj_for_premium(obj, user_id, depth=0):
             if key_lower in ('locked', 'isprivate', 'is_private', 'private'):
                 if (value is True or str(value).lower() == 'true') and is_user_obj:
                     return True
-
         for value in obj.values():
             if _check_obj_for_premium(value, user_id, depth + 1):
                 return True
-
     elif isinstance(obj, list):
         for item in obj[:50]:
             if _check_obj_for_premium(item, user_id, depth + 1):
                 return True
-
     return False
 
 # ============================================================
-# NAME EXTRACTION
+# NAME EXTRACTION - HARDENED
 # ============================================================
 def normalize_display_name(value):
     if value is None:
@@ -346,7 +332,8 @@ def normalize_display_name(value):
     s = s.replace("&amp;", "&")
     s = re.sub(r"<[^>]+>", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    if len(s) < 2 or len(s) > 60:
+    # Max 40 chars - real usernames are short
+    if len(s) < 2 or len(s) > 40:
         return None
     if s.isdigit():
         return None
@@ -358,6 +345,10 @@ def normalize_display_name(value):
         return None
     if not re.search(r"[\u0600-\u06FFa-zA-Z\U0001F300-\U0001FAFF\u2600-\u27BF]", s):
         return None
+    # Reject names with more than 4 words
+    word_count = len(s.split())
+    if word_count > 4:
+        return None
     lowered = s.lower()
     blocked = {
         "live", "offline", "premium", "superlive", "super live",
@@ -368,17 +359,23 @@ def normalize_display_name(value):
     }
     if lowered in blocked:
         return None
+    # Reject site descriptions and slogans
+    if "rencontrez" in lowered or "diffusions" in lowered or "regardez" in lowered:
+        return None
+    if "nouvelles personnes" in lowered:
+        return None
     return s
 
 # ============================================================
-# CLASSIFICATION ENGINE
+# CLASSIFICATION ENGINE - WITH belongsToUser CHECK
 # ============================================================
 def classify_final(video_info: Dict[str, Any], json_bodies: List[str], user_id: str) -> str:
     src_object_count = int(video_info.get("srcObjectCount", 0))
     live_video_candidate = bool(video_info.get("liveVideoCandidate", False))
     stream_ended = bool(video_info.get("streamEnded", False))
+    belongs_to_user = bool(video_info.get("belongsToUser", False))
 
-    has_active_video = src_object_count > 0 and live_video_candidate
+    has_active_video = src_object_count > 0 and live_video_candidate and belongs_to_user
 
     is_premium = check_json_for_premium(json_bodies, user_id)
 
@@ -393,7 +390,7 @@ def classify_final(video_info: Dict[str, Any], json_bodies: List[str], user_id: 
     return UNKNOWN
 
 # ============================================================
-# PLAYWRIGHT DETECTION - MULTI-SOURCE NAME EXTRACTION
+# PLAYWRIGHT DETECTION - WITH DOM IDENTITY CHECK
 # ============================================================
 PAGE_INFO_JS = r"""
 (userId) => {
@@ -401,14 +398,10 @@ PAGE_INFO_JS = r"""
     let srcObjectCount = 0;
     let visibleCount = 0;
     let liveVideoCandidate = false;
+    let belongsToUser = false;
     let streamEnded = false;
     let streamerName = '';
 
-    // ============================================================
-    // EXTRACT STREAMER NAME FROM MULTIPLE SOURCES
-    // Priority: og:title > document.title > h1 > h2 > DOM elements
-    // Skip generic names like "Super", "SuperLive", "Live"
-    // ============================================================
     const isGenericName = (name) => {
         if (!name) return true;
         const lowered = name.toLowerCase().trim();
@@ -417,24 +410,26 @@ PAGE_INFO_JS = r"""
             'live', 'direct', 'en direct', 'stream', 'video',
             'recording', 'watching', 'watch', 'play', 'player',
             'home', 'search', 'explore', 'trending',
+            'rencontrez', 'diffusions', 'regardez', 'nouvelles',
+            'personnes',
         ];
-        return generic.includes(lowered);
+        if (generic.includes(lowered)) return true;
+        const wordCount = lowered.split(/\s+/).length;
+        if (wordCount > 4) return true;
+        return false;
     };
 
     const cleanName = (raw) => {
         if (!raw) return '';
         let name = String(raw).trim();
-        // Remove site name suffix: "Name | SuperLive" or "Name - SuperLive"
         name = name.replace(/\s*[\|\-\u2013\u2014]\s*(SuperLive|superlivetv|Super Live|Super).*$/i, '');
-        // Remove "en direct" / "live" suffix
         name = name.replace(/\s*(en direct|live|direct|streaming).*$/i, '');
         name = name.trim();
-        if (name.length < 2 || name.length > 60) return '';
+        if (name.length < 2 || name.length > 40) return '';
         if (isGenericName(name)) return '';
         return name;
     };
 
-    // Source 1: og:title
     try {
         const ogTitle = document.querySelector('meta[property="og:title"]');
         if (ogTitle && ogTitle.content) {
@@ -443,7 +438,6 @@ PAGE_INFO_JS = r"""
         }
     } catch (e) {}
 
-    // Source 2: document.title
     if (!streamerName) {
         try {
             const cleaned = cleanName(document.title || '');
@@ -451,7 +445,6 @@ PAGE_INFO_JS = r"""
         } catch (e) {}
     }
 
-    // Source 3: h1 element
     if (!streamerName) {
         try {
             const h1 = document.querySelector('h1');
@@ -462,42 +455,16 @@ PAGE_INFO_JS = r"""
         } catch (e) {}
     }
 
-    // Source 4: h2 elements
-    if (!streamerName) {
-        try {
-            const h2s = document.querySelectorAll('h2');
-            for (const h2 of h2s) {
-                if (h2 && h2.innerText) {
-                    const cleaned = cleanName(h2.innerText);
-                    if (cleaned) {
-                        streamerName = cleaned;
-                        break;
-                    }
-                }
-            }
-        } catch (e) {}
-    }
-
-    // Source 5: DOM elements with username/streamer-name classes
     if (!streamerName) {
         try {
             const selectors = [
-                '[class*="username"]',
-                '[class*="streamer-name"]',
-                '[class*="streamer_name"]',
-                '[class*="profile-name"]',
-                '[class*="profile_name"]',
-                '[class*="user-name"]',
-                '[class*="user_name"]',
-                '[class*="nickname"]',
-                '[class*="nick-name"]',
-                '[class*="broadcaster-name"]',
-                '[class*="broadcaster_name"]',
-                '[class*="channel-name"]',
+                '[class*="username"]', '[class*="streamer-name"]',
+                '[class*="streamer_name"]', '[class*="profile-name"]',
+                '[class*="profile_name"]', '[class*="user-name"]',
+                '[class*="user_name"]', '[class*="nickname"]',
+                '[class*="nick-name"]', '[class*="broadcaster-name"]',
+                '[class*="broadcaster_name"]', '[class*="channel-name"]',
                 '[class*="channel_name"]',
-                '[data-testid*="username"]',
-                '[data-testid*="streamer"]',
-                '[data-testid*="nickname"]',
             ];
             for (const sel of selectors) {
                 try {
@@ -514,31 +481,43 @@ PAGE_INFO_JS = r"""
         } catch (e) {}
     }
 
-    // Source 6: Look for name near the video player area
-    if (!streamerName) {
-        try {
-            const videoParent = videos.length > 0 ? videos[0].closest('div[class]') : null;
-            if (videoParent) {
-                const container = videoParent.parentElement;
-                if (container) {
-                    const textEls = container.querySelectorAll('span, div, p, a');
-                    for (const el of textEls) {
-                        if (el.innerText && el.innerText.length >= 2 && el.innerText.length <= 60) {
-                            const cleaned = cleanName(el.innerText);
-                            if (cleaned && !isGenericName(cleaned)) {
-                                streamerName = cleaned;
-                                break;
-                            }
-                        }
+    // ============================================================
+    // DOM IDENTITY CHECK - same logic as record_once.py
+    // ============================================================
+    const domContainsTargetId = (element) => {
+        if (!userId || !element) return false;
+        let node = element;
+        let depth = 0;
+        while (node && depth < 8) {
+            try {
+                const values = [
+                    node.id,
+                    node.className,
+                    node.getAttribute && node.getAttribute("data-stream-id"),
+                    node.getAttribute && node.getAttribute("data-id"),
+                    node.getAttribute && node.getAttribute("data-livestream-id"),
+                    node.getAttribute && node.getAttribute("data-channel-id"),
+                    node.getAttribute && node.getAttribute("data-video-id"),
+                    node.getAttribute && node.getAttribute("href"),
+                ];
+                if (values.some(value => value != null && String(value).includes(userId))) {
+                    return true;
+                }
+                if (node.querySelectorAll) {
+                    const descendants = node.querySelectorAll(
+                        'a[href*="' + userId + '"], [data-stream-id*="' + userId + '"], [data-livestream-id*="' + userId + '"], [data-video-id*="' + userId + '"]'
+                    );
+                    if (descendants.length > 0) {
+                        return true;
                     }
                 }
-            }
-        } catch (e) {}
-    }
+            } catch (e) {}
+            node = node.parentElement;
+            depth++;
+        }
+        return false;
+    };
 
-    // ============================================================
-    // CHECK STREAM ENDED
-    // ============================================================
     try {
         const bodyText = document.body ? document.body.innerText : '';
         if (bodyText.includes("Le direct s'est termin\u00e9") || bodyText.includes("Stream ended")) {
@@ -546,9 +525,6 @@ PAGE_INFO_JS = r"""
         }
     } catch (e) {}
 
-    // ============================================================
-    // CHECK VIDEO ELEMENTS
-    // ============================================================
     for (const video of videos) {
         if (video.srcObject) {
             srcObjectCount++;
@@ -560,11 +536,13 @@ PAGE_INFO_JS = r"""
         }
         if (video.srcObject && video.readyState >= 2 && visible) {
             liveVideoCandidate = true;
+            if (domContainsTargetId(video)) {
+                belongsToUser = true;
+            }
         }
     }
 
-    // If there's an active video, stream is NOT ended
-    if (streamEnded && srcObjectCount > 0 && liveVideoCandidate) {
+    if (streamEnded && srcObjectCount > 0 && liveVideoCandidate && belongsToUser) {
         streamEnded = false;
     }
 
@@ -573,6 +551,7 @@ PAGE_INFO_JS = r"""
         srcObjectCount,
         visibleCount,
         liveVideoCandidate,
+        belongsToUser,
         streamEnded,
         streamerName
     };
@@ -588,8 +567,8 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
         url = BASE_LIVE_URL.format(user_id=user_id)
         video_info = {
             "videoCount": 0, "srcObjectCount": 0, "visibleCount": 0,
-            "liveVideoCandidate": False, "streamEnded": False,
-            "streamerName": "",
+            "liveVideoCandidate": False, "belongsToUser": False,
+            "streamEnded": False, "streamerName": "",
         }
 
         async def on_response(response):
@@ -621,8 +600,8 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
             except Exception:
                 video_info = {
                     "videoCount": 0, "srcObjectCount": 0, "visibleCount": 0,
-                    "liveVideoCandidate": False, "streamEnded": False,
-                    "streamerName": "",
+                    "liveVideoCandidate": False, "belongsToUser": False,
+                    "streamEnded": False, "streamerName": "",
                 }
 
             if not video_info.get("liveVideoCandidate") and video_info.get("srcObjectCount", 0) == 0:
@@ -673,7 +652,7 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
 
         result = {
             "status": final_status,
-            "reason": f"video={video_info.get('liveVideoCandidate')},premium_json={video_info.get('premiumFromJson')},ended={video_info.get('streamEnded')}",
+            "reason": f"video={video_info.get('liveVideoCandidate')},belongs={video_info.get('belongsToUser')},premium_json={video_info.get('premiumFromJson')},ended={video_info.get('streamEnded')}",
             "stream_url": url,
             "display_name": display_name,
             "video_info": video_info,
