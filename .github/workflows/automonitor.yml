@@ -66,6 +66,9 @@ jobs:
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           AUTO_API_TOKEN: ${{ secrets.AUTO_API_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SEND_REPORT: "1"
           MAX_CONCURRENT: "5"
           USE_PLAYWRIGHT: "1"
           HTTP_CONCURRENCY: "8"
