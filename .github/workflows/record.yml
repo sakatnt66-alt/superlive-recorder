@@ -12,11 +12,6 @@ on:
         required: false
         default: ""
         type: string
-      stream_name:
-        description: "Stream owner display name"
-        required: false
-        default: ""
-        type: string
 
   repository_dispatch:
     types: [record_stream]
@@ -87,7 +82,7 @@ jobs:
           VIDEO_WAIT_SECONDS: 60
           FIRST_CHUNK_TIMEOUT_SECONDS: 10
           STREAM_ID: ${{ github.event.client_payload.stream_id || inputs.stream_id }}
-          STREAM_NAME: ${{ github.event.client_payload.stream_name || inputs.stream_name || '' }}
+          STREAM_NAME: ${{ github.event.client_payload.stream_name || '' }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
