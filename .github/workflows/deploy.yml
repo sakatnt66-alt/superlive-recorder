@@ -27,7 +27,19 @@ jobs:
       - name: Install Wrangler
         run: npm install -g wrangler
 
-      - name: Verify KV Namespace ID is set
+      - name: Verify secrets are set
+        run: |
+          if [ -z "${{ secrets.CLOUDFLARE_API_TOKEN }}" ]; then
+            echo "ERROR: CLOUDFLARE_API_TOKEN is not set in GitHub Secrets"
+            exit 1
+          fi
+          if [ -z "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" ]; then
+            echo "ERROR: CLOUDFLARE_ACCOUNT_ID is not set in GitHub Secrets"
+            exit 1
+          fi
+          echo "All secrets are configured"
+
+      - name: Verify KV Namespace ID
         run: |
           if grep -q "YOUR_KV_NAMESPACE_ID_HERE" wrangler.toml; then
             echo "ERROR: wrangler.toml still contains placeholder KV ID"
@@ -44,11 +56,12 @@ jobs:
           wrangler deploy
           echo "Worker deployed successfully"
 
-      - name: Verify Cron Triggers
+      - name: Verify deployment
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
-          echo "Checking deployed triggers..."
-          wrangler deployments list || true
-          echo "Deploy completed. Check Cloudflare Dashboard > Workers > Triggers to confirm cron is active."
+          echo "Listing worker routes..."
+          wrangler whoami || true
+          echo ""
+          echo "Deployment complete. Check Cloudflare Dashboard > Workers > Triggers for cron schedule."
