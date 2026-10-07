@@ -59,17 +59,19 @@ def log_detection(user_id: str, result: Dict[str, Any], source: str) -> None:
     log(f"reason={result.get('reason', 'unknown')}")
     if result.get("display_name"):
         log(f"display_name={result['display_name']}")
-    video_info = result.get("video_info")
-    if video_info:
+    vi = result.get("video_info")
+    if vi:
         log(
             f"video_state="
-            f"videos={video_info.get('videoCount', 0)},"
-            f"srcObj={video_info.get('srcObjectCount', 0)},"
-            f"live={video_info.get('liveVideoCandidate', False)},"
-            f"belongsToUser={video_info.get('belongsToUser', False)},"
-            f"premium_json={video_info.get('premiumFromJson', False)},"
-            f"stream_ended={video_info.get('streamEnded', False)},"
-            f"title_name={video_info.get('titleName', '')[:40]}"
+            f"videos={vi.get('videoCount', 0)},"
+            f"srcObj={vi.get('srcObjectCount', 0)},"
+            f"live={vi.get('liveVideoCandidate', False)},"
+            f"belongs={vi.get('belongsToUser', False)},"
+            f"mainActive={vi.get('mainVideoActive', False)},"
+            f"premium={vi.get('premiumFromJson', False)},"
+            f"premiumDom={vi.get('premiumDom', False)},"
+            f"ended={vi.get('streamEnded', False)},"
+            f"name={vi.get('streamerName', '')[:40]}"
         )
 
 def html_escape(text: str) -> str:
@@ -201,8 +203,7 @@ async def load_active_recordings() -> Dict[str, Any]:
     if status != 200:
         raise RuntimeError(f"Failed to load active recordings: HTTP {status} - {data}")
     active_ids = set()
-    recordings = data.get("recordings", [])
-    for rec in recordings:
+    for rec in data.get("recordings", []):
         if rec.get("status") == "recording":
             stream_id = str(rec.get("stream_id", "")).strip()
             if stream_id:
@@ -327,7 +328,6 @@ def normalize_display_name(value):
         "k", "m", "b", "undefined", "super",
         "membre", "member", "user", "guest",
         "membre super", "super membre",
-        "membre superlive", "superlive member",
     }
     if lowered in blocked:
         return None
@@ -383,38 +383,44 @@ def _find_username_in_obj(obj, user_id, depth=0):
     return None
 
 def classify_final(video_info: Dict[str, Any], json_bodies: List[str], user_id: str) -> str:
-    src_object_count = int(video_info.get("srcObjectCount", 0))
     live_video_candidate = bool(video_info.get("liveVideoCandidate", False))
     stream_ended = bool(video_info.get("streamEnded", False))
     belongs_to_user = bool(video_info.get("belongsToUser", False))
     main_video_active = bool(video_info.get("mainVideoActive", False))
+    premium_json = bool(video_info.get("premiumFromJson", False))
+    premium_dom = bool(video_info.get("premiumDom", False))
 
-    is_premium = check_json_for_premium(json_bodies, user_id)
+    is_premium = premium_json or premium_dom
 
-    if stream_ended and not main_video_active:
-        return OFFLINE
-
-    if not live_video_candidate and stream_ended:
-        return OFFLINE
-
-    if not live_video_candidate and not stream_ended:
-        return UNKNOWN
-
-    if live_video_candidate and belongs_to_user and main_video_active:
+    # RULE 1: Main video is active and belongs to user
+    if main_video_active and belongs_to_user:
         if is_premium:
             return LIVE_PREMIUM
         return LIVE_NORMAL
 
+    # RULE 2: Video exists, belongs to user, but main video not confirmed
+    # Still treat as live if video is active and belongs to user
+    if live_video_candidate and belongs_to_user:
+        if is_premium:
+            return LIVE_PREMIUM
+        return LIVE_NORMAL
+
+    # RULE 3: Video exists but does NOT belong to user
+    # These are recommended/suggested streams
     if live_video_candidate and not belongs_to_user:
+        if stream_ended:
+            return OFFLINE
         return UNKNOWN
 
-    if live_video_candidate and belongs_to_user and not main_video_active:
-        return UNKNOWN
+    # RULE 4: No active video at all
+    if not live_video_candidate:
+        return OFFLINE
 
     return UNKNOWN
 
 # ============================================================
-# CRITICAL FIX: PAGE_INFO_JS with STRICT video identification
+# PAGE_INFO_JS — SAME domContainsTargetId AS record_once.py
+# 8 levels deep, checks id/className/data-*/href/descendants
 # ============================================================
 PAGE_INFO_JS = r"""
 (userId) => {
@@ -425,80 +431,46 @@ PAGE_INFO_JS = r"""
     let belongsToUser = false;
     let mainVideoActive = false;
     let streamEnded = false;
-    let titleName = '';
+    let streamerName = '';
+    let premiumDom = false;
 
     // ============================================================
-    // EXTRACT NAME FROM PAGE TITLE (most reliable source)
-    // The page title/og:title always contains the TARGET user's name
-    // regardless of what recommended streams are showing.
+    // DOM CONTAINS TARGET ID — EXACT SAME LOGIC AS record_once.py
+    // 8 levels deep, checks id, className, data-*, href, descendants
     // ============================================================
-    try {
-        const ogTitle = document.querySelector('meta[property="og:title"]');
-        if (ogTitle && ogTitle.content) {
-            titleName = ogTitle.content.trim();
-        }
-    } catch (e) {}
-
-    if (!titleName) {
-        try {
-            titleName = (document.title || '').trim();
-        } catch (e) {}
-    }
-
-    // Clean site name suffix from title
-    if (titleName) {
-        titleName = titleName.replace(/\s*[\|\-\u2013\u2014]\s*(SuperLive|superlivetv|Super Live|Super).*$/i, '').trim();
-        titleName = titleName.replace(/\s*(en direct|live|direct|streaming).*$/i, '').trim();
-    }
-
-    // ============================================================
-    // CHECK STREAM ENDED
-    // ============================================================
-    try {
-        const bodyText = document.body ? document.body.innerText : '';
-        if (bodyText.includes("Le direct s'est termin\u00e9") || bodyText.includes("Stream ended")) {
-            streamEnded = true;
-        }
-    } catch (e) {}
-
-    // ============================================================
-    // STRICT VIDEO IDENTIFICATION
-    //
-    // KEY FIX: We now use a STRICT check that only looks at the
-    // video element itself and its IMMEDIATE container (max 3 levels).
-    // We do NOT traverse 8 levels up which would match the page
-    // header/breadcrumb/URL containing the user ID.
-    //
-    // Additionally, we identify the MAIN video (first/largest) and
-    // check if IT specifically is active and associated with the user.
-    // ============================================================
-    const strictDomContainsTargetId = (element) => {
+    const domContainsTargetId = (element) => {
         if (!userId || !element) return false;
         let node = element;
         let depth = 0;
-        // CRITICAL: Only check 3 levels up (video + immediate container)
-        // NOT 8 levels which would match page header/breadcrumb
-        while (node && depth < 3) {
+        while (node && depth < 8) {
             try {
-                const dataStreamId = node.getAttribute && node.getAttribute("data-stream-id");
-                const dataId = node.getAttribute && node.getAttribute("data-id");
-                const dataLivestreamId = node.getAttribute && node.getAttribute("data-livestream-id");
-                const dataChannelId = node.getAttribute && node.getAttribute("data-channel-id");
-                const dataVideoId = node.getAttribute && node.getAttribute("data-video-id");
-                const href = node.getAttribute && node.getAttribute("href");
-
-                const directValues = [dataStreamId, dataId, dataLivestreamId, dataChannelId, dataVideoId, href];
-                if (directValues.some(value => value != null && String(value).includes(userId))) {
+                const values = [
+                    node.id,
+                    node.className,
+                    node.getAttribute && node.getAttribute("data-stream-id"),
+                    node.getAttribute && node.getAttribute("data-id"),
+                    node.getAttribute && node.getAttribute("data-livestream-id"),
+                    node.getAttribute && node.getAttribute("data-channel-id"),
+                    node.getAttribute && node.getAttribute("data-video-id"),
+                    node.getAttribute && node.getAttribute("href"),
+                ];
+                if (values.some(value => value != null && String(value).includes(userId))) {
                     return true;
                 }
-
-                // Check direct child links (not deep descendants)
-                if (node.querySelectorAll) {
-                    const directLinks = node.querySelectorAll(
-                        'a[href*="/livestream/' + userId + '"], a[href*="/' + userId + '"]'
+                if (node.querySelector) {
+                    const descendants = node.querySelectorAll(
+                        '[href], [data-stream-id], [data-livestream-id], [data-video-id]'
                     );
-                    if (directLinks.length > 0) {
-                        return true;
+                    for (const descendant of descendants) {
+                        const descendantValues = [
+                            descendant.getAttribute && descendant.getAttribute("href"),
+                            descendant.getAttribute && descendant.getAttribute("data-stream-id"),
+                            descendant.getAttribute && descendant.getAttribute("data-livestream-id"),
+                            descendant.getAttribute && descendant.getAttribute("data-video-id"),
+                        ];
+                        if (descendantValues.some(value => value != null && String(value).includes(userId))) {
+                            return true;
+                        }
                     }
                 }
             } catch (e) {}
@@ -509,30 +481,116 @@ PAGE_INFO_JS = r"""
     };
 
     // ============================================================
-    // IDENTIFY THE MAIN VIDEO
-    // The main video is the FIRST video on the page or the LARGEST one.
-    // It's the one that should show the target user's stream.
-    // Recommended videos are usually smaller and appear later.
+    // CHECK STREAM ENDED — ONLY in the main video area
+    // NOT in the entire page body (which always contains it)
     // ============================================================
-    let mainVideo = null;
-    let mainVideoArea = 0;
-
-    for (const video of videos) {
-        const rect = video.getBoundingClientRect();
-        const area = rect.width * rect.height;
-        if (area > mainVideoArea) {
-            mainVideoArea = area;
-            mainVideo = video;
+    try {
+        // Check for ended message ONLY near the main video container
+        // NOT in the full page body
+        if (videos.length > 0) {
+            const mainVideo = videos[0];
+            let container = mainVideo.parentElement;
+            let cDepth = 0;
+            while (container && cDepth < 5) {
+                const text = container.innerText || '';
+                if (text.includes("Le direct s'est termin") || text.includes("Stream ended")) {
+                    streamEnded = true;
+                    break;
+                }
+                container = container.parentElement;
+                cDepth++;
+            }
         }
-    }
-
-    // If no largest found, use the first video
-    if (!mainVideo && videos.length > 0) {
-        mainVideo = videos[0];
-    }
+    } catch (e) {}
 
     // ============================================================
-    // CHECK ALL VIDEOS
+    // CHECK PREMIUM — DOM elements near the main video
+    // ============================================================
+    try {
+        if (videos.length > 0) {
+            const mainVideo = videos[0];
+            let container = mainVideo.parentElement;
+            let pDepth = 0;
+            while (container && pDepth < 5) {
+                const premiumEls = container.querySelectorAll(
+                    '[class*="premium"], [class*="paywall"], [class*="lock"], [class*="subscribe"], [class*="unlock"]'
+                );
+                for (const el of premiumEls) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 50 && rect.height > 50) {
+                        premiumDom = true;
+                        break;
+                    }
+                }
+                if (premiumDom) break;
+                container = container.parentElement;
+                pDepth++;
+            }
+        }
+    } catch (e) {}
+
+    // ============================================================
+    // EXTRACT NAME — from JSON embedded in page + DOM near video
+    // ============================================================
+    try {
+        // Method 1: Look for name in script tags containing JSON
+        const scripts = document.querySelectorAll('script');
+        for (const script of scripts) {
+            const text = script.textContent || '';
+            if (text.includes(userId) && (text.includes('username') || text.includes('nickname') || text.includes('displayName'))) {
+                try {
+                    const nameMatch = text.match(/"(?:username|nickname|displayName|display_name|name)"\s*:\s*"([^"]{2,40})"/);
+                    if (nameMatch && nameMatch[1]) {
+                        const candidate = nameMatch[1].trim();
+                        if (candidate.length >= 2 && candidate !== 'Super' && !candidate.match(/^\d+$/)) {
+                            streamerName = candidate;
+                            break;
+                        }
+                    }
+                } catch (e) {}
+            }
+        }
+
+        // Method 2: Look for name in DOM elements near the main video
+        if (!streamerName && videos.length > 0) {
+            const mainVideo = videos[0];
+            let container = mainVideo.parentElement;
+            let nDepth = 0;
+            while (container && nDepth < 5 && !streamerName) {
+                const nameEls = container.querySelectorAll(
+                    '[class*="name"], [class*="username"], [class*="nickname"], h1, h2, h3, .title'
+                );
+                for (const el of nameEls) {
+                    const text = (el.innerText || '').trim();
+                    if (text.length >= 2 && text.length <= 40 && text !== 'Super') {
+                        const wordCount = text.split(/\s+/).length;
+                        if (wordCount <= 4 && !text.match(/^\d+$/)) {
+                            streamerName = text;
+                            break;
+                        }
+                    }
+                }
+                container = container.parentElement;
+                nDepth++;
+            }
+        }
+
+        // Method 3: og:title / document.title (last resort)
+        if (!streamerName) {
+            const ogTitle = document.querySelector('meta[property="og:title"]');
+            if (ogTitle && ogTitle.content) {
+                let title = ogTitle.content.trim();
+                title = title.replace(/\s*[\|\-\u2013\u2014]\s*(SuperLive|superlivetv|Super Live|Super).*$/i, '').trim();
+                title = title.replace(/\s*(en direct|live|direct|streaming).*$/i, '').trim();
+                if (title.length >= 2 && title.length <= 40 && title !== 'Super') {
+                    streamerName = title;
+                }
+            }
+        }
+    } catch (e) {}
+
+    // ============================================================
+    // CHECK ALL VIDEOS WITH domContainsTargetId (8 levels)
     // ============================================================
     for (const video of videos) {
         if (video.srcObject) {
@@ -545,31 +603,42 @@ PAGE_INFO_JS = r"""
         }
         if (video.srcObject && video.readyState >= 2 && visible) {
             liveVideoCandidate = true;
-
-            // STRICT check: only 3 levels up
-            if (strictDomContainsTargetId(video)) {
+            if (domContainsTargetId(video)) {
                 belongsToUser = true;
             }
         }
     }
 
     // ============================================================
-    // CHECK IF THE MAIN VIDEO IS ACTIVE AND BELONGS TO USER
-    // This is the critical check that prevents recording
-    // recommended streams.
+    // CHECK MAIN VIDEO (largest/first)
     // ============================================================
+    let mainVideo = null;
+    let mainVideoArea = 0;
+    for (const video of videos) {
+        const rect = video.getBoundingClientRect();
+        const area = rect.width * rect.height;
+        if (area > mainVideoArea) {
+            mainVideoArea = area;
+            mainVideo = video;
+        }
+    }
+    if (!mainVideo && videos.length > 0) {
+        mainVideo = videos[0];
+    }
+
     if (mainVideo) {
         const mainHasSrcObject = !!mainVideo.srcObject;
-        const mainIsVisible = mainVideo.getBoundingClientRect().width > 100;
+        const mainRect = mainVideo.getBoundingClientRect();
+        const mainIsVisible = mainRect.width > 100 && mainRect.height > 100;
         const mainIsReady = mainVideo.readyState >= 2;
-        const mainBelongs = strictDomContainsTargetId(mainVideo);
+        const mainBelongs = domContainsTargetId(mainVideo);
 
         if (mainHasSrcObject && mainIsVisible && mainIsReady && mainBelongs) {
             mainVideoActive = true;
         }
 
-        // If the main video has NO srcObject but other videos do,
-        // those other videos are likely recommended streams.
+        // If main video has NO srcObject but other videos do,
+        // those other videos are likely recommended streams
         if (!mainHasSrcObject && srcObjectCount > 0) {
             belongsToUser = false;
             mainVideoActive = false;
@@ -577,16 +646,13 @@ PAGE_INFO_JS = r"""
     }
 
     // ============================================================
-    // FINAL SAFETY CHECK:
-    // If there are more than 2 videos with srcObject, and the main
-    // video doesn't clearly belong to the user, mark as uncertain.
+    // CRITICAL: Override streamEnded if main video IS active
+    // The "ended" text appears on ALL pages, not just offline ones
     // ============================================================
-    if (srcObjectCount > 2 && !mainVideoActive) {
-        belongsToUser = false;
-    }
-
-    // Override streamEnded if main video is actually active
     if (streamEnded && mainVideoActive) {
+        streamEnded = false;
+    }
+    if (streamEnded && belongsToUser && liveVideoCandidate) {
         streamEnded = false;
     }
 
@@ -598,7 +664,8 @@ PAGE_INFO_JS = r"""
         belongsToUser,
         mainVideoActive,
         streamEnded,
-        titleName
+        streamerName,
+        premiumDom
     };
 }
 """
@@ -612,7 +679,8 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
         video_info = {
             "videoCount": 0, "srcObjectCount": 0, "visibleCount": 0,
             "liveVideoCandidate": False, "belongsToUser": False,
-            "mainVideoActive": False, "streamEnded": False, "titleName": "",
+            "mainVideoActive": False, "streamEnded": False,
+            "streamerName": "", "premiumDom": False,
         }
 
         async def on_response(response):
@@ -645,7 +713,8 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
                 video_info = {
                     "videoCount": 0, "srcObjectCount": 0, "visibleCount": 0,
                     "liveVideoCandidate": False, "belongsToUser": False,
-                    "mainVideoActive": False, "streamEnded": False, "titleName": "",
+                    "mainVideoActive": False, "streamEnded": False,
+                    "streamerName": "", "premiumDom": False,
                 }
 
             if not video_info.get("liveVideoCandidate") and video_info.get("srcObjectCount", 0) == 0:
@@ -666,30 +735,24 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
 
         await page.close()
 
+        video_info["premiumFromJson"] = check_json_for_premium(json_bodies, user_id)
         final_status = classify_final(video_info, json_bodies, user_id)
 
-        # ============================================================
-        # NAME EXTRACTION - PRIORITY ORDER:
-        # 1. JSON API responses (most reliable, tied to user_id)
-        # 2. Page title / og:title (always shows target user's name)
-        # 3. Only if belongsToUser AND mainVideoActive, use DOM
-        # ============================================================
+        # Name extraction priority:
+        # 1. JSON API (most reliable)
+        # 2. DOM/page extraction (from PAGE_INFO_JS)
         display_name = None
 
-        # Priority 1: JSON API
         json_name = extract_name_from_json(json_bodies, user_id)
         if json_name:
             display_name = json_name
 
-        # Priority 2: Page title (only if no JSON name found)
         if not display_name:
-            title_name = video_info.get("titleName", "")
-            if title_name:
-                normalized_title = normalize_display_name(title_name)
-                if normalized_title:
-                    display_name = normalized_title
-
-        video_info["premiumFromJson"] = check_json_for_premium(json_bodies, user_id)
+            dom_name = video_info.get("streamerName", "")
+            if dom_name:
+                normalized = normalize_display_name(dom_name)
+                if normalized:
+                    display_name = normalized
 
         result = {
             "status": final_status,
@@ -697,6 +760,7 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
                       f"belongs={video_info.get('belongsToUser')},"
                       f"mainActive={video_info.get('mainVideoActive')},"
                       f"premium_json={video_info.get('premiumFromJson')},"
+                      f"premium_dom={video_info.get('premiumDom')},"
                       f"ended={video_info.get('streamEnded')}",
             "stream_url": url,
             "display_name": display_name,
