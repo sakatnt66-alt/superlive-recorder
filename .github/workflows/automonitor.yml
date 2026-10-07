@@ -1,0 +1,77 @@
+name: Auto Monitor
+
+on:
+  schedule:
+    - cron: "*/3 * * * *"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [auto_monitor]
+
+concurrency:
+  group: automonitor
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PLAYWRIGHT_BROWSERS_PATH: ~/.cache/ms-playwright
+
+jobs:
+  auto-monitor:
+    name: Smart Auto Monitor
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-automonitor-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          pip install playwright
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-chromium-120
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install Playwright Chromium
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Run Auto Monitor
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          AUTO_API_TOKEN: ${{ secrets.AUTO_API_TOKEN }}
+          MAX_CONCURRENT: "5"
+          USE_PLAYWRIGHT: "1"
+          HTTP_CONCURRENCY: "8"
+          PLAYWRIGHT_CONCURRENCY: "2"
+          PLAYWRIGHT_MAX_USERS_PER_CYCLE: "12"
+        run: |
+          echo "[AUTO] Starting Auto Monitor workflow"
+          python auto_monitor.py
+          echo "[AUTO] Auto Monitor workflow finished"
