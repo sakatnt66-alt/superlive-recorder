@@ -1,0 +1,54 @@
+name: Deploy Worker to Cloudflare
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'worker.js'
+      - 'wrangler.toml'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy Cloudflare Worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Wrangler
+        run: npm install -g wrangler
+
+      - name: Verify KV Namespace ID is set
+        run: |
+          if grep -q "YOUR_KV_NAMESPACE_ID_HERE" wrangler.toml; then
+            echo "ERROR: wrangler.toml still contains placeholder KV ID"
+            exit 1
+          fi
+          echo "KV Namespace ID is configured"
+
+      - name: Deploy Worker
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          echo "Deploying worker..."
+          wrangler deploy
+          echo "Worker deployed successfully"
+
+      - name: Verify Cron Triggers
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          echo "Checking deployed triggers..."
+          wrangler deployments list || true
+          echo "Deploy completed. Check Cloudflare Dashboard > Workers > Triggers to confirm cron is active."
