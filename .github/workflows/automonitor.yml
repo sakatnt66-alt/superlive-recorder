@@ -1,8 +1,6 @@
 name: Auto Monitor
 
 on:
-  schedule:
-    - cron: "*/3 * * * *"
   workflow_dispatch:
   repository_dispatch:
     types: [auto_monitor]
@@ -69,6 +67,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SEND_REPORT: "1"
+          UPDATE_WATCHLIST_NAMES: "1"
+          NAME_MIN_SCORE: "50"
           MAX_CONCURRENT: "5"
           USE_PLAYWRIGHT: "1"
           HTTP_CONCURRENCY: "8"
