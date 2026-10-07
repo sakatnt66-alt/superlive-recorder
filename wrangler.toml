@@ -1,0 +1,19 @@
+name = "superlive-recorder"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# ============================================================
+# KV NAMESPACE
+# استبدل القيمة أدناه بمعرف الـ KV namespace الخاص بك
+# تجده في: Cloudflare Dashboard → Workers & Pages → KV
+# ============================================================
+[[kv_namespaces]]
+binding = "SUPERLIVE_STATE"
+id = "64750a5f7887455e88305120e1fc651f"
+
+# ============================================================
+# CRON TRIGGER - AUTO MONITOR EVERY 3 MINUTES
+# هذا هو الجزء الذي يُفعّل الـ scheduled() handler
+# ============================================================
+[triggers]
+crons = ["*/3 * * * *"]
