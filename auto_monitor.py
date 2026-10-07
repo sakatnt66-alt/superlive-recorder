@@ -27,7 +27,8 @@ API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "20"))
 USE_PLAYWRIGHT = os.environ.get("USE_PLAYWRIGHT", "1") not in ("0", "false", "False")
 HTTP_CONCURRENCY = int(os.environ.get("HTTP_CONCURRENCY", "8"))
 PLAYWRIGHT_CONCURRENCY = int(os.environ.get("PLAYWRIGHT_CONCURRENCY", "2"))
-PLAYWRIGHT_WAIT_MS = int(os.environ.get("PLAYWRIGHT_WAIT_MS", "5000"))
+PLAYWRIGHT_WAIT_MS = int(os.environ.get("PLAYWRIGHT_WAIT_MS", "8000"))
+PLAYWRIGHT_RETRY_WAIT_MS = int(os.environ.get("PLAYWRIGHT_RETRY_WAIT_MS", "4000"))
 PAGE_TIMEOUT_MS = int(os.environ.get("PAGE_TIMEOUT_MS", "25000"))
 PLAYWRIGHT_MAX_USERS_PER_CYCLE = int(os.environ.get("PLAYWRIGHT_MAX_USERS_PER_CYCLE", "12"))
 
@@ -74,8 +75,19 @@ def log_detection(user_id: str, result: Dict[str, Any], source: str) -> None:
     log(f"status={status}")
     log(f"action={action}")
     log(f"reason={reason}")
+
     if result.get("display_name"):
         log(f"display_name={result['display_name']}")
+
+    video_info = result.get("video_info")
+    if video_info:
+        log(
+            f"video_state="
+            f"count={video_info.get('videoCount', 0)},"
+            f"srcObj={video_info.get('srcObjectCount', 0)},"
+            f"visible={video_info.get('visibleCount', 0)},"
+            f"liveCandidate={video_info.get('liveVideoCandidate', False)}"
+        )
 
 # ============================================================
 # TELEGRAM REPORT
@@ -99,7 +111,6 @@ def split_telegram_text(text: str, limit: int = 3900) -> List[str]:
             if current:
                 chunks.append(current)
                 current = ""
-
             for i in range(0, len(line), limit):
                 chunks.append(line[i:i + limit])
             continue
@@ -184,7 +195,7 @@ def build_report(elapsed_seconds: float, stats: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 # ============================================================
-# DISPLAY NAME EXTRACTION
+# DISPLAY NAME EXTRACTION — HARDENED FILTERS
 # ============================================================
 NAME_KEY_SCORES = {
     "username": 100,
@@ -209,6 +220,13 @@ NAME_KEY_SCORES = {
 
 
 def normalize_display_name(value):
+    """
+    Validate and normalize a candidate display name.
+
+    Returns None when the value is clearly NOT a username,
+    e.g. counters like '0 2,9 k', '0 510', '0 228 k',
+    pure numbers, viewer counts, etc.
+    """
     if value is None:
         return None
 
@@ -217,25 +235,52 @@ def normalize_display_name(value):
     s = re.sub(r"<[^>]+>", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
 
-    if len(s) < 2 or len(s) > 60:
+    # Reject too short or too long
+    if len(s) < 3 or len(s) > 60:
         return None
 
+    # Reject pure numbers
     if s.isdigit():
         return None
 
+    # ============================================================
+    # COUNTER / STATS REJECTION FILTERS
+    # ============================================================
+
+    # Reject anything starting with a digit: "0 2,9 k", "510", "3.4M"
+    if re.search(r"^\d", s):
+        return None
+
+    # Reject counter-like patterns: "2,9 k", "228 k", "1.2K", "3.4 M"
+    if re.search(r"\d+[.,\s]?\d*\s*[kKmM]\b", s, re.IGNORECASE):
+        return None
+
+    # Reject pure numeric/symbol strings: "0-9", "12.5", "100%"
+    if re.search(r"^[0-9.,\s\-+%]+$", s):
+        return None
+
+    # Reject strings containing only digits with separators
+    if re.search(r"^[\d.,\s]+$", s):
+        return None
+
+    # ============================================================
+    # LETTER REQUIREMENT
+    # ============================================================
+
+    # Must contain at least one letter (Latin or Arabic)
+    if not re.search(r"[\u0600-\u06FFa-zA-Z]", s):
+        return None
+
+    # ============================================================
+    # BLOCKED GENERIC WORDS
+    # ============================================================
     lowered = s.lower()
     blocked = {
-        "live",
-        "offline",
-        "premium",
-        "superlive",
-        "super live",
-        "recording",
-        "unknown",
-        "none",
-        "null",
-        "video",
-        "stream",
+        "live", "offline", "premium", "superlive", "super live",
+        "recording", "unknown", "none", "null", "video", "stream",
+        "views", "viewers", "followers", "fans", "likes",
+        "watching", "subscribe", "follow", "following",
+        "k", "m", "b",
     }
 
     if lowered in blocked:
@@ -253,13 +298,8 @@ def dict_contains_user_id(data, user_id):
             if str(value) == str(user_id):
                 k = str(key).lower()
                 if any(token in k for token in (
-                    "id",
-                    "user",
-                    "stream",
-                    "channel",
-                    "broadcaster",
-                    "author",
-                    "owner",
+                    "id", "user", "stream", "channel",
+                    "broadcaster", "author", "owner",
                 )):
                     return True
 
@@ -278,11 +318,8 @@ def scan_json_for_names(obj, user_id, candidates, depth=0, associated=False):
 
             if isinstance(value, (dict, list)):
                 scan_json_for_names(
-                    value,
-                    user_id,
-                    candidates,
-                    depth + 1,
-                    current_associated,
+                    value, user_id, candidates,
+                    depth + 1, current_associated,
                 )
             else:
                 base_score = NAME_KEY_SCORES.get(key_norm)
@@ -302,26 +339,17 @@ def scan_json_for_names(obj, user_id, candidates, depth=0, associated=False):
 
     elif isinstance(obj, list):
         for item in obj[:200]:
-            scan_json_for_names(
-                item,
-                user_id,
-                candidates,
-                depth + 1,
-                associated,
-            )
+            scan_json_for_names(item, user_id, candidates, depth + 1, associated)
 
 
 def extract_json_name_candidates(user_id, json_bodies):
     candidates = []
-
     for body in json_bodies[:20]:
         try:
             obj = json.loads(body)
         except Exception:
             continue
-
         scan_json_for_names(obj, user_id, candidates)
-
     return candidates
 
 
@@ -335,7 +363,6 @@ def choose_display_name(candidates):
 
         score = int(candidate.get("score", 0) or 0)
         source = str(candidate.get("source", ""))
-
         key = name.lower()
 
         if key not in dedup or score > dedup[key]["score"]:
@@ -354,11 +381,12 @@ def choose_display_name(candidates):
 
 def extract_display_name_from_html(raw, user_id):
     candidates = []
-
     if not raw:
         return candidates
 
-    title_match = re.search(r"<title[^>]*>(.*?)</title>", raw, re.IGNORECASE | re.DOTALL)
+    title_match = re.search(
+        r"<title[^>]*>(.*?)</title>", raw, re.IGNORECASE | re.DOTALL
+    )
     if title_match:
         title = re.sub(r"<[^>]+>", " ", title_match.group(1))
         candidates.append({
@@ -369,8 +397,7 @@ def extract_display_name_from_html(raw, user_id):
 
     og_match = re.search(
         r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
-        raw,
-        re.IGNORECASE,
+        raw, re.IGNORECASE,
     )
     if og_match:
         candidates.append({
@@ -381,8 +408,7 @@ def extract_display_name_from_html(raw, user_id):
 
     twitter_match = re.search(
         r'<meta[^>]+name=["\']twitter:title["\'][^>]+content=["\']([^"\']+)',
-        raw,
-        re.IGNORECASE,
+        raw, re.IGNORECASE,
     )
     if twitter_match:
         candidates.append({
@@ -406,7 +432,6 @@ async def update_watchlist_name(user_id: str, display_name: str):
         if status == 200:
             log(f"Saved display name for {user_id}: {display_name}")
         elif status == 404:
-            # User not in watchlist or endpoint missing.
             pass
         else:
             log(f"Name save warning for {user_id}: HTTP {status}")
@@ -520,7 +545,10 @@ async def trigger_auto_recording(user_id: str, stream_url: str, stream_name: str
 # SIGNAL PATTERNS
 # ============================================================
 def compile_patterns(patterns):
-    return [(re.compile(pattern, re.IGNORECASE), weight, label) for pattern, weight, label in patterns]
+    return [
+        (re.compile(pattern, re.IGNORECASE), weight, label)
+        for pattern, weight, label in patterns
+    ]
 
 
 STRONG_LIVE_PATTERNS = [
@@ -534,7 +562,7 @@ MEDIUM_LIVE_PATTERNS = [
     (r'"(?:hasLive|has_live|liveEnabled|canRecord)"\s*:\s*true', 40, "json_live_medium"),
     (r'"liveVideoCandidate"\s*:\s*true', 40, "player_video_candidate"),
     (r'class="[^"]*\blive\b', 15, "html_class_live"),
-    (r"\ben direct\b", 8, "text_fr_live"),
+    (r"\ben direct\b", 30, "text_fr_live"),
 ]
 
 STRONG_PREMIUM_PATTERNS = [
@@ -551,7 +579,7 @@ WEAK_PREMIUM_PATTERNS = [
 STRONG_OFFLINE_PATTERNS = [
     (r'"(?:isLive|is_live|live|streaming|is_streaming)"\s*:\s*false', 100, "json_live_false"),
     (r'"(?:status|state|streamStatus|liveStatus|stream_status|live_status)"\s*:\s*"?(?:offline|ended|finished|completed|inactive|stopped)"?', 100, "json_status_offline"),
-    (r"le direct s'est terminé", 100, "text_fr_ended"),
+    (r"le direct s'est terminé", 60, "text_fr_ended"),
     (r'"offline"\s*:\s*true', 80, "json_offline_true"),
 ]
 
@@ -592,6 +620,12 @@ def score_text(text: str):
 
 
 def decide_scores(live_score: int, premium_score: int, offline_score: int) -> str:
+    """
+    Text-only classification (used for HTTP fallback).
+
+    This is intentionally conservative because HTTP responses
+    often contain CAPTCHA pages or ambiguous content.
+    """
     if premium_score >= 100 and live_score >= 20:
         return LIVE_PREMIUM
 
@@ -604,6 +638,88 @@ def decide_scores(live_score: int, premium_score: int, offline_score: int) -> st
     return UNKNOWN
 
 
+def classify_with_video_signal(video_info: Dict[str, Any], text_analysis: Dict[str, Any]) -> str:
+    """
+    Final classification that prioritizes actual video player state
+    over generic text signals.
+
+    An active <video> element with srcObject is the strongest
+    possible evidence of a live stream. Text-based 'ended' messages
+    from other page elements must never override a real active video
+    player.
+
+    Classification hierarchy:
+      1. Active video player  →  LIVE (unless premium)
+      2. Strong JSON live     →  LIVE (unless premium)
+      3. Weak live + ended    →  UNKNOWN (ambiguous)
+      4. No live signals      →  OFFLINE
+    """
+    video_count = int(video_info.get("videoCount", 0) or 0)
+    src_object_count = int(video_info.get("srcObjectCount", 0) or 0)
+    visible_count = int(video_info.get("visibleCount", 0) or 0)
+    live_video_candidate = bool(video_info.get("liveVideoCandidate", False))
+
+    # An active video player exists on the page
+    has_active_video = (
+        video_count > 0
+        and src_object_count > 0
+        and (live_video_candidate or visible_count > 0)
+    )
+
+    scores = text_analysis.get("scores", {})
+    live_score = int(scores.get("live", 0))
+    premium_score = int(scores.get("premium", 0))
+    offline_score = int(scores.get("offline", 0))
+
+    # ============================================================
+    # PRIORITY 1: Active video player = LIVE
+    #
+    # A real <video> element with srcObject and visible/playing
+    # state is the strongest possible evidence. Text messages
+    # like "Le direct s'est terminé" from recommended streams
+    # or old page elements must NOT override this signal.
+    # ============================================================
+    if has_active_video:
+        if premium_score >= 100:
+            return LIVE_PREMIUM
+        return LIVE_NORMAL
+
+    # ============================================================
+    # PRIORITY 2: No active video. Use text/JSON signals.
+    # ============================================================
+
+    # Strong JSON live signal without video
+    # (video may not have loaded yet, but API confirms live)
+    if live_score >= 100:
+        if premium_score >= 100:
+            return LIVE_PREMIUM
+        return LIVE_NORMAL
+
+    # Premium detected with some live signal
+    if premium_score >= 100 and live_score >= 20:
+        return LIVE_PREMIUM
+
+    # ============================================================
+    # PRIORITY 3: Ambiguous — weak live signal + offline signal
+    #
+    # This is the key fix for the false OFFLINE problem.
+    # If there is ANY live signal (even weak), we do NOT
+    # classify as OFFLINE. Instead, we return UNKNOWN so the
+    # system retries next cycle instead of missing a real stream.
+    # ============================================================
+    if live_score > 0 and offline_score >= 60:
+        return UNKNOWN
+
+    # Clear offline: no live signal at all
+    if offline_score >= 60 and live_score == 0:
+        return OFFLINE
+
+    return UNKNOWN
+
+
+# ============================================================
+# TEXT ANALYSIS
+# ============================================================
 def extract_segments(text: str, user_id: str, window: int = 3500, max_segments: int = 10) -> List[str]:
     if not text or not user_id:
         return []
@@ -678,7 +794,10 @@ def analyze_texts(texts: List[str], user_id: str) -> Dict[str, Any]:
 
 def is_captcha_page(text: str) -> bool:
     lowered = text.lower()
-    return ("recaptcha" in lowered or "cf-challenge" in lowered) and len(text) < 30000
+    return (
+        ("recaptcha" in lowered or "cf-challenge" in lowered)
+        and len(text) < 30000
+    )
 
 # ============================================================
 # HTTP DETECTION
@@ -777,8 +896,25 @@ PAGE_NAME_EXTRACT_JS = r"""
   const add = (value, source, score) => {
     const v = clean(value);
     if (!v) return;
-    if (v.length < 2 || v.length > 60) return;
+
+    // Length filters
+    if (v.length < 3 || v.length > 60) return;
+
+    // Reject pure numbers
     if (/^\d+$/.test(v)) return;
+
+    // Reject strings starting with digits (counters, stats)
+    if (/^\d/.test(v)) return;
+
+    // Reject counter-like patterns: "2,9 k", "228 k", "1.2K"
+    if (/\d+[.,\s]?\d*\s*[kKmM]\b/.test(v)) return;
+
+    // Reject pure numeric/symbol strings
+    if (/^[0-9.,\s\-+%]+$/.test(v)) return;
+
+    // Must contain at least one letter
+    if (!/[a-zA-Z\u0600-\u06FF]/.test(v)) return;
+
     candidates.push({ value: v, source, score });
   };
 
@@ -843,6 +979,38 @@ PAGE_NAME_EXTRACT_JS = r"""
 }
 """
 
+VIDEO_INFO_JS = """
+() => {
+    const videos = Array.from(document.querySelectorAll('video'));
+    let srcObjectCount = 0;
+    let visibleCount = 0;
+    let liveVideoCandidate = false;
+
+    for (const video of videos) {
+        if (video.srcObject) {
+            srcObjectCount++;
+        }
+
+        const rect = video.getBoundingClientRect();
+        const visible = rect.width > 50 && rect.height > 50;
+        if (visible) {
+            visibleCount++;
+        }
+
+        if (video.srcObject && video.readyState >= 2 && visible) {
+            liveVideoCandidate = true;
+        }
+    }
+
+    return {
+        videoCount: videos.length,
+        srcObjectCount,
+        visibleCount,
+        liveVideoCandidate
+    };
+}
+"""
+
 
 async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Semaphore) -> Dict[str, Any]:
     async with semaphore:
@@ -851,6 +1019,12 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
         json_bodies: List[str] = []
         json_count = 0
         url = BASE_LIVE_URL.format(user_id=user_id)
+        video_info = {
+            "videoCount": 0,
+            "srcObjectCount": 0,
+            "visibleCount": 0,
+            "liveVideoCandidate": False,
+        }
 
         async def on_response(response):
             nonlocal json_count
@@ -886,44 +1060,17 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
                 html = ""
 
             try:
-                body_text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+                body_text = await page.evaluate(
+                    "() => document.body ? document.body.innerText : ''"
+                )
             except Exception:
                 body_text = ""
 
+            # ============================================================
+            # VIDEO STATE DETECTION (with retry)
+            # ============================================================
             try:
-                video_info = await page.evaluate(
-                    """
-                    () => {
-                        const videos = Array.from(document.querySelectorAll('video'));
-                        let srcObjectCount = 0;
-                        let visibleCount = 0;
-                        let liveVideoCandidate = false;
-
-                        for (const video of videos) {
-                            if (video.srcObject) {
-                                srcObjectCount++;
-                            }
-
-                            const rect = video.getBoundingClientRect();
-                            const visible = rect.width > 50 && rect.height > 50;
-                            if (visible) {
-                                visibleCount++;
-                            }
-
-                            if (video.srcObject && video.readyState >= 2 && visible) {
-                                liveVideoCandidate = true;
-                            }
-                        }
-
-                        return {
-                            videoCount: videos.length,
-                            srcObjectCount,
-                            visibleCount,
-                            liveVideoCandidate
-                        };
-                    }
-                    """
-                )
+                video_info = await page.evaluate(VIDEO_INFO_JS)
             except Exception:
                 video_info = {
                     "videoCount": 0,
@@ -932,6 +1079,16 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
                     "liveVideoCandidate": False,
                 }
 
+            # If no active video found on first check, wait and retry once.
+            # The page may need extra time to initialize the WebRTC player.
+            if not video_info.get("liveVideoCandidate") and video_info.get("srcObjectCount", 0) == 0:
+                await page.wait_for_timeout(PLAYWRIGHT_RETRY_WAIT_MS)
+                try:
+                    video_info = await page.evaluate(VIDEO_INFO_JS)
+                except Exception:
+                    pass
+
+            # DOM name extraction
             try:
                 dom_name_candidates = await page.evaluate(PAGE_NAME_EXTRACT_JS, user_id)
                 if not isinstance(dom_name_candidates, list):
@@ -969,7 +1126,20 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
 
         result = analyze_texts(texts, user_id)
         result["stream_url"] = url
+        result["video_info"] = video_info
 
+        # ============================================================
+        # CRITICAL: Use video-aware classification
+        #
+        # This replaces the old text-only decide_scores() with a
+        # classifier that prioritizes the actual video player state.
+        # An active <video> element overrides misleading text like
+        # "Le direct s'est terminé" from recommended streams.
+        # ============================================================
+        final_status = classify_with_video_signal(video_info, result)
+        result["status"] = final_status
+
+        # Name extraction
         json_name_candidates = extract_json_name_candidates(user_id, json_bodies)
         all_name_candidates = json_name_candidates + dom_name_candidates
 
@@ -1028,7 +1198,10 @@ async def playwright_classify_many(user_ids: List[str]) -> Dict[str, Dict[str, A
             )
 
             semaphore = asyncio.Semaphore(PLAYWRIGHT_CONCURRENCY)
-            tasks = [playwright_classify_user(context, user_id, semaphore) for user_id in user_ids]
+            tasks = [
+                playwright_classify_user(context, user_id, semaphore)
+                for user_id in user_ids
+            ]
             gathered = await asyncio.gather(*tasks, return_exceptions=True)
 
             for user_id, result in zip(user_ids, gathered):
