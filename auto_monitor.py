@@ -364,7 +364,7 @@ def normalize_display_name(value):
         "recording", "unknown", "none", "null", "video", "stream",
         "views", "viewers", "followers", "fans", "likes",
         "watching", "subscribe", "follow", "following",
-        "k", "m", "b", "undefined",
+        "k", "m", "b", "undefined", "super",
     }
     if lowered in blocked:
         return None
@@ -393,7 +393,7 @@ def classify_final(video_info: Dict[str, Any], json_bodies: List[str], user_id: 
     return UNKNOWN
 
 # ============================================================
-# PLAYWRIGHT DETECTION
+# PLAYWRIGHT DETECTION - MULTI-SOURCE NAME EXTRACTION
 # ============================================================
 PAGE_INFO_JS = r"""
 (userId) => {
@@ -404,18 +404,141 @@ PAGE_INFO_JS = r"""
     let streamEnded = false;
     let streamerName = '';
 
+    // ============================================================
+    // EXTRACT STREAMER NAME FROM MULTIPLE SOURCES
+    // Priority: og:title > document.title > h1 > h2 > DOM elements
+    // Skip generic names like "Super", "SuperLive", "Live"
+    // ============================================================
+    const isGenericName = (name) => {
+        if (!name) return true;
+        const lowered = name.toLowerCase().trim();
+        const generic = [
+            'super', 'superlive', 'super live', 'superlivetv',
+            'live', 'direct', 'en direct', 'stream', 'video',
+            'recording', 'watching', 'watch', 'play', 'player',
+            'home', 'search', 'explore', 'trending',
+        ];
+        return generic.includes(lowered);
+    };
+
+    const cleanName = (raw) => {
+        if (!raw) return '';
+        let name = String(raw).trim();
+        // Remove site name suffix: "Name | SuperLive" or "Name - SuperLive"
+        name = name.replace(/\s*[\|\-\u2013\u2014]\s*(SuperLive|superlivetv|Super Live|Super).*$/i, '');
+        // Remove "en direct" / "live" suffix
+        name = name.replace(/\s*(en direct|live|direct|streaming).*$/i, '');
+        name = name.trim();
+        if (name.length < 2 || name.length > 60) return '';
+        if (isGenericName(name)) return '';
+        return name;
+    };
+
+    // Source 1: og:title
     try {
         const ogTitle = document.querySelector('meta[property="og:title"]');
         if (ogTitle && ogTitle.content) {
-            let title = ogTitle.content.trim();
-            title = title.replace(/\s*[\|\-\u2013\u2014]\s*(SuperLive|superlivetv|Super Live).*$/i, '');
-            title = title.replace(/\s*(en direct|live|direct).*$/i, '');
-            if (title.length >= 2 && title.length <= 60) {
-                streamerName = title.trim();
-            }
+            const cleaned = cleanName(ogTitle.content);
+            if (cleaned) streamerName = cleaned;
         }
     } catch (e) {}
 
+    // Source 2: document.title
+    if (!streamerName) {
+        try {
+            const cleaned = cleanName(document.title || '');
+            if (cleaned) streamerName = cleaned;
+        } catch (e) {}
+    }
+
+    // Source 3: h1 element
+    if (!streamerName) {
+        try {
+            const h1 = document.querySelector('h1');
+            if (h1 && h1.innerText) {
+                const cleaned = cleanName(h1.innerText);
+                if (cleaned) streamerName = cleaned;
+            }
+        } catch (e) {}
+    }
+
+    // Source 4: h2 elements
+    if (!streamerName) {
+        try {
+            const h2s = document.querySelectorAll('h2');
+            for (const h2 of h2s) {
+                if (h2 && h2.innerText) {
+                    const cleaned = cleanName(h2.innerText);
+                    if (cleaned) {
+                        streamerName = cleaned;
+                        break;
+                    }
+                }
+            }
+        } catch (e) {}
+    }
+
+    // Source 5: DOM elements with username/streamer-name classes
+    if (!streamerName) {
+        try {
+            const selectors = [
+                '[class*="username"]',
+                '[class*="streamer-name"]',
+                '[class*="streamer_name"]',
+                '[class*="profile-name"]',
+                '[class*="profile_name"]',
+                '[class*="user-name"]',
+                '[class*="user_name"]',
+                '[class*="nickname"]',
+                '[class*="nick-name"]',
+                '[class*="broadcaster-name"]',
+                '[class*="broadcaster_name"]',
+                '[class*="channel-name"]',
+                '[class*="channel_name"]',
+                '[data-testid*="username"]',
+                '[data-testid*="streamer"]',
+                '[data-testid*="nickname"]',
+            ];
+            for (const sel of selectors) {
+                try {
+                    const el = document.querySelector(sel);
+                    if (el && el.innerText) {
+                        const cleaned = cleanName(el.innerText);
+                        if (cleaned) {
+                            streamerName = cleaned;
+                            break;
+                        }
+                    }
+                } catch (e) {}
+            }
+        } catch (e) {}
+    }
+
+    // Source 6: Look for name near the video player area
+    if (!streamerName) {
+        try {
+            const videoParent = videos.length > 0 ? videos[0].closest('div[class]') : null;
+            if (videoParent) {
+                const container = videoParent.parentElement;
+                if (container) {
+                    const textEls = container.querySelectorAll('span, div, p, a');
+                    for (const el of textEls) {
+                        if (el.innerText && el.innerText.length >= 2 && el.innerText.length <= 60) {
+                            const cleaned = cleanName(el.innerText);
+                            if (cleaned && !isGenericName(cleaned)) {
+                                streamerName = cleaned;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e) {}
+    }
+
+    // ============================================================
+    // CHECK STREAM ENDED
+    // ============================================================
     try {
         const bodyText = document.body ? document.body.innerText : '';
         if (bodyText.includes("Le direct s'est termin\u00e9") || bodyText.includes("Stream ended")) {
@@ -423,6 +546,9 @@ PAGE_INFO_JS = r"""
         }
     } catch (e) {}
 
+    // ============================================================
+    // CHECK VIDEO ELEMENTS
+    // ============================================================
     for (const video of videos) {
         if (video.srcObject) {
             srcObjectCount++;
@@ -437,6 +563,7 @@ PAGE_INFO_JS = r"""
         }
     }
 
+    // If there's an active video, stream is NOT ended
     if (streamEnded && srcObjectCount > 0 && liveVideoCandidate) {
         streamEnded = false;
     }
