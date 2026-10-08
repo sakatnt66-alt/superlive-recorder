@@ -40,12 +40,11 @@
     },
     {
       "stream_id": "33018909",
-      "stream_url": "https://superlivetv.com/fr/profile/33018909",
-      "stream_name": "Super",
-      "status": "stopped",
-      "started_at": "2026-10-08T21:37:04.963Z",
-      "source": "auto",
-      "stopped_at": "2026-10-08T21:39:06.589Z"
+      "stream_url": "https://superlivetv.com/fr/rizlani6479?isFromSearch=true",
+      "stream_name": "🇲🇦🦌غزلان فرنسي🦌",
+      "status": "recording",
+      "started_at": "2026-10-08T22:58:02.218Z",
+      "source": "auto"
     }
   ]
 }
