@@ -6,5 +6,10 @@ compatibility_date = "2024-01-01"
 binding = "SUPERLIVE_STATE"
 id = "64750a5f7887455e88305120e1fc651f"
 
+[vars]
+TELEGRAM_CHAT_ID = "8648567642"
+GITHUB_REPO = "sakatnt66-alt/superlive-recorder"
+
+# كل 3 دقائق - آمن تماماً مع Single-Key Architecture
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/3 * * * *"]
