@@ -1,16 +1,6 @@
 {
   "recordings": [
     {
-      "stream_id": "21421785",
-      "stream_url": "https://superlivetv.com/fr/profile/19868298?isFromSearch=true",
-      "stream_name": "نجلاء💎🎀",
-      "status": "recording",
-      "started_at": "2026-10-08T21:17:45.703Z",
-      "source": "auto",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
-    },
-    {
       "stream_id": "24353293",
       "stream_url": "https://superlivetv.com/fr/profile/24353293",
       "stream_name": "Super",
