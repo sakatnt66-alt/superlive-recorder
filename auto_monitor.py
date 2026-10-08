@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-auto_monitor.py - Version 5.1 (Pass Phase 1 username to Phase 2)
+auto_monitor.py - Version 5.2 (Correct Recording URL)
 
-Changes in v5.1:
-- Pass display_name from Phase 1 to check_live_status (Phase 2)
-  This ensures usernames discovered during search are preserved
-  even if Phase 2 page extraction fails.
+CRITICAL FIX in v5.2:
+- Always use BASE_LIVE_URL (/fr/livestream/{user_id}) for recording
+- record_once.py ONLY works with this URL pattern
+- Do NOT use stream_url or profile_url from discovery layer
 """
 
 import asyncio
@@ -171,9 +171,6 @@ async def process_user(discovery, uid, names, sem):
             r.update({"status": DISCOVERY_FAILED, "reason": "no_discovery", "phase": "init"})
             return r
 
-        # =============================================
-        # PHASE 1: IDENTITY RESOLUTION
-        # =============================================
         try:
             log(f"[Phase 1] Resolving {uid}")
             info = await discovery.discover_profile_id(uid)
@@ -189,30 +186,26 @@ async def process_user(discovery, uid, names, sem):
             r.update({"status": DISCOVERY_FAILED, "reason": f"p1:{str(e)[:60]}", "phase": "p1_error"})
             return r
 
-        # =============================================
-        # PHASE 2: LIVE STATUS DETECTION
-        # FIXED: Pass display_name from Phase 1 to Phase 2
-        # =============================================
         try:
             log(f"[Phase 2] Check live at {r['profile_url']}")
             live = await discovery.check_live_status(
                 r["profile_url"],
                 uid,
                 r.get("profile_id", ""),
-                r.get("display_name")  # Pass Phase 1 username to Phase 2
+                r.get("display_name")
             )
             if not live:
                 r.update({"status": UNKNOWN, "reason": "check_failed", "phase": "p2_failed"})
                 return r
-            # Update display_name if Phase 2 found a better one
-            if live.get("username") and not r.get("display_name"):
-                r["display_name"] = live["username"]
+            if live.get("username") and not r.get("display_name"): r["display_name"] = live["username"]
             if not live.get("is_live"):
                 r.update({"status": OFFLINE, "reason": "no_live", "action": "SKIP_OFFLINE", "phase": "p2_offline"})
                 return r
             if live.get("is_premium"):
                 r.update({"status": LIVE_PREMIUM, "reason": "premium", "action": "SKIP_PREMIUM", "phase": "p2_premium"})
                 return r
+            # For LIVE_NORMAL, we only need to know it's live.
+            # The actual recording URL will be BASE_LIVE_URL (set in main_async).
             r.update({"status": LIVE_NORMAL, "reason": "live", "action": "CANDIDATE",
                       "stream_url": live.get("stream_url") or r["profile_url"], "phase": "p2_live"})
             log(f"[Phase 2] LIVE OK")
@@ -220,9 +213,6 @@ async def process_user(discovery, uid, names, sem):
             r.update({"status": UNKNOWN, "reason": f"p2:{str(e)[:60]}", "phase": "p2_error"})
             return r
 
-        # =============================================
-        # PHASE 3: STREAM VALIDATION
-        # =============================================
         try:
             validation = await discovery.validate_stream(uid, r.get("profile_id", uid), r.get("stream_url", ""))
             if not validation.get("validation_passed"):
@@ -256,7 +246,7 @@ async def main_async():
              "live_normal": 0, "live_premium": 0, "offline": 0, "unknown": 0,
              "discovery_failed": 0, "started_recordings": 0, "names": {}, "profile_map": {}}
 
-    log("Starting Auto Monitor v5.1 (Pass Phase 1 username to Phase 2)")
+    log("Starting Auto Monitor v5.2 (Correct Recording URL)")
     if not DISCOVERY_AVAILABLE: log("FATAL: no discovery module"); return 1
     if not WORKER_URL: log("FATAL: no WORKER_URL"); return 1
 
@@ -308,9 +298,16 @@ async def main_async():
             r = results.get(uid)
             if not r or r.get("status") != LIVE_NORMAL: continue
             if uid in active["active_ids"] or slots <= 0: continue
-            url = r.get("stream_url") or BASE_LIVE_URL.format(user_id=uid)
+
+            # ================================================================
+            # CRITICAL FIX: record_once.py ONLY works with /fr/livestream/{user_id}
+            # Do NOT use stream_url (might be .m3u8 or profile/slug URL)
+            # Always construct the canonical livestream URL for recording
+            # ================================================================
+            url = BASE_LIVE_URL.format(user_id=uid)
+
             name = r.get("display_name") or stats["names"].get(uid, "")
-            log(f"START_RECORDING {uid}")
+            log(f"START_RECORDING {uid} -> {url}")
             ok, reason = await trigger_recording(uid, url, name, r.get("profile_id", ""))
             if ok:
                 stats["started_recordings"] += 1
