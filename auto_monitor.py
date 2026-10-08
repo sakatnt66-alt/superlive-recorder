@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-auto_monitor.py - Version 5.2 (Correct Recording URL)
+auto_monitor.py - Version 5.3 (Use Real Stream ID)
 
-CRITICAL FIX in v5.2:
-- Always use BASE_LIVE_URL (/fr/livestream/{user_id}) for recording
-- record_once.py ONLY works with this URL pattern
-- Do NOT use stream_url or profile_url from discovery layer
+CRITICAL FIX in v5.3:
+- Use REAL stream_id from Phase 2 (extracted from API or video URL)
+- NOT user_id from watchlist
+- user_id != stream_id on this website!
+- record_once.py needs: /fr/livestream/{stream_id}
 """
 
 import asyncio
@@ -34,7 +35,8 @@ MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "5"))
 API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "20"))
 DISCOVERY_CONCURRENCY = int(os.environ.get("DISCOVERY_CONCURRENCY", "2"))
 
-BASE_LIVE_URL = "https://superlivetv.com/fr/livestream/{user_id}"
+# Base URL uses {stream_id} NOT {user_id}!
+BASE_LIVE_URL = "https://superlivetv.com/fr/livestream/{stream_id}"
 
 LIVE_NORMAL = "LIVE_NORMAL"
 LIVE_PREMIUM = "LIVE_PREMIUM"
@@ -51,6 +53,7 @@ def log_result(uid, r):
     log(f"source=discovery_layer")
     if r.get("profile_url"): log(f"profile_url={r['profile_url']}")
     if r.get("profile_id"): log(f"profile_id={r['profile_id']}")
+    if r.get("stream_id"): log(f"stream_id={r['stream_id']}")
     if r.get("display_name"): log(f"display_name={r['display_name']}")
     log(f"phase={r.get('phase', 'unknown')}")
     log(f"status={r.get('status', UNKNOWN)}")
@@ -103,8 +106,8 @@ def build_report(elapsed, stats):
     if names:
         lines.append(""); lines.append("👤 الأسماء:")
         for uid, name in names.items():
-            pid = stats.get("profile_map", {}).get(uid, "?")
-            lines.append(f"• {uid} [P:{pid}] -> {html_escape(name)}")
+            sid = stats.get("stream_id_map", {}).get(uid, "?")
+            lines.append(f"• {uid} [S:{sid}] -> {html_escape(name)}")
     return "\n".join(lines)
 
 
@@ -149,9 +152,10 @@ async def load_active_recordings():
     return {"active_count": len(ids), "max_concurrent": MAX_CONCURRENT, "active_ids": ids}
 
 
-async def trigger_recording(uid, url, name="", pid=""):
+async def trigger_recording(uid, url, name="", stream_id="", profile_id=""):
     status, data = await api(f"/api/auto-trigger/{uid}", "POST",
-                             {"stream_url": url, "source": "auto", "stream_name": name, "profile_id": pid, "user_id": uid})
+                             {"stream_url": url, "source": "auto", "stream_name": name,
+                              "stream_id": stream_id, "profile_id": profile_id, "user_id": uid})
     if status == 200 and data.get("started"): return True, "started"
     return False, data.get("error", f"http_{status}")
 
@@ -164,6 +168,7 @@ async def update_name(uid, name):
 async def process_user(discovery, uid, names, sem):
     async with sem:
         r = {"user_id": uid, "profile_url": None, "profile_id": None,
+             "stream_id": None,  # NEW: real stream_id
              "display_name": names.get(uid), "stream_url": None,
              "status": UNKNOWN, "reason": "", "action": "SKIP", "phase": "none"}
 
@@ -197,6 +202,11 @@ async def process_user(discovery, uid, names, sem):
             if not live:
                 r.update({"status": UNKNOWN, "reason": "check_failed", "phase": "p2_failed"})
                 return r
+
+            # Extract real stream_id from Phase 2
+            r["stream_id"] = live.get("stream_id") or uid
+            log(f"[Phase 2] stream_id={r['stream_id']} (user_id={uid})")
+
             if live.get("username") and not r.get("display_name"): r["display_name"] = live["username"]
             if not live.get("is_live"):
                 r.update({"status": OFFLINE, "reason": "no_live", "action": "SKIP_OFFLINE", "phase": "p2_offline"})
@@ -204,8 +214,6 @@ async def process_user(discovery, uid, names, sem):
             if live.get("is_premium"):
                 r.update({"status": LIVE_PREMIUM, "reason": "premium", "action": "SKIP_PREMIUM", "phase": "p2_premium"})
                 return r
-            # For LIVE_NORMAL, we only need to know it's live.
-            # The actual recording URL will be BASE_LIVE_URL (set in main_async).
             r.update({"status": LIVE_NORMAL, "reason": "live", "action": "CANDIDATE",
                       "stream_url": live.get("stream_url") or r["profile_url"], "phase": "p2_live"})
             log(f"[Phase 2] LIVE OK")
@@ -244,9 +252,10 @@ async def main_async():
     t0 = time.monotonic()
     stats = {"total_watchlist": 0, "already_recording": 0, "checked_now": 0,
              "live_normal": 0, "live_premium": 0, "offline": 0, "unknown": 0,
-             "discovery_failed": 0, "started_recordings": 0, "names": {}, "profile_map": {}}
+             "discovery_failed": 0, "started_recordings": 0,
+             "names": {}, "stream_id_map": {}}  # NEW: track stream_ids
 
-    log("Starting Auto Monitor v5.2 (Correct Recording URL)")
+    log("Starting Auto Monitor v5.3 (Use Real Stream ID)")
     if not DISCOVERY_AVAILABLE: log("FATAL: no discovery module"); return 1
     if not WORKER_URL: log("FATAL: no WORKER_URL"); return 1
 
@@ -284,7 +293,8 @@ async def main_async():
             elif s == OFFLINE: stats["offline"] += 1
             elif s == DISCOVERY_FAILED: stats["discovery_failed"] += 1
             else: stats["unknown"] += 1
-            if r.get("profile_id"): stats["profile_map"][uid] = r["profile_id"]
+            # Track stream_id for reporting
+            if r.get("stream_id"): stats["stream_id_map"][uid] = r["stream_id"]
             name = r.get("display_name")
             if name: stats["names"][uid] = name
             if UPDATE_WATCHLIST_NAMES and name: await update_name(uid, name)
@@ -300,15 +310,16 @@ async def main_async():
             if uid in active["active_ids"] or slots <= 0: continue
 
             # ================================================================
-            # CRITICAL FIX: record_once.py ONLY works with /fr/livestream/{user_id}
-            # Do NOT use stream_url (might be .m3u8 or profile/slug URL)
-            # Always construct the canonical livestream URL for recording
+            # CRITICAL: Use REAL stream_id, NOT user_id
+            # record_once.py needs: /fr/livestream/{stream_id}
+            # stream_id is extracted from API or video URL in Phase 2
             # ================================================================
-            url = BASE_LIVE_URL.format(user_id=uid)
+            stream_id = r.get("stream_id") or uid
+            url = BASE_LIVE_URL.format(stream_id=stream_id)
 
             name = r.get("display_name") or stats["names"].get(uid, "")
-            log(f"START_RECORDING {uid} -> {url}")
-            ok, reason = await trigger_recording(uid, url, name, r.get("profile_id", ""))
+            log(f"START_RECORDING {uid} (stream_id={stream_id}) -> {url}")
+            ok, reason = await trigger_recording(uid, url, name, stream_id, r.get("profile_id", ""))
             if ok:
                 stats["started_recordings"] += 1
                 slots -= 1
