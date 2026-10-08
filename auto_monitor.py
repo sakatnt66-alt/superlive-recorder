@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-auto_monitor.py - Version 5.0 (Single-Key KV)
-Uses new Worker API that stores watchlist/recordings in single keys.
+auto_monitor.py - Version 5.1 (Pass Phase 1 username to Phase 2)
+
+Changes in v5.1:
+- Pass display_name from Phase 1 to check_live_status (Phase 2)
+  This ensures usernames discovered during search are preserved
+  even if Phase 2 page extraction fails.
 """
 
 import asyncio
@@ -167,6 +171,9 @@ async def process_user(discovery, uid, names, sem):
             r.update({"status": DISCOVERY_FAILED, "reason": "no_discovery", "phase": "init"})
             return r
 
+        # =============================================
+        # PHASE 1: IDENTITY RESOLUTION
+        # =============================================
         try:
             log(f"[Phase 1] Resolving {uid}")
             info = await discovery.discover_profile_id(uid)
@@ -182,13 +189,24 @@ async def process_user(discovery, uid, names, sem):
             r.update({"status": DISCOVERY_FAILED, "reason": f"p1:{str(e)[:60]}", "phase": "p1_error"})
             return r
 
+        # =============================================
+        # PHASE 2: LIVE STATUS DETECTION
+        # FIXED: Pass display_name from Phase 1 to Phase 2
+        # =============================================
         try:
             log(f"[Phase 2] Check live at {r['profile_url']}")
-            live = await discovery.check_live_status(r["profile_url"], uid, r.get("profile_id", ""))
+            live = await discovery.check_live_status(
+                r["profile_url"],
+                uid,
+                r.get("profile_id", ""),
+                r.get("display_name")  # Pass Phase 1 username to Phase 2
+            )
             if not live:
                 r.update({"status": UNKNOWN, "reason": "check_failed", "phase": "p2_failed"})
                 return r
-            if live.get("username") and not r.get("display_name"): r["display_name"] = live["username"]
+            # Update display_name if Phase 2 found a better one
+            if live.get("username") and not r.get("display_name"):
+                r["display_name"] = live["username"]
             if not live.get("is_live"):
                 r.update({"status": OFFLINE, "reason": "no_live", "action": "SKIP_OFFLINE", "phase": "p2_offline"})
                 return r
@@ -202,6 +220,9 @@ async def process_user(discovery, uid, names, sem):
             r.update({"status": UNKNOWN, "reason": f"p2:{str(e)[:60]}", "phase": "p2_error"})
             return r
 
+        # =============================================
+        # PHASE 3: STREAM VALIDATION
+        # =============================================
         try:
             validation = await discovery.validate_stream(uid, r.get("profile_id", uid), r.get("stream_url", ""))
             if not validation.get("validation_passed"):
@@ -235,7 +256,7 @@ async def main_async():
              "live_normal": 0, "live_premium": 0, "offline": 0, "unknown": 0,
              "discovery_failed": 0, "started_recordings": 0, "names": {}, "profile_map": {}}
 
-    log("Starting Auto Monitor v5.0 (Single-Key KV)")
+    log("Starting Auto Monitor v5.1 (Pass Phase 1 username to Phase 2)")
     if not DISCOVERY_AVAILABLE: log("FATAL: no discovery module"); return 1
     if not WORKER_URL: log("FATAL: no WORKER_URL"); return 1
 
