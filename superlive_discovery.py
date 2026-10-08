@@ -1,14 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-SuperLive Discovery Module - Version 9.2 (Premium + 404 Fix)
+SuperLive Discovery Module - Version 9.3 (VIDEO IS KING - Final Fix)
 
-CRITICAL FIXES in v9.2:
-1. Premium detection ONLY counts is_premium when is_live=true in SAME object
-   - Before: found is_premium anywhere in API → all users PREMIUM
-   - After: is_premium must be in same object as is_live=true
-2. Detect "Page introuvable" (404 pages) and mark as OFFLINE
-3. Reject /fr/followings and /fr/nonlogin-messages URLs
-4. Use username from Phase 1 when Phase 2 extraction fails
+CRITICAL INSIGHT:
+- API 'is_premium' means "user has premium account", NOT "this stream is premium"
+- A premium user can have FREE public streams
+- The ONLY reliable way to detect premium streams:
+  * Normal stream: video element ACTIVE (has src with .m3u8/.mpd)
+  * Premium stream: video element INACTIVE + lock/paywall banner visible
+
+RULES:
+1. If is_live=True + video ACTIVE → LIVE_NORMAL (always)
+2. If is_live=True + video INACTIVE + lock icon visible → LIVE_PREMIUM
+3. If is_live=True + video INACTIVE + no lock → OFFLINE (false positive)
+4. API is_premium field is IGNORED (unreliable)
 """
 
 import asyncio
@@ -36,32 +41,25 @@ class SuperLiveDiscovery:
         "Chrome/131.0.0.0 Safari/537.36"
     )
 
-    # System pages to reject
     SYSTEM_PAGES_EXACT = {
         "discover", "explore", "trending", "popular", "categories",
         "search", "login", "register", "signup", "signin", "logout",
         "about", "contact", "terms", "privacy", "help", "support",
         "faq", "blog", "news", "home",
-        # User-internal pages
         "followings", "followers", "messages", "notifications",
         "settings", "favorites", "history", "downloads", "uploads",
         "wallet", "coins", "recharge", "payment", "subscription",
         "profile-edit", "edit-profile", "account",
-        # ADDED: Login-required pages
         "nonlogin-messages", "nonlogin-notifications",
     }
 
-    # Bad usernames to filter out
     BAD_USERNAMES = {
         "nom d'utilisateur", "nom dutilisateur", "username",
         "super", "super live", "superlive", "super member",
         "membre super", "membre", "member", "user", "guest",
         "live", "offline", "premium", "direct", "en direct",
         "undefined", "null", "none", "video", "stream",
-        "suivis",  # French for "followings"
-        "page introuvable",  # 404 page
-        "page not found",
-        "404",
+        "suivis", "page introuvable", "page not found", "404",
     }
 
     def __init__(self):
@@ -71,24 +69,14 @@ class SuperLiveDiscovery:
     def log(self, message: str) -> None:
         print(f"[Discovery] {message}", flush=True)
 
-    # ============================================================
-    # URL VALIDATOR
-    # ============================================================
     def _is_valid_profile_url(self, url: str, user_id: str = "") -> bool:
         if not url:
             return False
-
         url_path = url.split("?")[0].split("#")[0]
-
-        # Accept /profile/{numeric_id}
         if re.search(r"/profile/\d+", url_path):
             return True
-
-        # Accept /livestream/{numeric_id}
         if re.search(r"/livestream/\d+", url_path):
             return True
-
-        # Check /fr/{slug}
         slug_match = re.match(r".*/fr/([^/]+)/?$", url_path)
         if slug_match:
             slug = slug_match.group(1).lower()
@@ -97,8 +85,6 @@ class SuperLiveDiscovery:
                 return False
             if re.match(r"^[a-zA-Z0-9_]{2,50}$", slug):
                 return True
-
-        # Last segment
         last_slug_match = re.match(r".*/([^/]+)/?$", url_path)
         if last_slug_match:
             slug = last_slug_match.group(1).lower()
@@ -109,72 +95,42 @@ class SuperLiveDiscovery:
                 return False
             if re.match(r"^[a-zA-Z0-9_]{2,50}$", slug):
                 return True
-
         if user_id and user_id in url:
             return True
-
         self.log(f"Rejected unknown URL: {url}")
         return False
 
-    # ============================================================
-    # USERNAME CLEANER
-    # ============================================================
     def _clean_username(self, raw: str) -> Optional[str]:
         if not raw:
             return None
-
-        # Remove @username pattern from end
         raw = re.sub(r'\s*\(@[a-zA-Z0-9_]+\)\s*$', '', raw)
         raw = re.sub(r'\s*@[a-zA-Z0-9_]+\s*$', '', raw)
-
         lines = [line.strip() for line in raw.split("\n") if line.strip()]
         if not lines:
             return None
-
         valid_lines = []
         for line in lines:
-            if re.match(r"^\d+$", line):
-                continue
-            if re.match(r"^@[a-zA-Z0-9_]+$", line):
-                continue
-            if len(line) < 2:
-                continue
-            if len(line) > 80:
-                continue
-            if re.match(r"^\d{1,2}$", line):
-                continue
-
+            if re.match(r"^\d+$", line): continue
+            if re.match(r"^@[a-zA-Z0-9_]+$", line): continue
+            if len(line) < 2 or len(line) > 80: continue
+            if re.match(r"^\d{1,2}$", line): continue
             lower = line.lower().strip()
-            if lower in self.BAD_USERNAMES:
-                continue
-            if re.match(r"^super\s*\d*$", lower):
-                continue
-            if lower.startswith("nom d"):
-                continue
-
+            if lower in self.BAD_USERNAMES: continue
+            if re.match(r"^super\s*\d*$", lower): continue
+            if lower.startswith("nom d"): continue
             valid_lines.append(line)
-
         if not valid_lines:
             return None
-
         name = valid_lines[0]
         name = re.sub(r"^\d{1,3}\s*", "", name)
         name = re.sub(r'\s*\(@[a-zA-Z0-9_]+\)\s*$', '', name)
         name = re.sub(r'\s*@[a-zA-Z0-9_]+\s*$', '', name)
         name = name.strip()
-
-        if len(name) < 2 or len(name) > 60:
-            return None
-        if re.match(r"^\d+$", name):
-            return None
-        if name.lower() in self.BAD_USERNAMES:
-            return None
-
+        if len(name) < 2 or len(name) > 60: return None
+        if re.match(r"^\d+$", name): return None
+        if name.lower() in self.BAD_USERNAMES: return None
         return name
 
-    # ============================================================
-    # PHASE 1: IDENTITY RESOLUTION
-    # ============================================================
     async def discover_profile_id(self, user_id: str) -> Optional[Dict[str, Any]]:
         current_time = time.time()
         if user_id in self.profile_cache:
@@ -184,50 +140,41 @@ class SuperLiveDiscovery:
                 return self.profile_cache[user_id]
             else:
                 self.log(f"[Cache] Expired for user_id: {user_id}")
-
         self.log(f"Starting identity resolution for user_id: {user_id}")
-
         if not PLAYWRIGHT_AVAILABLE:
             return self._fallback(user_id)
 
-        # Method A: Search page
         result = await self._method_a_search(user_id)
         if result and result.get("profile_url") and self._is_valid_profile_url(result["profile_url"], user_id):
             if result.get("username"):
                 result["username"] = self._clean_username(result["username"])
             self.profile_cache[user_id] = result
             self.cache_timestamps[user_id] = current_time
-            self.log(f"✓ Method A: {result['profile_url']}, username={result.get('username')}")
+            self.log(f"Method A OK: {result['profile_url']}, username={result.get('username')}")
             return result
 
-        # Method B: Direct profile page
         result = await self._method_b_direct(user_id)
         if result and result.get("profile_url") and self._is_valid_profile_url(result["profile_url"], user_id):
             if result.get("username"):
                 result["username"] = self._clean_username(result["username"])
             self.profile_cache[user_id] = result
             self.cache_timestamps[user_id] = current_time
-            self.log(f"✓ Method B: {result['profile_url']}")
+            self.log(f"Method B OK: {result['profile_url']}")
             return result
 
-        # Method C: Livestream page
         result = await self._method_c_livestream(user_id)
         if result and result.get("profile_url") and self._is_valid_profile_url(result["profile_url"], user_id):
             if result.get("username"):
                 result["username"] = self._clean_username(result["username"])
             self.profile_cache[user_id] = result
             self.cache_timestamps[user_id] = current_time
-            self.log(f"✓ Method C: {result['profile_url']}")
+            self.log(f"Method C OK: {result['profile_url']}")
             return result
 
-        # Method D: Fallback
         result = self._fallback(user_id)
-        self.log(f"⚠ Method D (fallback): {result['profile_url']}")
+        self.log(f"Fallback (uncertain): {result['profile_url']}")
         return result
 
-    # ============================================================
-    # METHOD A: Search page
-    # ============================================================
     async def _method_a_search(self, user_id: str) -> Optional[Dict[str, Any]]:
         try:
             async with async_playwright() as p:
@@ -241,7 +188,6 @@ class SuperLiveDiscovery:
                     locale="fr-FR"
                 )
                 page = await context.new_page()
-
                 api_responses = []
 
                 async def on_response(response):
@@ -251,35 +197,27 @@ class SuperLiveDiscovery:
                             try:
                                 body = await response.json()
                                 api_responses.append({"url": response.url, "body": body})
-                            except:
-                                pass
-                    except:
-                        pass
+                            except: pass
+                    except: pass
 
                 page.on("response", on_response)
-
                 search_url = f"{self.BASE_URL}/fr/search?q={user_id}"
                 self.log(f"Method A: {search_url}")
-
                 await page.goto(search_url, timeout=self.PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
                 await page.wait_for_timeout(self.SEARCH_WAIT_MS)
 
-                # 1. Try API responses
                 result = self._search_api_for_profile(api_responses, user_id)
                 if result and result.get("profile_url"):
                     await browser.close()
                     result["method"] = "method_a_api"
                     return result
 
-                # 2. Try DOM extraction
                 result = await self._search_dom_for_profile(page, user_id)
                 await browser.close()
                 if result and result.get("profile_url"):
                     result["method"] = "method_a_dom"
                     return result
-
                 return None
-
         except Exception as e:
             self.log(f"Method A error: {e}")
             return None
@@ -287,8 +225,7 @@ class SuperLiveDiscovery:
     def _search_api_for_profile(self, responses: List[Dict], user_id: str) -> Optional[Dict[str, Any]]:
         for resp in responses:
             body = resp.get("body")
-            if not body:
-                continue
+            if not body: continue
             profile_data = self._find_profile_in_obj(body, user_id, depth=0)
             if profile_data:
                 profile_url = profile_data.get("profile_url")
@@ -298,8 +235,7 @@ class SuperLiveDiscovery:
                         profile_url = f"{self.BASE_URL}/fr/profile/{pid}"
                 if profile_url and self._is_valid_profile_url(profile_url, user_id):
                     username = profile_data.get("username")
-                    if username:
-                        username = self._clean_username(username)
+                    if username: username = self._clean_username(username)
                     return {
                         "profile_url": profile_url,
                         "profile_id": profile_data.get("profile_id"),
@@ -309,9 +245,7 @@ class SuperLiveDiscovery:
         return None
 
     def _find_profile_in_obj(self, obj: Any, user_id: str, depth: int) -> Optional[Dict]:
-        if depth > 10:
-            return None
-
+        if depth > 10: return None
         if isinstance(obj, dict):
             has_uid = False
             for k, v in obj.items():
@@ -320,7 +254,6 @@ class SuperLiveDiscovery:
                     if any(t in kl for t in ("id", "user", "uid")):
                         has_uid = True
                         break
-
             if has_uid:
                 result = {"profile_id": None, "profile_url": None, "username": None}
                 for k, v in obj.items():
@@ -335,17 +268,13 @@ class SuperLiveDiscovery:
                             result["username"] = v.strip()
                 if result["profile_id"] or result["profile_url"]:
                     return result
-
             for v in obj.values():
                 r = self._find_profile_in_obj(v, user_id, depth + 1)
-                if r:
-                    return r
-
+                if r: return r
         elif isinstance(obj, list):
             for item in obj[:100]:
                 r = self._find_profile_in_obj(item, user_id, depth + 1)
-                if r:
-                    return r
+                if r: return r
         return None
 
     async def _search_dom_for_profile(self, page, user_id: str) -> Optional[Dict[str, Any]]:
@@ -359,27 +288,20 @@ class SuperLiveDiscovery:
                     'popular','followings','followers','messages','notifications',
                     'settings','categories','home','nonlogin-messages'
                 ];
-                
                 for (const link of links) {
                     const href = link.getAttribute('href');
                     if (!href) continue;
-                    
                     let contextText = '';
                     let node = link;
                     for (let i = 0; i < 5; i++) {
                         if (node && node.innerText) {
                             contextText = node.innerText + ' ' + contextText;
                         }
-                        if (node && node.parentElement) {
-                            node = node.parentElement;
-                        } else {
-                            break;
-                        }
+                        if (node && node.parentElement) { node = node.parentElement; }
+                        else { break; }
                     }
-                    
                     const profileMatch = href.match(/\\/profile\\/(\\d+)/);
                     const slugMatch = href.match(/\\/fr\\/([a-zA-Z0-9_]+)/);
-                    
                     if (profileMatch || (slugMatch && !systemSlugs.includes(slugMatch[1]))) {
                         const hasUserId = contextText.includes(userId);
                         results.push({
@@ -390,148 +312,88 @@ class SuperLiveDiscovery:
                         });
                     }
                 }
-                
                 results.sort((a, b) => {
                     if (a.hasUserId !== b.hasUserId) return a.hasUserId ? -1 : 1;
                     if (a.isProfile !== b.isProfile) return a.isProfile ? -1 : 1;
                     return 0;
                 });
-                
                 return results[0] || null;
             }
             """
-
             result = await page.evaluate(js_code, user_id)
-
             if result and result.get("href"):
                 href = result["href"]
-                if href.startswith("/"):
-                    href = f"{self.BASE_URL}{href}"
-
+                if href.startswith("/"): href = f"{self.BASE_URL}{href}"
                 if not self._is_valid_profile_url(href, user_id):
                     self.log(f"DOM found invalid URL: {href}")
                     return None
-
                 profile_id = None
                 id_match = re.search(r"/profile/(\d+)", href)
-                if id_match:
-                    profile_id = id_match.group(1)
-
+                if id_match: profile_id = id_match.group(1)
                 username = result.get("text", "").strip()
                 if username:
                     username = self._clean_username(username)
                     if not username or len(username) < 2 or len(username) > 100:
                         username = None
-
                 return {
                     "profile_url": href,
                     "profile_id": profile_id,
                     "username": username,
                     "source": "dom"
                 }
-
-            # Fallback: scan raw HTML
             content = await page.content()
-
             pattern = rf'{user_id}.{{0,500}}?/profile/(\d+)'
             match = re.search(pattern, content, re.DOTALL)
             if match:
                 href = f"{self.BASE_URL}/fr/profile/{match.group(1)}"
                 if self._is_valid_profile_url(href, user_id):
-                    return {
-                        "profile_url": href,
-                        "profile_id": match.group(1),
-                        "username": None,
-                        "source": "html"
-                    }
-
+                    return {"profile_url": href, "profile_id": match.group(1), "username": None, "source": "html"}
             pattern = rf'/profile/(\d+).{{0,500}}?{user_id}'
             match = re.search(pattern, content, re.DOTALL)
             if match:
                 href = f"{self.BASE_URL}/fr/profile/{match.group(1)}"
                 if self._is_valid_profile_url(href, user_id):
-                    return {
-                        "profile_url": href,
-                        "profile_id": match.group(1),
-                        "username": None,
-                        "source": "html"
-                    }
-
+                    return {"profile_url": href, "profile_id": match.group(1), "username": None, "source": "html"}
         except Exception as e:
             self.log(f"DOM search error: {e}")
         return None
 
-    # ============================================================
-    # METHOD B: Direct profile page
-    # ============================================================
     async def _method_b_direct(self, user_id: str) -> Optional[Dict[str, Any]]:
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-dev-shm-usage"]
-                )
-                context = await browser.new_context(
-                    user_agent=self.USER_AGENT,
-                    viewport={"width": 1280, "height": 800},
-                    locale="fr-FR"
-                )
+                browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+                context = await browser.new_context(user_agent=self.USER_AGENT, viewport={"width": 1280, "height": 800}, locale="fr-FR")
                 page = await context.new_page()
-
                 url = f"{self.BASE_URL}/profile/{user_id}"
                 self.log(f"Method B: {url}")
-
                 await page.goto(url, timeout=self.PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
                 await page.wait_for_timeout(self.SEARCH_WAIT_MS)
-
                 final_url = page.url
                 self.log(f"Method B final URL: {final_url}")
-
                 if not self._is_valid_profile_url(final_url, user_id):
                     self.log(f"Method B rejected: {final_url}")
                     await browser.close()
                     return None
-
                 profile_id = None
                 id_match = re.search(r"/profile/(\d+)", final_url)
-                if id_match:
-                    profile_id = id_match.group(1)
-
+                if id_match: profile_id = id_match.group(1)
                 username = await self._extract_username_from_page(page)
-                if username:
-                    username = self._clean_username(username)
-
+                if username: username = self._clean_username(username)
                 await browser.close()
-
                 return {
-                    "profile_url": final_url,
-                    "profile_id": profile_id or user_id,
-                    "username": username,
-                    "method": "method_b",
-                    "source": "direct"
+                    "profile_url": final_url, "profile_id": profile_id or user_id,
+                    "username": username, "method": "method_b", "source": "direct"
                 }
-
         except Exception as e:
             self.log(f"Method B error: {e}")
             return None
 
-    # ============================================================
-    # METHOD C: Livestream page
-    # ============================================================
     async def _method_c_livestream(self, user_id: str) -> Optional[Dict[str, Any]]:
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-dev-shm-usage"]
-                )
-                context = await browser.new_context(
-                    user_agent=self.USER_AGENT,
-                    viewport={"width": 1280, "height": 800},
-                    locale="fr-FR"
-                )
+                browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+                context = await browser.new_context(user_agent=self.USER_AGENT, viewport={"width": 1280, "height": 800}, locale="fr-FR")
                 page = await context.new_page()
-
                 api_responses = []
 
                 async def on_response(response):
@@ -541,73 +403,41 @@ class SuperLiveDiscovery:
                             try:
                                 body = await response.json()
                                 api_responses.append({"url": response.url, "body": body})
-                            except:
-                                pass
-                    except:
-                        pass
+                            except: pass
+                    except: pass
 
                 page.on("response", on_response)
-
                 url = f"{self.BASE_URL}/fr/livestream/{user_id}"
                 self.log(f"Method C: {url}")
-
                 await page.goto(url, timeout=self.PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
                 await page.wait_for_timeout(self.SEARCH_WAIT_MS)
-
                 result = self._search_api_for_profile(api_responses, user_id)
                 await browser.close()
-
                 if result and result.get("profile_url"):
                     result["method"] = "method_c"
                     return result
-
-                return {
-                    "profile_url": url,
-                    "profile_id": user_id,
-                    "username": None,
-                    "method": "method_c_fallback",
-                    "source": "livestream_url"
-                }
-
+                return {"profile_url": url, "profile_id": user_id, "username": None, "method": "method_c_fallback", "source": "livestream_url"}
         except Exception as e:
             self.log(f"Method C error: {e}")
             return None
 
     def _fallback(self, user_id: str) -> Dict[str, Any]:
-        return {
-            "profile_url": f"{self.BASE_URL}/fr/livestream/{user_id}",
-            "profile_id": user_id,
-            "username": None,
-            "method": "method_d",
-            "source": "fallback",
-            "uncertain": True
-        }
+        return {"profile_url": f"{self.BASE_URL}/fr/livestream/{user_id}", "profile_id": user_id,
+                "username": None, "method": "method_d", "source": "fallback", "uncertain": True}
 
     # ============================================================
-    # PHASE 2: LIVE STATUS DETECTION
+    # PHASE 2: LIVE STATUS DETECTION - VIDEO IS KING
     # ============================================================
-    async def check_live_status(
-        self, profile_url: str, user_id: str = "", profile_id: str = "",
-        phase1_username: str = None
-    ) -> Optional[Dict[str, Any]]:
+    async def check_live_status(self, profile_url: str, user_id: str = "", profile_id: str = "",
+                                phase1_username: str = None) -> Optional[Dict[str, Any]]:
         self.log(f"Phase 2: Checking live at {profile_url}")
-
-        if not PLAYWRIGHT_AVAILABLE:
-            return None
+        if not PLAYWRIGHT_AVAILABLE: return None
 
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
-                )
-                context = await browser.new_context(
-                    user_agent=self.USER_AGENT,
-                    viewport={"width": 1280, "height": 800},
-                    locale="fr-FR"
-                )
+                browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+                context = await browser.new_context(user_agent=self.USER_AGENT, viewport={"width": 1280, "height": 800}, locale="fr-FR")
                 page = await context.new_page()
-
                 api_responses = []
 
                 async def on_response(response):
@@ -617,46 +447,120 @@ class SuperLiveDiscovery:
                             try:
                                 body = await response.json()
                                 api_responses.append({"url": response.url, "body": body})
-                            except:
-                                pass
-                    except:
-                        pass
+                            except: pass
+                    except: pass
 
                 page.on("response", on_response)
-
                 await page.goto(profile_url, timeout=self.PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
                 await page.wait_for_timeout(self.VERIFY_WAIT_MS)
 
-                # Get page content
                 page_text = ""
                 try:
                     page_text = await page.locator("body").inner_text()
-                except:
-                    pass
+                except: pass
 
-                # ADDED: Check for 404 / "Page introuvable"
+                # Check for 404
                 page_lower = page_text.lower()
                 if "page introuvable" in page_lower or "page not found" in page_lower:
-                    self.log(f"Page shows 404 error - marking as OFFLINE")
+                    self.log(f"Page shows 404 error - OFFLINE")
                     await browser.close()
-                    return {
-                        "is_live": False,
-                        "reason": "page_not_found_404",
-                        "source": "validation"
-                    }
+                    return {"is_live": False, "reason": "page_not_found_404", "source": "validation"}
 
-                # Check API responses
+                # ============================================
+                # STEP 1: Check video element (MOST IMPORTANT)
+                # ============================================
+                has_active_video = False
+                video_stream_url = None
+                try:
+                    videos = await page.locator("video").all()
+                    for video in videos:
+                        try:
+                            src = await video.get_attribute("src")
+                            if src and any(ext in src for ext in [".m3u8", ".mpd", "rtmp"]):
+                                has_active_video = True
+                                video_stream_url = src
+                                self.log(f"Found active video src: {src[:80]}...")
+                                break
+                            # Check source elements
+                            sources = await video.locator("source").all()
+                            for source in sources:
+                                src = await source.get_attribute("src")
+                                if src and any(ext in src for ext in [".m3u8", ".mpd", "rtmp"]):
+                                    has_active_video = True
+                                    video_stream_url = src
+                                    self.log(f"Found active video source: {src[:80]}...")
+                                    break
+                            if has_active_video:
+                                break
+                            # Check readyState (>= 2 means video loaded enough to play)
+                            try:
+                                ready_state = await video.evaluate("el => el.readyState")
+                                if ready_state >= 2:
+                                    has_active_video = True
+                                    src = await video.get_attribute("src")
+                                    if src:
+                                        video_stream_url = src
+                                    self.log(f"Video readyState={ready_state} (active)")
+                                    break
+                            except: pass
+                        except: continue
+                except Exception as e:
+                    self.log(f"Video check error: {e}")
+
+                # ============================================
+                # STEP 2: Check DOM for live indicators
+                # ============================================
+                dom_is_live = await self._check_dom_live_indicator(page)
+
+                # ============================================
+                # STEP 3: Check DOM for PREMIUM indicators (lock, paywall)
+                # ============================================
+                dom_is_premium = await self._check_dom_premium(page)
+
+                # ============================================
+                # STEP 4: Check API responses
+                # ============================================
                 api_result = self._check_api_live_status(api_responses, user_id)
+                api_says_live = bool(api_result and api_result.get("is_live"))
 
-                # Check DOM for live indicators
-                dom_result = await self._check_dom_live_status(page)
-
-                # FIXED: Premium detection ONLY when is_live is in same object
+                # ============================================
+                # STEP 5: DETERMINE STATUS - VIDEO IS KING
+                # ============================================
+                is_live = False
                 is_premium = False
-                if api_result and api_result.get("is_live") and api_result.get("is_premium"):
-                    is_premium = True
+                stream_url = video_stream_url
 
-                # Extract username - prefer Phase 1 username if available
+                if has_active_video:
+                    # ACTIVE VIDEO = NORMAL STREAM (always)
+                    # Premium streams don't play video - they show paywall
+                    if dom_is_live or api_says_live:
+                        is_live = True
+                        is_premium = False  # ← Video playing means it's NOT premium
+                        self.log(f"VIDEO ACTIVE + live indicator → LIVE_NORMAL")
+                    else:
+                        # Video but no live indicator - probably a preview or unrelated video
+                        is_live = False
+                        self.log(f"VIDEO ACTIVE but no live indicator → OFFLINE")
+
+                elif dom_is_live or api_says_live:
+                    # Live indicator but NO video
+                    if dom_is_premium:
+                        # Live indicator + lock icon = PREMIUM STREAM
+                        is_live = True
+                        is_premium = True
+                        self.log(f"NO VIDEO + live indicator + LOCK → LIVE_PREMIUM")
+                    else:
+                        # Live indicator + no video + no lock = False positive
+                        # This is likely the API lying (common on this site)
+                        is_live = False
+                        self.log(f"NO VIDEO + live indicator + NO LOCK → OFFLINE (false positive)")
+
+                else:
+                    # No live indicator, no video
+                    is_live = False
+                    self.log(f"NO VIDEO + NO live indicator → OFFLINE")
+
+                # Extract username
                 username = phase1_username
                 if not username and api_result and api_result.get("username"):
                     username = self._clean_username(api_result["username"])
@@ -665,44 +569,132 @@ class SuperLiveDiscovery:
                     if page_username:
                         username = self._clean_username(page_username)
 
-                # Determine live status
-                is_live = False
-                stream_url = None
-                stream_id = None
-
-                if api_result and api_result.get("is_live"):
-                    is_live = True
-                    stream_url = api_result.get("stream_url")
-                    stream_id = api_result.get("stream_id")
-
-                if dom_result and dom_result.get("is_live"):
-                    is_live = True
+                # Determine stream URL
+                if not stream_url:
+                    if api_result:
+                        stream_url = api_result.get("stream_url")
                     if not stream_url:
-                        stream_url = dom_result.get("stream_url")
+                        stream_url = profile_url
 
                 await browser.close()
 
                 result = {
                     "is_live": is_live,
-                    "stream_url": stream_url or profile_url,
-                    "stream_id": stream_id,
+                    "stream_url": stream_url,
+                    "stream_id": api_result.get("stream_id") if api_result else None,
                     "is_premium": is_premium,
                     "username": username,
-                    "source": "api" if (api_result and api_result.get("is_live")) else "dom"
+                    "source": "video_dom_api",
+                    "debug": {
+                        "has_active_video": has_active_video,
+                        "dom_is_live": dom_is_live,
+                        "api_says_live": api_says_live,
+                        "dom_is_premium": dom_is_premium,
+                    }
                 }
 
-                self.log(f"Phase 2 result: is_live={is_live}, premium={is_premium}, username={username}")
+                self.log(f"Phase 2 FINAL: is_live={is_live}, premium={is_premium}, username={username}")
                 return result
 
         except Exception as e:
             self.log(f"check_live_status error: {e}")
             return None
 
+    # ============================================================
+    # NEW: Check DOM for premium-only indicators (lock, paywall banner)
+    # ============================================================
+    async def _check_dom_premium(self, page) -> bool:
+        """Check DOM for premium-only indicators like lock icons and paywall banners"""
+        try:
+            # CSS selectors for premium indicators
+            premium_selectors = [
+                '[class*="lock"]',
+                '[class*="paywall"]',
+                '[class*="premium-only"]',
+                '[class*="private-room"]',
+                '[class*="exclusive"]',
+                '[class*="paid"]',
+                '[class*="subscribe"]',
+                '[class*="unlock"]',
+                '[class*="coin"]',
+                'svg[class*="lock"]',
+                '[data-premium="true"]',
+                '[data-private="true"]',
+            ]
+            for selector in premium_selectors:
+                try:
+                    elements = await page.locator(selector).all()
+                    for el in elements:
+                        try:
+                            if await el.is_visible():
+                                self.log(f"Premium indicator found: {selector}")
+                                return True
+                        except: pass
+                except: continue
+
+            # Text indicators (must be prominent, not in footer)
+            text_patterns = [
+                "text=Premium Only",
+                "text=Premium only",
+                "text=Contenu Premium",
+                "text=Private Room",
+                "text=Salon Privé",
+                "text=Salon privé",
+                "text=Pay to watch",
+                "text=Payer pour regarder",
+                "text=Unlock with coins",
+                "text=Débloquer avec",
+            ]
+            for pattern in text_patterns:
+                try:
+                    elements = await page.locator(pattern).all()
+                    for el in elements:
+                        try:
+                            if await el.is_visible():
+                                self.log(f"Premium text found: {pattern}")
+                                return True
+                        except: pass
+                except: continue
+
+        except Exception as e:
+            self.log(f"Premium DOM check error: {e}")
+        return False
+
+    async def _check_dom_live_indicator(self, page) -> bool:
+        try:
+            live_selectors = [
+                ".live-badge", ".live-indicator", ".is-live",
+                '[data-status="live"]', '[class*="live-badge"]',
+                '[class*="live-indicator"]', '[class*="is-live"]',
+            ]
+            for selector in live_selectors:
+                try:
+                    elements = await page.locator(selector).all()
+                    for el in elements:
+                        try:
+                            if await el.is_visible():
+                                return True
+                        except: pass
+                except: continue
+
+            text_selectors = ["text=DIRECT", "text=LIVE", "text=En direct", "text=مباشر"]
+            for selector in text_selectors:
+                try:
+                    elements = await page.locator(selector).all()
+                    for el in elements:
+                        try:
+                            if await el.is_visible():
+                                return True
+                        except: pass
+                except: continue
+        except Exception as e:
+            self.log(f"DOM live check error: {e}")
+        return False
+
     def _check_api_live_status(self, responses: List[Dict], user_id: str) -> Optional[Dict]:
         for resp in responses:
             body = resp.get("body")
-            if not body:
-                continue
+            if not body: continue
             result = self._find_live_status_in_obj(body, user_id, depth=0)
             if result and result.get("is_live"):
                 return result
@@ -710,22 +702,17 @@ class SuperLiveDiscovery:
 
     def _find_live_status_in_obj(self, obj: Any, user_id: str, depth: int) -> Optional[Dict]:
         """
-        FIXED: Only returns result if is_live=true AND is_premium are in SAME object.
-        Before: found is_premium anywhere → all users PREMIUM
-        After: is_premium must be sibling of is_live=true
+        NOTE: is_premium from API is IGNORED here.
+        We only use API for is_live, stream_url, stream_id, username.
+        Premium detection is done via DOM (lock icon) and video element.
         """
-        if depth > 10:
-            return None
-
+        if depth > 10: return None
         if isinstance(obj, dict):
             result = {
-                "is_live": False,
-                "stream_url": None,
-                "stream_id": None,
-                "username": None,
-                "is_premium": False
+                "is_live": False, "stream_url": None,
+                "stream_id": None, "username": None,
+                "is_premium": False  # Always False - we don't trust API for this
             }
-
             for k, v in obj.items():
                 kl = str(k).lower()
                 if kl in ("is_live", "islive", "live", "streaming", "is_streaming", "online", "is_online"):
@@ -738,84 +725,17 @@ class SuperLiveDiscovery:
                 if kl in ("username", "nickname", "display_name", "displayname", "name"):
                     if isinstance(v, str) and v.strip():
                         result["username"] = v.strip()
-                # FIXED: Only set is_premium if we're in a live object
-                if kl in ("is_premium", "ispremium", "premium", "paywall"):
-                    result["is_premium"] = bool(v)
-
-            # ONLY return if is_live is true in THIS object
+                # INTENTIONALLY NOT extracting is_premium from API
             if result["is_live"]:
                 return result
-
             for v in obj.values():
                 r = self._find_live_status_in_obj(v, user_id, depth + 1)
-                if r and r.get("is_live"):
-                    return r
-
+                if r and r.get("is_live"): return r
         elif isinstance(obj, list):
             for item in obj[:50]:
                 r = self._find_live_status_in_obj(item, user_id, depth + 1)
-                if r and r.get("is_live"):
-                    return r
+                if r and r.get("is_live"): return r
         return None
-
-    async def _check_dom_live_status(self, page) -> Optional[Dict]:
-        try:
-            is_live = False
-            stream_url = None
-
-            live_selectors = [
-                ".live-badge", ".live-indicator", ".is-live",
-                '[data-status="live"]', '[class*="live-badge"]',
-            ]
-
-            for selector in live_selectors:
-                try:
-                    elements = await page.locator(selector).all()
-                    for el in elements:
-                        try:
-                            if await el.is_visible():
-                                is_live = True
-                                break
-                        except:
-                            pass
-                    if is_live:
-                        break
-                except:
-                    continue
-
-            if not is_live:
-                text_selectors = ["text=DIRECT", "text=LIVE", "text=En direct", "text=مباشر"]
-                for selector in text_selectors:
-                    try:
-                        elements = await page.locator(selector).all()
-                        for el in elements:
-                            try:
-                                if await el.is_visible():
-                                    is_live = True
-                                    break
-                            except:
-                                pass
-                        if is_live:
-                            break
-                    except:
-                        continue
-
-            if is_live:
-                try:
-                    videos = await page.locator("video").all()
-                    for video in videos:
-                        src = await video.get_attribute("src")
-                        if src and any(ext in src for ext in [".m3u8", ".mpd", "rtmp"]):
-                            stream_url = src
-                            break
-                except:
-                    pass
-                return {"is_live": True, "stream_url": stream_url}
-
-        except Exception as e:
-            self.log(f"DOM live check error: {e}")
-
-        return {"is_live": False}
 
     async def _extract_username_from_page(self, page) -> Optional[str]:
         try:
@@ -824,7 +744,6 @@ class SuperLiveDiscovery:
                 '[class*="profile-name"]', '[class*="user-name"]',
                 "h1", "h2",
             ]
-
             for selector in selectors:
                 try:
                     elements = await page.locator(selector).all()
@@ -832,11 +751,8 @@ class SuperLiveDiscovery:
                         text = (await el.inner_text()).strip()
                         if 2 <= len(text) <= 100 and not text.isdigit():
                             word_count = len(text.split())
-                            if word_count <= 5:
-                                return text
-                except:
-                    continue
-
+                            if word_count <= 5: return text
+                except: continue
             try:
                 og = await page.locator('meta[property="og:title"]').first.get_attribute("content")
                 if og:
@@ -845,24 +761,15 @@ class SuperLiveDiscovery:
                     cleaned = cleaned.strip()
                     if 2 <= len(cleaned) <= 100 and not cleaned.isdigit():
                         return cleaned
-            except:
-                pass
-
+            except: pass
         except Exception as e:
             self.log(f"Username extraction error: {e}")
         return None
 
-    # ============================================================
-    # PHASE 3: STREAM VALIDATION
-    # ============================================================
     async def validate_stream(self, user_id: str, profile_id: str, stream_url: str) -> Dict[str, Any]:
         self.log(f"Phase 3: Validating stream for user_id={user_id}")
         return {
-            "validation_passed": True,
-            "checks_passed": 3,
-            "total_checks": 3,
-            "metadata_match": True,
-            "dom_has_user_id": True,
-            "dom_has_profile_id": True,
-            "actual_stream_url": stream_url
+            "validation_passed": True, "checks_passed": 3, "total_checks": 3,
+            "metadata_match": True, "dom_has_user_id": True,
+            "dom_has_profile_id": True, "actual_stream_url": stream_url
         }
