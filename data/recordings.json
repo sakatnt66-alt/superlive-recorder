@@ -53,16 +53,6 @@
       "status": "recording",
       "started_at": "2026-10-08T23:05:10.972Z",
       "source": "auto"
-    },
-    {
-      "stream_id": "61325170",
-      "stream_url": "https://superlivetv.com/fr/profile/22782357?isFromSearch=true",
-      "stream_name": "💜البندري🖤💎🎠🎠🎠",
-      "status": "recording",
-      "started_at": "2026-10-08T23:05:12.395Z",
-      "source": "auto",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
