@@ -70,7 +70,8 @@ def log_detection(user_id: str, result: Dict[str, Any], source: str) -> None:
             f"mainActive={vi.get('mainVideoActive', False)},"
             f"premium={vi.get('premiumFromJson', False)},"
             f"ended={vi.get('streamEnded', False)},"
-            f"name={vi.get('streamerName', '')[:40]}"
+            f"name={vi.get('streamerName', '')[:40]},"
+            f"nameSource={vi.get('nameSource', 'none')}"
         )
 
 def html_escape(text: str) -> str:
@@ -326,7 +327,7 @@ def normalize_display_name(value):
         "watching", "subscribe", "follow", "following",
         "k", "m", "b", "undefined", "super",
         "membre", "member", "user", "guest",
-        "membre super", "super membre", "membre superlive",
+        "membre super", "super membre",
     }
     if lowered in blocked:
         return None
@@ -388,28 +389,26 @@ def classify_final(video_info: Dict[str, Any], json_bodies: List[str], user_id: 
     main_video_active = bool(video_info.get("mainVideoActive", False))
     premium_json = bool(video_info.get("premiumFromJson", False))
 
-    # FIXED: Only use premium_json, NOT premium_dom
-    # premium_dom was removed because it gave false positives
-    # (site has "subscribe"/"premium" buttons on ALL pages)
     is_premium = premium_json
 
-    # RULE 1: Main video is active and belongs to user
+    # RULE 1: Main video is active AND belongs to user
     if main_video_active and belongs_to_user:
         if is_premium:
             return LIVE_PREMIUM
         return LIVE_NORMAL
 
-    # RULE 2: Video exists, belongs to user, but main video not confirmed
+    # RULE 2: Video exists and belongs to user
     if live_video_candidate and belongs_to_user:
         if is_premium:
             return LIVE_PREMIUM
         return LIVE_NORMAL
 
-    # RULE 3: Video exists but does NOT belong to user (recommended streams)
+    # RULE 3: Video exists but does NOT belong to user
+    # These are recommended/suggested streams — user is likely offline
     if live_video_candidate and not belongs_to_user:
         if stream_ended:
             return OFFLINE
-        return UNKNOWN
+        return OFFLINE
 
     # RULE 4: No active video at all
     if not live_video_candidate:
@@ -418,7 +417,8 @@ def classify_final(video_info: Dict[str, Any], json_bodies: List[str], user_id: 
     return UNKNOWN
 
 # ============================================================
-# PAGE_INFO_JS — FIXED: premium_dom REMOVED
+# PAGE_INFO_JS — ROOT FIX: Name extraction ONLY from sources
+# tied to the target user_id, NOT from recommended streams
 # ============================================================
 PAGE_INFO_JS = r"""
 (userId) => {
@@ -430,9 +430,11 @@ PAGE_INFO_JS = r"""
     let mainVideoActive = false;
     let streamEnded = false;
     let streamerName = '';
+    let nameSource = 'none';
 
     // ============================================================
     // DOM CONTAINS TARGET ID — SAME LOGIC AS record_once.py
+    // 8 levels deep, checks id, className, data-*, href, descendants
     // ============================================================
     const domContainsTargetId = (element) => {
         if (!userId || !element) return false;
@@ -497,58 +499,137 @@ PAGE_INFO_JS = r"""
     } catch (e) {}
 
     // ============================================================
-    // PREMIUM DETECTION: JSON ONLY (DOM check removed)
-    // The DOM check was removed because the site has
-    // "subscribe"/"premium" buttons on ALL pages, causing
-    // false positives for every user.
-    // Premium detection is now done ONLY from JSON API responses
-    // in the Python code (check_json_for_premium).
-    // ============================================================
-
-    // ============================================================
-    // EXTRACT NAME
+    // NAME EXTRACTION — ONLY FROM SOURCES TIED TO user_id
+    //
+    // Priority:
+    // 1. JSON embedded in <script> tags that contain user_id
+    // 2. DOM elements with data-* attributes containing user_id
+    // 3. DOM elements near the main video that are associated with user_id
+    //
+    // CRITICAL: We do NOT extract names from arbitrary DOM elements
+    // because those may belong to recommended/suggested streams.
     // ============================================================
     try {
+        // Method 1: JSON in script tags containing user_id
         const scripts = document.querySelectorAll('script');
         for (const script of scripts) {
             const text = script.textContent || '';
-            if (text.includes(userId) && (text.includes('username') || text.includes('nickname') || text.includes('displayName'))) {
-                try {
-                    const nameMatch = text.match(/"(?:username|nickname|displayName|display_name|name)"\s*:\s*"([^"]{2,40})"/);
-                    if (nameMatch && nameMatch[1]) {
-                        const candidate = nameMatch[1].trim();
-                        if (candidate.length >= 2 && candidate !== 'Super' && !candidate.match(/^\d+$/)) {
-                            streamerName = candidate;
-                            break;
-                        }
-                    }
-                } catch (e) {}
-            }
-        }
+            if (!text.includes(userId)) continue;
 
-        if (!streamerName && videos.length > 0) {
-            const mainVideo = videos[0];
-            let container = mainVideo.parentElement;
-            let nDepth = 0;
-            while (container && nDepth < 5 && !streamerName) {
-                const nameEls = container.querySelectorAll(
-                    '[class*="name"], [class*="username"], [class*="nickname"], h1, h2, h3, .title'
-                );
-                for (const el of nameEls) {
-                    const text = (el.innerText || '').trim();
-                    if (text.length >= 2 && text.length <= 40 && text !== 'Super') {
-                        const wordCount = text.split(/\s+/).length;
-                        if (wordCount <= 4 && !text.match(/^\d+$/)) {
-                            streamerName = text;
+            // Look for name fields near the user_id in JSON
+            const namePatterns = [
+                /"(?:username|nickname|displayName|display_name|streamer_name|broadcaster_name|user_name)"\s*:\s*"([^"]{2,40})"/g,
+            ];
+
+            for (const pattern of namePatterns) {
+                let match;
+                while ((match = pattern.exec(text)) !== null) {
+                    const candidate = match[1].trim();
+                    if (candidate.length >= 2 && candidate.length <= 40) {
+                        const wordCount = candidate.split(/\s+/).length;
+                        if (wordCount <= 4 && !candidate.match(/^\d+$/) && candidate !== 'Super') {
+                            streamerName = candidate;
+                            nameSource = 'json_script';
                             break;
                         }
                     }
                 }
-                container = container.parentElement;
-                nDepth++;
+                if (streamerName) break;
+            }
+            if (streamerName) break;
+        }
+
+        // Method 2: DOM elements with data-* attributes containing user_id
+        if (!streamerName) {
+            const dataSelectors = [
+                '[data-stream-id*="' + userId + '"]',
+                '[data-id*="' + userId + '"]',
+                '[data-livestream-id*="' + userId + '"]',
+                '[data-channel-id*="' + userId + '"]',
+                '[data-user-id*="' + userId + '"]',
+            ];
+
+            for (const sel of dataSelectors) {
+                try {
+                    const elements = document.querySelectorAll(sel);
+                    for (const el of elements) {
+                        // Look for name-like text in this element and its children
+                        const nameEls = el.querySelectorAll(
+                            '[class*="name"], [class*="username"], [class*="nickname"], h1, h2, h3, .title, .user-info, .profile-name'
+                        );
+                        for (const nameEl of nameEls) {
+                            const text = (nameEl.innerText || '').trim();
+                            if (text.length >= 2 && text.length <= 40) {
+                                const wordCount = text.split(/\s+/).length;
+                                if (wordCount <= 4 && !text.match(/^\d+$/) && text !== 'Super') {
+                                    streamerName = text;
+                                    nameSource = 'data_attr';
+                                    break;
+                                }
+                            }
+                        }
+                        if (streamerName) break;
+
+                        // Also check the element's own text
+                        const ownText = (el.innerText || '').trim();
+                        if (ownText.length >= 2 && ownText.length <= 40) {
+                            const wordCount = ownText.split(/\s+/).length;
+                            if (wordCount <= 4 && !ownText.match(/^\d+$/) && ownText !== 'Super') {
+                                streamerName = ownText;
+                                nameSource = 'data_attr_text';
+                                break;
+                            }
+                        }
+                    }
+                } catch (e) {}
+                if (streamerName) break;
             }
         }
 
+        // Method 3: DOM elements near the main video that are associated with user_id
+        if (!streamerName && videos.length > 0) {
+            const mainVideo = videos[0];
+            if (domContainsTargetId(mainVideo)) {
+                let container = mainVideo.parentElement;
+                let nDepth = 0;
+                while (container && nDepth < 5 && !streamerName) {
+                    const nameEls = container.querySelectorAll(
+                        '[class*="name"], [class*="username"], [class*="nickname"], h1, h2, h3, .title, .user-info, .profile-name, .streamer-info'
+                    );
+                    for (const el of nameEls) {
+                        const text = (el.innerText || '').trim();
+                        if (text.length >= 2 && text.length <= 40) {
+                            const wordCount = text.split(/\s+/).length;
+                            if (wordCount <= 4 && !text.match(/^\d+$/) && text !== 'Super') {
+                                streamerName = text;
+                                nameSource = 'main_video_dom';
+                                break;
+                            }
+                        }
+                    }
+                    container = container.parentElement;
+                    nDepth++;
+                }
+            }
+        }
+
+        // Method 4: Links containing user_id — extract name from link text
+        if (!streamerName) {
+            const links = document.querySelectorAll('a[href*="' + userId + '"]');
+            for (const link of links) {
+                const text = (link.innerText || '').trim();
+                if (text.length >= 2 && text.length <= 40) {
+                    const wordCount = text.split(/\s+/).length;
+                    if (wordCount <= 4 && !text.match(/^\d+$/) && text !== 'Super') {
+                        streamerName = text;
+                        nameSource = 'link_text';
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Method 5: og:title / document.title (LAST RESORT)
         if (!streamerName) {
             const ogTitle = document.querySelector('meta[property="og:title"]');
             if (ogTitle && ogTitle.content) {
@@ -556,7 +637,11 @@ PAGE_INFO_JS = r"""
                 title = title.replace(/\s*[\|\-\u2013\u2014]\s*(SuperLive|superlivetv|Super Live|Super).*$/i, '').trim();
                 title = title.replace(/\s*(en direct|live|direct|streaming).*$/i, '').trim();
                 if (title.length >= 2 && title.length <= 40 && title !== 'Super') {
-                    streamerName = title;
+                    const wordCount = title.split(/\s+/).length;
+                    if (wordCount <= 4 && !title.match(/^\d+$/)) {
+                        streamerName = title;
+                        nameSource = 'og_title';
+                    }
                 }
             }
         }
@@ -616,11 +701,8 @@ PAGE_INFO_JS = r"""
         }
     }
 
-    // Override streamEnded if main video IS active
-    if (streamEnded && mainVideoActive) {
-        streamEnded = false;
-    }
-    if (streamEnded && belongsToUser && liveVideoCandidate) {
+    // Override streamEnded if main video IS active and belongs to user
+    if (streamEnded && mainVideoActive && belongsToUser) {
         streamEnded = false;
     }
 
@@ -632,7 +714,8 @@ PAGE_INFO_JS = r"""
         belongsToUser,
         mainVideoActive,
         streamEnded,
-        streamerName
+        streamerName,
+        nameSource
     };
 }
 """
@@ -647,7 +730,7 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
             "videoCount": 0, "srcObjectCount": 0, "visibleCount": 0,
             "liveVideoCandidate": False, "belongsToUser": False,
             "mainVideoActive": False, "streamEnded": False,
-            "streamerName": "",
+            "streamerName": "", "nameSource": "none",
         }
 
         async def on_response(response):
@@ -681,7 +764,7 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
                     "videoCount": 0, "srcObjectCount": 0, "visibleCount": 0,
                     "liveVideoCandidate": False, "belongsToUser": False,
                     "mainVideoActive": False, "streamEnded": False,
-                    "streamerName": "",
+                    "streamerName": "", "nameSource": "none",
                 }
 
             if not video_info.get("liveVideoCandidate") and video_info.get("srcObjectCount", 0) == 0:
@@ -702,11 +785,12 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
 
         await page.close()
 
-        # Premium detection ONLY from JSON API responses
         video_info["premiumFromJson"] = check_json_for_premium(json_bodies, user_id)
         final_status = classify_final(video_info, json_bodies, user_id)
 
-        # Name extraction: JSON first, then DOM
+        # Name extraction priority:
+        # 1. JSON API responses (most reliable)
+        # 2. DOM extraction from PAGE_INFO_JS (tied to user_id)
         display_name = None
         json_name = extract_name_from_json(json_bodies, user_id)
         if json_name:
@@ -725,7 +809,8 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
                       f"belongs={video_info.get('belongsToUser')},"
                       f"mainActive={video_info.get('mainVideoActive')},"
                       f"premium_json={video_info.get('premiumFromJson')},"
-                      f"ended={video_info.get('streamEnded')}",
+                      f"ended={video_info.get('streamEnded')},"
+                      f"nameSource={video_info.get('nameSource', 'none')}",
             "stream_url": url,
             "display_name": display_name,
             "video_info": video_info,
@@ -733,10 +818,12 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
 
         return result
 
-async def playwright_classify_many(user_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+async def playwright_classify_many(user_ids: List[str], stored_names: Dict[str, str] = None) -> Dict[str, Dict[str, Any]]:
     results = {}
     if not user_ids:
         return results
+    if stored_names is None:
+        stored_names = {}
     try:
         from playwright.async_api import async_playwright
     except ImportError:
@@ -761,7 +848,10 @@ async def playwright_classify_many(user_ids: List[str]) -> Dict[str, Dict[str, A
                 locale="fr-FR",
             )
             semaphore = asyncio.Semaphore(PLAYWRIGHT_CONCURRENCY)
-            tasks = [playwright_classify_user(context, uid, semaphore) for uid in user_ids]
+            tasks = [
+                playwright_classify_user(context, uid, semaphore)
+                for uid in user_ids
+            ]
             gathered = await asyncio.gather(*tasks, return_exceptions=True)
             for user_id, result in zip(user_ids, gathered):
                 if isinstance(result, Exception):
@@ -771,6 +861,10 @@ async def playwright_classify_many(user_ids: List[str]) -> Dict[str, Dict[str, A
                         "display_name": None,
                     }
                 else:
+                    # If no name was extracted but we have a stored name, use it
+                    if not result.get("display_name") and stored_names.get(user_id):
+                        result["display_name"] = stored_names[user_id]
+
                     results[user_id] = result
             await context.close()
             await browser.close()
@@ -863,7 +957,7 @@ async def async_main() -> int:
         stats["checked_now"] = len(selected)
 
         log(f"Running browser detection for {len(selected)} users")
-        results = await playwright_classify_many(selected)
+        results = await playwright_classify_many(selected, stored_names)
 
         for user_id, result in results.items():
             log_detection(user_id, result, "playwright")
