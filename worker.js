@@ -1,5 +1,5 @@
 // worker.js - SuperLive Recorder + Auto Monitor + Watchlist + Cron
-// Version: 10.0 - Full integration
+// Version: 11.0 - KV limit protection + full commands
 
 export default {
   async fetch(request, env, ctx) {
@@ -59,6 +59,9 @@ export default {
   }
 };
 
+// ============================================================
+// HELPERS
+// ============================================================
 function isAutoApiAuthorized(request, env) {
   if (!env.AUTO_API_TOKEN) return true;
   const token = request.headers.get('X-Auto-Token');
@@ -95,6 +98,9 @@ async function getWatchlist(env) {
   return watchlist;
 }
 
+// ============================================================
+// WATCHLIST API
+// ============================================================
 async function handleWatchlistList(request, env) {
   if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
   try {
@@ -200,6 +206,9 @@ async function handleWatchlistUpdateName(request, url, env) {
   }
 }
 
+// ============================================================
+// ACTIVE RECORDINGS API
+// ============================================================
 async function handleActiveRecordings(request, env) {
   if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
   try {
@@ -223,6 +232,9 @@ async function handleActiveRecordings(request, env) {
   }
 }
 
+// ============================================================
+// AUTO TRIGGER API
+// ============================================================
 async function handleAutoTrigger(request, url, env) {
   if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
   try {
@@ -298,6 +310,9 @@ async function handleAutoTrigger(request, url, env) {
   }
 }
 
+// ============================================================
+// TRIGGER MONITOR API
+// ============================================================
 async function handleTriggerMonitorApi(request, env) {
   if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
   try {
@@ -321,6 +336,9 @@ async function handleTriggerMonitorApi(request, env) {
   }
 }
 
+// ============================================================
+// CRON HANDLER
+// ============================================================
 async function handleAutoMonitorCron(env) {
   try {
     console.log('[AUTO-CRON] Starting scheduled check...');
@@ -341,6 +359,9 @@ async function handleAutoMonitorCron(env) {
   }
 }
 
+// ============================================================
+// ORIGINAL STATE APIs
+// ============================================================
 async function handleUpdateState(request, url, env) {
   try {
     const streamId = url.pathname.split('/').pop();
@@ -441,6 +462,9 @@ async function handleCheckStop(request, url, env) {
   }
 }
 
+// ============================================================
+// TELEGRAM WEBHOOK
+// ============================================================
 async function handleTelegramWebhook(request, env) {
   try {
     const update = await request.json();
@@ -457,6 +481,9 @@ async function handleTelegramWebhook(request, env) {
   }
 }
 
+// ============================================================
+// TELEGRAM MESSAGE HANDLER
+// ============================================================
 async function handleMessage(message, env) {
   const chatId = message.chat.id.toString();
   const text = (message.text || '').trim();
@@ -527,11 +554,22 @@ async function handleMessage(message, env) {
     );
   } catch (error) {
     console.error('handleMessage error:', error);
+    try {
+      await sendTelegramMessage(env, chatId,
+        '❌ حدث خطأ في معالجة الرسالة.\nيرجى المحاولة مرة أخرى.',
+        { parse_mode: 'HTML' }
+      );
+    } catch (e) {
+      console.error('Failed to send error message:', e);
+    }
   }
 
   return new Response('OK');
 }
 
+// ============================================================
+// TELEGRAM CALLBACK HANDLER
+// ============================================================
 async function handleCallbackQuery(callbackQuery, env) {
   const chatId = callbackQuery.message.chat.id.toString();
   const data = callbackQuery.data;
@@ -570,12 +608,17 @@ async function handleCallbackQuery(callbackQuery, env) {
     }
   } catch (error) {
     console.error('Callback error:', error);
-    await answerCallbackQuery(callbackQuery.id, env, '❌ خطأ');
+    try {
+      await answerCallbackQuery(callbackQuery.id, env, '❌ خطأ');
+    } catch (e) {}
   }
 
   return new Response('OK');
 }
 
+// ============================================================
+// TELEGRAM COMMAND HANDLERS
+// ============================================================
 async function handleRecord(chatId, streamUrl, env) {
   const streamId = extractStreamId(streamUrl);
   if (!streamId) {
@@ -806,7 +849,17 @@ async function handleRemoveWatch(chatId, streamId, env) {
 }
 
 async function handleWatchlistCommand(chatId, env) {
-  const watchlist = await getWatchlist(env);
+  let watchlist = [];
+  try {
+    watchlist = await getWatchlist(env);
+  } catch (e) {
+    console.error('getWatchlist error in handleWatchlistCommand:', e);
+    await sendTelegramMessage(env, chatId,
+      '⚠️ حدث خطأ في قراءة قائمة المراقبة. حاول مرة أخرى لاحقاً.',
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] } }
+    );
+    return;
+  }
   if (watchlist.length === 0) {
     await sendTelegramMessage(env, chatId,
       '📋 <b>قائمة المراقبة فارغة</b>\nأضف مستخدمين باستخدام:\n<code>/addwatch 123456</code>',
@@ -851,21 +904,46 @@ async function sendHelp(chatId, env) {
   });
 }
 
+// ============================================================
+// MAIN MENU - PROTECTED with try/catch for each operation
+// ============================================================
 async function sendMainMenu(chatId, env) {
-  await autoCleanup(env);
-  const activeCount = await countActiveRecordings(env);
-  const watchlist = await getWatchlist(env);
-  const message = '🎬 <b>SuperLive Recorder</b>\n\n<b>مرحباً!</b>\n📊 التسجيلات النشطة: <b>' + activeCount + '/5</b>\n📋 قائمة المراقبة: <b>' + watchlist.length + ' مستخدم</b>\n\nلبدء التسجيل، أرسل رابط البث أو استخدم الأزرار 👇';
+  let activeCount = 0;
+  let watchlistCount = 0;
+
+  try {
+    activeCount = await countActiveRecordings(env);
+  } catch (e) {
+    console.error('countActiveRecordings error in sendMainMenu:', e);
+  }
+
+  try {
+    const watchlist = await getWatchlist(env);
+    watchlistCount = watchlist.length;
+  } catch (e) {
+    console.error('getWatchlist error in sendMainMenu:', e);
+  }
+
+  const message = '🎬 <b>SuperLive Recorder</b>\n\n' +
+    '<b>مرحباً!</b>\n' +
+    '📊 التسجيلات النشطة: <b>' + activeCount + '/5</b>\n' +
+    '📋 قائمة المراقبة: <b>' + watchlistCount + ' مستخدم</b>\n\n' +
+    'لبدء التسجيل، أرسل رابط البث أو استخدم الأزرار 👇';
+
   const buttons = [
     [{ text: '📊 الحالة', callback_data: 'status' }, { text: '🛑 إيقاف', callback_data: 'stop_menu' }],
     [{ text: '📋 قائمة المراقبة', callback_data: 'watchlist' }, { text: '🧪 تشغيل المراقبة', callback_data: 'test_monitor' }],
     [{ text: '🧹 تنظيف', callback_data: 'cleanup' }, { text: '❓ مساعدة', callback_data: 'help' }]
   ];
+
   await sendTelegramMessage(env, chatId, message, {
     parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons }
   });
 }
 
+// ============================================================
+// SHARED HELPERS
+// ============================================================
 async function autoCleanup(env) {
   try {
     const { keys } = await env.SUPERLIVE_STATE.list({ prefix: 'recording:' });
@@ -961,6 +1039,9 @@ async function answerCallbackQuery(callbackQueryId, env, text) {
   }
 }
 
+// ============================================================
+// GITHUB WORKFLOW TRIGGERS
+// ============================================================
 async function triggerRecordWorkflow(env, streamUrl, streamId, streamName) {
   return triggerGitHubDispatch(env, 'record_stream', {
     stream_url: streamUrl, stream_id: streamId, stream_name: streamName || ''
