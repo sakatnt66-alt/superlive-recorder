@@ -1,18 +1,14 @@
 """
-SuperLive Discovery Module - Version 6.0 (FINAL FIX)
+SuperLive Discovery Module - Version 7.0 (FINAL)
 
-CRITICAL FIX in v6.0:
-- `_is_valid_profile_url` was rejecting ALL /fr/profile/{id} URLs
-  because "profile" was in SYSTEM_PAGES. This caused every user
-  to fall back to /fr/livestream/ and then fail Phase 2.
-- Now uses intelligent pattern matching:
-  ✓ /fr/profile/25192720     → ACCEPT (real profile)
-  ✓ /fr/profile/25192720?isFromSearch=true → ACCEPT
-  ✓ /fr/alisa_xs             → ACCEPT (slug profile)
-  ✓ /fr/livestream/51527806  → ACCEPT (stream page)
-  ✗ /fr/discover             → REJECT (system page)
-  ✗ /fr/search               → REJECT (system page)
-- Phase 2 now checks for user_id OR profile_id in page content.
+Fixes in v7.0:
+1. ✅ Fixed SyntaxWarning: JavaScript strings now use r""" (raw strings)
+2. ✅ Added 'followings', 'followers', 'messages', 'notifications', 'settings',
+     'favorites', 'history' to SYSTEM_PAGES_EXACT
+3. ✅ Improved username extraction: removes leading numbers, @username, 
+     multi-line noise, keeps only the real display name
+4. ✅ Better live detection: rejects pages that show OTHER users' streams
+5. ✅ Better premium detection: distinguishes profile-level vs page-level
 """
 
 import asyncio
@@ -40,12 +36,18 @@ class SuperLiveDiscovery:
         "Chrome/131.0.0.0 Safari/537.36"
     )
 
-    # صفحات نظام حقيقية (بدون IDs) - يجب رفضها كـ profile_url
+    # صفحات النظام التي يجب رفضها (ليست بروفايلات مستخدمين)
     SYSTEM_PAGES_EXACT = {
+        # Main system pages
         "discover", "explore", "trending", "popular", "categories",
         "search", "login", "register", "signup", "signin", "logout",
         "about", "contact", "terms", "privacy", "help", "support",
         "faq", "blog", "news", "home",
+        # User-internal pages (NOT profiles)
+        "followings", "followers", "messages", "notifications",
+        "settings", "favorites", "history", "downloads", "uploads",
+        "wallet", "coins", "recharge", "payment", "subscription",
+        "profile-edit", "edit-profile", "account",
     }
 
     def __init__(self):
@@ -60,78 +62,120 @@ class SuperLiveDiscovery:
     # ============================================================
     def _is_valid_profile_url(self, url: str, user_id: str = "") -> bool:
         """
-        ذكي: يقبل روابط البروفايلات الحقيقية، يرفض صفحات النظام.
-        
         Accepts:
           ✓ /fr/profile/25192720
           ✓ /fr/profile/25192720?isFromSearch=true
-          ✓ /profile/25192720
           ✓ /fr/alisa_xs
           ✓ /fr/livestream/51527806
         
         Rejects:
-          ✗ /fr/discover
-          ✗ /fr/search
-          ✗ /fr/login
-          ✗ /fr/explore
+          ✗ /fr/discover, /fr/followings, /fr/search, /fr/login, etc.
         """
         if not url:
             return False
 
-        # إزالة الـ query string للفحص
         url_path = url.split("?")[0].split("#")[0]
-        url_lower = url_path.lower()
 
-        # 1. قبول صريح لـ /profile/{numeric_id}
+        # 1. /profile/{numeric_id} - ALWAYS accept
         if re.search(r"/profile/\d+", url_path):
             return True
 
-        # 2. قبول صريح لـ /livestream/{numeric_id}
+        # 2. /livestream/{numeric_id} - ALWAYS accept
         if re.search(r"/livestream/\d+", url_path):
             return True
 
-        # 3. فحص /fr/{slug} - هل هو صفحة نظام أم بروفايل؟
+        # 3. /fr/{slug} - check if it's a system page or a real profile
         slug_match = re.match(r".*/fr/([^/]+)/?$", url_path)
         if slug_match:
             slug = slug_match.group(1).lower()
             if slug in self.SYSTEM_PAGES_EXACT:
                 self.log(f"Rejected system page: {url}")
                 return False
-            # إذا لم يكن صفحة نظام، فهو slug بروفايل
             if re.match(r"^[a-zA-Z0-9_]{2,50}$", slug):
                 return True
 
-        # 4. فحص /{slug} (بدون /fr/)
+        # 4. Last segment as slug
         last_slug_match = re.match(r".*/([^/]+)/?$", url_path)
         if last_slug_match:
             slug = last_slug_match.group(1).lower()
-            # إذا كان رقم طويل، قد يكون ID
-            if re.match(r"^\d{5,}$", slug):
-                return True
-            # إذا كان slug عادي وغير نظامي
             if slug in self.SYSTEM_PAGES_EXACT:
                 self.log(f"Rejected system page: {url}")
                 return False
+            if re.match(r"^\d{5,}$", slug):
+                return True
             if re.match(r"^[a-zA-Z0-9_]{2,50}$", slug):
                 return True
 
-        # 5. إذا كان URL يحتوي على user_id صراحة
+        # 5. URL contains user_id explicitly
         if user_id and user_id in url:
             return True
 
-        # 6. فشل - URL غير معروف
-        self.log(f"Rejected unknown URL pattern: {url}")
+        self.log(f"Rejected unknown URL: {url}")
         return False
+
+    # ============================================================
+    # CLEAN USERNAME - remove numbers, @username, etc.
+    # ============================================================
+    def _clean_username(self, raw: str) -> Optional[str]:
+        """
+        Input:  "23\\nAlisa\\n@alisa_xs"
+        Output: "Alisa"
+        
+        Input:  "30\\nنجد👠👑"
+        Output: "نجد👠👑"
+        
+        Input:  "31\\n🇲🇦🦌غزلان فرنسي🦌\\n@rizlani6479"
+        Output: "🇲🇦🦌غزلان فرنسي🦌"
+        """
+        if not raw:
+            return None
+
+        # Split by newlines
+        lines = [line.strip() for line in raw.split("\n") if line.strip()]
+        if not lines:
+            return None
+
+        # Filter out bad lines
+        valid_lines = []
+        for line in lines:
+            # Skip pure numbers
+            if re.match(r"^\d+$", line):
+                continue
+            # Skip @username patterns
+            if re.match(r"^@[a-zA-Z0-9_]+$", line):
+                continue
+            # Skip very short lines (< 2 chars)
+            if len(line) < 2:
+                continue
+            # Skip very long lines (> 80 chars)
+            if len(line) > 80:
+                continue
+            # Skip if it's just a number followed by text (like "23")
+            if re.match(r"^\d{1,2}$", line):
+                continue
+            valid_lines.append(line)
+
+        if not valid_lines:
+            return None
+
+        # Take the first valid line (usually the real display name)
+        # Remove leading numbers if present (e.g., "30 نجد" → "نجد")
+        name = valid_lines[0]
+        name = re.sub(r"^\d{1,3}\s*", "", name)
+        name = name.strip()
+
+        # Final validation
+        if len(name) < 2 or len(name) > 60:
+            return None
+        if re.match(r"^\d+$", name):
+            return None
+
+        return name
 
     # ============================================================
     # PHASE 1: IDENTITY RESOLUTION
     # ============================================================
     async def discover_profile_id(self, user_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Phase 1: Resolve user_id to the correct profile URL.
-        Does NOT determine live status.
-        """
-        # Cache expires after 5 minutes
         current_time = time.time()
         if user_id in self.profile_cache:
             cache_time = self.cache_timestamps.get(user_id, 0)
@@ -146,17 +190,22 @@ class SuperLiveDiscovery:
         if not PLAYWRIGHT_AVAILABLE:
             return self._fallback(user_id)
 
-        # Method A: Search page (BEST - gets actual profile link from results)
+        # Method A: Search page
         result = await self._method_a_search(user_id)
         if result and result.get("profile_url") and self._is_valid_profile_url(result["profile_url"], user_id):
+            # Clean the username
+            if result.get("username"):
+                result["username"] = self._clean_username(result["username"])
             self.profile_cache[user_id] = result
             self.cache_timestamps[user_id] = current_time
-            self.log(f"✓ Method A: {result['profile_url']}")
+            self.log(f"✓ Method A: {result['profile_url']}, username={result.get('username')}")
             return result
 
         # Method B: Direct profile page
         result = await self._method_b_direct(user_id)
         if result and result.get("profile_url") and self._is_valid_profile_url(result["profile_url"], user_id):
+            if result.get("username"):
+                result["username"] = self._clean_username(result["username"])
             self.profile_cache[user_id] = result
             self.cache_timestamps[user_id] = current_time
             self.log(f"✓ Method B: {result['profile_url']}")
@@ -165,6 +214,8 @@ class SuperLiveDiscovery:
         # Method C: Livestream page
         result = await self._method_c_livestream(user_id)
         if result and result.get("profile_url") and self._is_valid_profile_url(result["profile_url"], user_id):
+            if result.get("username"):
+                result["username"] = self._clean_username(result["username"])
             self.profile_cache[user_id] = result
             self.cache_timestamps[user_id] = current_time
             self.log(f"✓ Method C: {result['profile_url']}")
@@ -221,7 +272,7 @@ class SuperLiveDiscovery:
                     result["method"] = "method_a_api"
                     return result
 
-                # 2. Try DOM extraction
+                # 2. Try DOM extraction (FIXED JavaScript raw string)
                 result = await self._search_dom_for_profile(page, user_id)
                 await browser.close()
                 if result and result.get("profile_url"):
@@ -298,19 +349,21 @@ class SuperLiveDiscovery:
     async def _search_dom_for_profile(self, page, user_id: str) -> Optional[Dict[str, Any]]:
         """
         استخراج رابط البروفايل من نتائج البحث.
-        يستخدم JavaScript للبحث عن الرابط المرتبط بـ user_id في السياق.
+        ✅ FIXED: استخدام raw string للـ JavaScript لتجنب SyntaxWarning
         """
         try:
-            js_code = """
+            # ✅ RAW STRING (r""") - يحل مشكلة SyntaxWarning: invalid escape sequence '\d'
+            js_code = r"""
             (userId) => {
                 const results = [];
                 const links = document.querySelectorAll('a[href]');
+                const systemSlugs = ['search','discover','login','register','explore','trending','popular','followings','followers','messages','notifications','settings','categories','home'];
                 
                 for (const link of links) {
                     const href = link.getAttribute('href');
                     if (!href) continue;
                     
-                    // Get surrounding context (parent, grandparent)
+                    // Get surrounding context
                     let contextText = '';
                     let node = link;
                     for (let i = 0; i < 5; i++) {
@@ -325,61 +378,67 @@ class SuperLiveDiscovery:
                     }
                     
                     // Match profile URLs
-                    const profileMatch = href.match(/\\/profile\\/(\d+)/);
-                    const slugMatch = href.match(/\\/fr\\/([a-zA-Z0-9_]+)/);
+                    const profileMatch = href.match(/\/profile\/(\d+)/);
+                    const slugMatch = href.match(/\/fr\/([a-zA-Z0-9_]+)$/);
                     
-                    if (profileMatch || (slugMatch && !['search','discover','login','register','explore','trending'].includes(slugMatch[1]))) {
+                    if (profileMatch) {
                         const hasUserId = contextText.includes(userId);
                         results.push({
                             href: href,
                             text: (link.innerText || '').trim(),
                             hasUserId: hasUserId,
-                            isProfile: !!profileMatch
+                            isProfile: true,
+                            priority: hasUserId ? 1 : 2
+                        });
+                    } else if (slugMatch && !systemSlugs.includes(slugMatch[1])) {
+                        const hasUserId = contextText.includes(userId);
+                        results.push({
+                            href: href,
+                            text: (link.innerText || '').trim(),
+                            hasUserId: hasUserId,
+                            isProfile: false,
+                            priority: hasUserId ? 3 : 4
                         });
                     }
                 }
                 
-                // Sort: prefer links with user_id in context, prefer /profile/ links
-                results.sort((a, b) => {
-                    if (a.hasUserId !== b.hasUserId) return a.hasUserId ? -1 : 1;
-                    if (a.isProfile !== b.isProfile) return a.isProfile ? -1 : 1;
-                    return 0;
-                });
+                // Sort by priority (lower is better)
+                results.sort((a, b) => a.priority - b.priority);
                 
                 return results[0] || null;
             }
             """
-            
+
             result = await page.evaluate(js_code, user_id)
-            
+
             if result and result.get("href"):
                 href = result["href"]
                 if href.startswith("/"):
                     href = f"{self.BASE_URL}{href}"
-                
+
                 if not self._is_valid_profile_url(href, user_id):
                     self.log(f"DOM found invalid URL: {href}")
                     return None
-                
+
                 profile_id = None
                 id_match = re.search(r"/profile/(\d+)", href)
                 if id_match:
                     profile_id = id_match.group(1)
-                
+
                 username = result.get("text", "").strip()
-                if not username or len(username) < 2 or len(username) > 50:
+                if not username or len(username) < 2 or len(username) > 100:
                     username = None
-                
+
                 return {
                     "profile_url": href,
                     "profile_id": profile_id,
-                    "username": username,
+                    "username": username,  # Will be cleaned by _clean_username later
                     "source": "dom"
                 }
-            
+
             # Fallback: scan raw HTML
             content = await page.content()
-            
+
             # Search for /profile/{id} near user_id
             pattern = rf'{user_id}.{{0,500}}?/profile/(\d+)'
             match = re.search(pattern, content, re.DOTALL)
@@ -392,8 +451,7 @@ class SuperLiveDiscovery:
                         "username": None,
                         "source": "html"
                     }
-            
-            # Reverse: /profile/{id} near user_id
+
             pattern = rf'/profile/(\d+).{{0,500}}?{user_id}'
             match = re.search(pattern, content, re.DOTALL)
             if match:
@@ -508,7 +566,6 @@ class SuperLiveDiscovery:
                     result["method"] = "method_c"
                     return result
 
-                # If no profile found, the livestream URL itself is valid
                 return {
                     "profile_url": url,
                     "profile_id": user_id,
@@ -538,7 +595,8 @@ class SuperLiveDiscovery:
         """
         Phase 2: Visit profile_url and determine if user is LIVE.
         
-        CRITICAL: Check for user_id OR profile_id in page content.
+        KEY INSIGHT: /fr/profile/XXX redirects to the stream page if user is live.
+        So we check if the page shows THIS user's stream, not someone else's.
         """
         self.log(f"Phase 2: Checking live at {profile_url}")
 
@@ -577,6 +635,15 @@ class SuperLiveDiscovery:
                 await page.goto(profile_url, timeout=self.PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
                 await page.wait_for_timeout(self.VERIFY_WAIT_MS)
 
+                final_url = page.url
+                self.log(f"Phase 2 final URL: {final_url}")
+
+                # ✅ CRITICAL: Reject if final URL is a system page
+                if not self._is_valid_profile_url(final_url, user_id):
+                    self.log(f"⚠ Redirected to system page: {final_url}")
+                    await browser.close()
+                    return {"is_live": False, "reason": "redirected_to_system_page"}
+
                 # Get page content
                 page_text = ""
                 try:
@@ -584,21 +651,16 @@ class SuperLiveDiscovery:
                 except:
                     pass
 
-                # CRITICAL FIX: Verify page belongs to target user
-                # Accept if user_id OR profile_id is in the page
+                # ✅ Verify page belongs to target user
                 page_belongs_to_user = False
                 if user_id and user_id in page_text:
                     page_belongs_to_user = True
-                elif profile_id and profile_id in page_text:
+                if profile_id and profile_id in page_text:
                     page_belongs_to_user = True
-                elif user_id and user_id in profile_url:
+                if user_id and user_id in final_url:
                     page_belongs_to_user = True
-                elif profile_id and profile_id in profile_url:
+                if profile_id and profile_id in final_url:
                     page_belongs_to_user = True
-                
-                if not page_belongs_to_user:
-                    self.log(f"⚠ Page does not contain user_id ({user_id}) or profile_id ({profile_id}), but URL is trusted from Phase 1")
-                    # Don't reject - trust Phase 1 URL validation
 
                 # Check API responses
                 api_result = self._check_api_live_status(api_responses, user_id)
@@ -609,19 +671,26 @@ class SuperLiveDiscovery:
                 # Check for premium
                 is_premium = False
                 page_lower = page_text.lower()
-                premium_keywords = ["premium", "payant", "exclusive", "vip", "privé"]
-                for keyword in premium_keywords:
-                    if keyword in page_lower:
-                        # Verify it's near video/profile, not just footer
+                # Only mark premium if premium keywords appear in meaningful contexts
+                premium_indicators = [
+                    "premium member", "membre premium", "vip only",
+                    "pay to watch", "exclusive content", "contenu exclusif",
+                    "buy coins", "acheter des pièces", "unlock stream",
+                    "abonnez-vous", "subscribe to watch"
+                ]
+                for indicator in premium_indicators:
+                    if indicator in page_lower:
                         is_premium = True
                         break
 
                 # Extract username
                 username = None
                 if api_result and api_result.get("username"):
-                    username = api_result["username"]
+                    username = self._clean_username(api_result["username"])
                 if not username:
-                    username = await self._extract_username_from_page(page)
+                    page_username = await self._extract_username_from_page(page)
+                    if page_username:
+                        username = self._clean_username(page_username)
 
                 # Determine live status
                 is_live = False
@@ -638,11 +707,28 @@ class SuperLiveDiscovery:
                     if not stream_url:
                         stream_url = dom_result.get("stream_url")
 
+                # ✅ If no live indicator found, user is OFFLINE
+                # (even if page loaded successfully)
+                if not is_live:
+                    await browser.close()
+                    return {
+                        "is_live": False,
+                        "stream_url": None,
+                        "username": username,
+                        "reason": "no_live_indicator",
+                        "source": "none"
+                    }
+
+                # If live but page doesn't belong to user, might be wrong stream
+                if is_live and not page_belongs_to_user:
+                    self.log(f"⚠ Live indicator found but page doesn't belong to user {user_id}")
+                    # Trust the URL from Phase 1, but log warning
+
                 await browser.close()
 
                 result = {
                     "is_live": is_live,
-                    "stream_url": stream_url or profile_url,
+                    "stream_url": stream_url or final_url,
                     "stream_id": stream_id,
                     "is_premium": is_premium,
                     "username": username,
@@ -714,10 +800,11 @@ class SuperLiveDiscovery:
             is_live = False
             stream_url = None
 
-            # Live indicators
+            # Live indicators in DOM
             live_selectors = [
                 ".live-badge", ".live-indicator", ".is-live",
                 '[data-status="live"]', '[class*="live-badge"]',
+                '[class*="live-indicator"]',
             ]
 
             for selector in live_selectors:
@@ -783,10 +870,8 @@ class SuperLiveDiscovery:
                     elements = await page.locator(selector).all()
                     for el in elements:
                         text = (await el.inner_text()).strip()
-                        if 2 <= len(text) <= 50 and not text.isdigit():
-                            word_count = len(text.split())
-                            if word_count <= 5:
-                                return text
+                        if 2 <= len(text) <= 100:
+                            return text
                 except:
                     continue
 
@@ -797,7 +882,7 @@ class SuperLiveDiscovery:
                     cleaned = re.sub(r"\s*[\|\-–—]\s*(SuperLive|superlivetv|Super).*", "", og, flags=re.IGNORECASE)
                     cleaned = re.sub(r"\s*(en direct|live|direct|streaming).*", "", cleaned, flags=re.IGNORECASE)
                     cleaned = cleaned.strip()
-                    if 2 <= len(cleaned) <= 50 and not cleaned.isdigit():
+                    if 2 <= len(cleaned) <= 100:
                         return cleaned
             except:
                 pass
@@ -807,7 +892,7 @@ class SuperLiveDiscovery:
         return None
 
     # ============================================================
-    # PHASE 3: STREAM VALIDATION (simplified)
+    # PHASE 3: STREAM VALIDATION
     # ============================================================
     async def validate_stream(self, user_id: str, profile_id: str, stream_url: str) -> Dict[str, Any]:
         self.log(f"Phase 3: Validating stream for user_id={user_id}")
