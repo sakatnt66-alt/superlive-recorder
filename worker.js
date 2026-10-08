@@ -1,5 +1,4 @@
-// worker.js - Version 13.0 - Single-Key KV Architecture
-// Solves KV list() limit by storing everything in fixed keys
+// worker.js - Version 14.0 - Fixed error handling
 
 export default {
   async fetch(request, env, ctx) {
@@ -50,7 +49,6 @@ export default {
     return new Response('Not Found', { status: 404 });
   },
 
-  // Cron Trigger - Runs every 3 minutes
   async scheduled(event, env, ctx) {
     console.log('[AUTO-CRON] Triggered at ' + new Date().toISOString());
     ctx.waitUntil(handleAutoMonitorCron(env));
@@ -58,7 +56,7 @@ export default {
 };
 
 // ============================================================
-// CONSTANTS - Single-key architecture
+// CONSTANTS
 // ============================================================
 const WATCHLIST_KEY = 'watchlist:all';
 const RECORDINGS_KEY = 'recordings:active';
@@ -79,8 +77,15 @@ function escapeHtml(text) {
   return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+function jsonResponse(data, status) {
+  return new Response(JSON.stringify(data), {
+    status: status || 200,
+    headers: { 'Content-Type': 'application/json' }
+  });
+}
+
 // ============================================================
-// WATCHLIST - Single key storage
+// WATCHLIST
 // ============================================================
 async function getWatchlist(env) {
   try {
@@ -88,26 +93,31 @@ async function getWatchlist(env) {
     if (Array.isArray(data)) return data;
     return [];
   } catch (e) {
+    console.error('getWatchlist error:', e);
     return [];
   }
 }
 
 async function saveWatchlist(env, watchlist) {
-  await env.SUPERLIVE_STATE.put(WATCHLIST_KEY, JSON.stringify(watchlist));
+  try {
+    await env.SUPERLIVE_STATE.put(WATCHLIST_KEY, JSON.stringify(watchlist));
+    return true;
+  } catch (e) {
+    console.error('saveWatchlist error:', e);
+    throw new Error('KV save failed: ' + e.message);
+  }
 }
 
 async function handleWatchlistList(request, env) {
   if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
   try {
     const watchlist = await getWatchlist(env);
-    return new Response(JSON.stringify({
+    return jsonResponse({
       success: true, count: watchlist.length,
       watchlist: watchlist, timestamp: new Date().toISOString()
-    }), { headers: { 'Content-Type': 'application/json' } });
-  } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500, headers: { 'Content-Type': 'application/json' }
     });
+  } catch (error) {
+    return jsonResponse({ error: error.message }, 500);
   }
 }
 
@@ -116,30 +126,36 @@ async function handleWatchlistAdd(request, env) {
   try {
     const body = await request.json();
     const streamId = String(body.stream_id || '').trim();
+    
     if (!streamId || !/^\d+$/.test(streamId)) {
-      return new Response(JSON.stringify({ error: 'Invalid stream ID' }), {
-        status: 400, headers: { 'Content-Type': 'application/json' }
+      return jsonResponse({ error: 'Invalid stream ID' }, 400);
+    }
+    
+    const watchlist = await getWatchlist(env);
+    
+    // Check if already exists
+    if (watchlist.some(e => String(e.stream_id) === streamId)) {
+      return jsonResponse({
+        success: true, message: 'Already in watchlist', stream_id: streamId
       });
     }
-    const watchlist = await getWatchlist(env);
-    if (watchlist.some(e => String(e.stream_id) === streamId)) {
-      return new Response(JSON.stringify({
-        success: true, message: 'Already in watchlist', stream_id: streamId
-      }), { headers: { 'Content-Type': 'application/json' } });
-    }
+    
+    // Add new entry
     watchlist.push({
       stream_id: streamId,
       added_at: new Date().toISOString(),
       display_name: null
     });
+    
+    // Save
     await saveWatchlist(env, watchlist);
-    return new Response(JSON.stringify({
+    
+    return jsonResponse({
       success: true, stream_id: streamId, timestamp: new Date().toISOString()
-    }), { headers: { 'Content-Type': 'application/json' } });
-  } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500, headers: { 'Content-Type': 'application/json' }
     });
+  } catch (error) {
+    console.error('handleWatchlistAdd error:', error);
+    return jsonResponse({ error: error.message }, 500);
   }
 }
 
@@ -149,26 +165,21 @@ async function handleWatchlistRemove(request, env) {
     const body = await request.json();
     const streamId = String(body.stream_id || '').trim();
     if (!streamId || !/^\d+$/.test(streamId)) {
-      return new Response(JSON.stringify({ error: 'Invalid stream ID' }), {
-        status: 400, headers: { 'Content-Type': 'application/json' }
-      });
+      return jsonResponse({ error: 'Invalid stream ID' }, 400);
     }
     const watchlist = await getWatchlist(env);
     const idx = watchlist.findIndex(e => String(e.stream_id) === streamId);
     if (idx === -1) {
-      return new Response(JSON.stringify({
-        success: false, error: 'Not found in watchlist'
-      }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+      return jsonResponse({ success: false, error: 'Not found in watchlist' }, 404);
     }
     watchlist.splice(idx, 1);
     await saveWatchlist(env, watchlist);
-    return new Response(JSON.stringify({
+    return jsonResponse({
       success: true, stream_id: streamId, timestamp: new Date().toISOString()
-    }), { headers: { 'Content-Type': 'application/json' } });
-  } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500, headers: { 'Content-Type': 'application/json' }
     });
+  } catch (error) {
+    console.error('handleWatchlistRemove error:', error);
+    return jsonResponse({ error: error.message }, 500);
   }
 }
 
@@ -177,35 +188,30 @@ async function handleWatchlistUpdateName(request, url, env) {
   try {
     const streamId = url.pathname.split('/').pop();
     if (!streamId || !/^\d+$/.test(streamId)) {
-      return new Response(JSON.stringify({ error: 'Invalid stream ID' }), {
-        status: 400, headers: { 'Content-Type': 'application/json' }
-      });
+      return jsonResponse({ error: 'Invalid stream ID' }, 400);
     }
     const body = await request.json();
     const displayName = String(body.display_name || '').trim();
     const watchlist = await getWatchlist(env);
     const entry = watchlist.find(e => String(e.stream_id) === streamId);
     if (!entry) {
-      return new Response(JSON.stringify({
-        success: false, error: 'Not found in watchlist'
-      }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+      return jsonResponse({ success: false, error: 'Not found in watchlist' }, 404);
     }
     entry.display_name = displayName || null;
     entry.name_updated_at = new Date().toISOString();
     await saveWatchlist(env, watchlist);
-    return new Response(JSON.stringify({
+    return jsonResponse({
       success: true, stream_id: streamId,
       display_name: displayName, timestamp: new Date().toISOString()
-    }), { headers: { 'Content-Type': 'application/json' } });
-  } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500, headers: { 'Content-Type': 'application/json' }
     });
+  } catch (error) {
+    console.error('handleWatchlistUpdateName error:', error);
+    return jsonResponse({ error: error.message }, 500);
   }
 }
 
 // ============================================================
-// RECORDINGS - Single key storage
+// RECORDINGS
 // ============================================================
 async function getRecordings(env) {
   try {
@@ -213,12 +219,19 @@ async function getRecordings(env) {
     if (Array.isArray(data)) return data;
     return [];
   } catch (e) {
+    console.error('getRecordings error:', e);
     return [];
   }
 }
 
 async function saveRecordings(env, recordings) {
-  await env.SUPERLIVE_STATE.put(RECORDINGS_KEY, JSON.stringify(recordings));
+  try {
+    await env.SUPERLIVE_STATE.put(RECORDINGS_KEY, JSON.stringify(recordings));
+    return true;
+  } catch (e) {
+    console.error('saveRecordings error:', e);
+    throw new Error('KV save failed: ' + e.message);
+  }
 }
 
 async function handleActiveRecordings(request, env) {
@@ -226,15 +239,13 @@ async function handleActiveRecordings(request, env) {
   try {
     const recordings = await getRecordings(env);
     const active = recordings.filter(r => r.status === 'recording');
-    return new Response(JSON.stringify({
+    return jsonResponse({
       success: true, active_count: active.length,
       max_concurrent: 5, recordings: active,
       timestamp: new Date().toISOString()
-    }), { headers: { 'Content-Type': 'application/json' } });
-  } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500, headers: { 'Content-Type': 'application/json' }
     });
+  } catch (error) {
+    return jsonResponse({ error: error.message }, 500);
   }
 }
 
@@ -243,9 +254,7 @@ async function handleAutoTrigger(request, url, env) {
   try {
     const streamId = url.pathname.split('/').pop();
     if (!streamId || !/^\d+$/.test(streamId)) {
-      return new Response(JSON.stringify({ error: 'Invalid stream ID' }), {
-        status: 400, headers: { 'Content-Type': 'application/json' }
-      });
+      return jsonResponse({ error: 'Invalid stream ID' }, 400);
     }
     const body = await request.json();
     const streamUrl = body.stream_url || ('https://superlivetv.com/fr/livestream/' + streamId);
@@ -254,26 +263,25 @@ async function handleAutoTrigger(request, url, env) {
 
     const watchlist = await getWatchlist(env);
     if (!watchlist.some(e => String(e.stream_id) === streamId)) {
-      return new Response(JSON.stringify({
+      return jsonResponse({
         success: false, error: 'not_in_watchlist', stream_id: streamId
-      }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+      }, 404);
     }
 
     const recordings = await getRecordings(env);
     const existing = recordings.find(r => String(r.stream_id) === streamId && r.status === 'recording');
     if (existing) {
-      return new Response(JSON.stringify({
+      return jsonResponse({
         success: false, error: 'already_recording', stream_id: streamId
-      }), { status: 409, headers: { 'Content-Type': 'application/json' } });
+      }, 409);
     }
 
-    // Cleanup finished/failed recordings
     const active = recordings.filter(r => r.status === 'recording');
     if (active.length >= 5) {
-      return new Response(JSON.stringify({
+      return jsonResponse({
         success: false, error: 'concurrency_limit',
         active_count: active.length, max_concurrent: 5
-      }), { status: 429, headers: { 'Content-Type': 'application/json' } });
+      }, 429);
     }
 
     const recordingState = {
@@ -284,7 +292,6 @@ async function handleAutoTrigger(request, url, env) {
       error: null, source: source
     };
 
-    // Remove any finished/failed entries for this stream, add new
     const filtered = recordings.filter(r =>
       !(String(r.stream_id) === streamId && ['finished', 'failed', 'stopped'].includes(r.status))
     );
@@ -299,24 +306,21 @@ async function handleAutoTrigger(request, url, env) {
         '🤖 <b>Auto Recording بدأ</b>\n📺 البث: <code>' + streamId + '</code>' + nameLine + '\n🔗 الرابط: <a href="' + streamUrl + '">افتح</a>',
         { parse_mode: 'HTML' }
       );
-      return new Response(JSON.stringify({
+      return jsonResponse({
         success: true, started: true, stream_id: streamId,
         stream_name: streamName, timestamp: new Date().toISOString()
-      }), { headers: { 'Content-Type': 'application/json' } });
+      });
     } else {
       recordingState.status = 'failed';
       recordingState.error = triggerResult.error;
       const idx = filtered.findIndex(r => String(r.stream_id) === streamId && r.status === 'recording');
       if (idx >= 0) filtered[idx] = recordingState;
       await saveRecordings(env, filtered);
-      return new Response(JSON.stringify({
-        success: false, error: triggerResult.error
-      }), { status: 502, headers: { 'Content-Type': 'application/json' } });
+      return jsonResponse({ success: false, error: triggerResult.error }, 502);
     }
   } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500, headers: { 'Content-Type': 'application/json' }
-    });
+    console.error('handleAutoTrigger error:', error);
+    return jsonResponse({ error: error.message }, 500);
   }
 }
 
@@ -327,19 +331,12 @@ async function handleTriggerMonitorApi(request, env) {
     const source = body.source || 'api';
     const result = await triggerMonitorWorkflow(env, source);
     if (result.success) {
-      return new Response(JSON.stringify({
-        success: true, message: 'Auto Monitor triggered',
-        timestamp: new Date().toISOString()
-      }), { headers: { 'Content-Type': 'application/json' } });
+      return jsonResponse({ success: true, message: 'Auto Monitor triggered', timestamp: new Date().toISOString() });
     } else {
-      return new Response(JSON.stringify({
-        success: false, error: result.error
-      }), { status: 502, headers: { 'Content-Type': 'application/json' } });
+      return jsonResponse({ success: false, error: result.error }, 502);
     }
   } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500, headers: { 'Content-Type': 'application/json' }
-    });
+    return jsonResponse({ error: error.message }, 500);
   }
 }
 
@@ -364,15 +361,13 @@ async function handleAutoMonitorCron(env) {
 }
 
 // ============================================================
-// LEGACY APIs (kept for compatibility)
+// LEGACY APIs
 // ============================================================
 async function handleUpdateState(request, url, env) {
   try {
     const streamId = url.pathname.split('/').pop();
     if (!streamId || !/^\d+$/.test(streamId)) {
-      return new Response(JSON.stringify({ error: 'Invalid stream ID' }), {
-        status: 400, headers: { 'Content-Type': 'application/json' }
-      });
+      return jsonResponse({ error: 'Invalid stream ID' }, 400);
     }
     const body = await request.json();
     const recordings = await getRecordings(env);
@@ -383,13 +378,10 @@ async function handleUpdateState(request, url, env) {
       recordings.push(Object.assign({ stream_id: streamId }, body));
     }
     await saveRecordings(env, recordings);
-    return new Response(JSON.stringify({
-      success: true, updated: streamId, status: body.status
-    }), { headers: { 'Content-Type': 'application/json' } });
+    return jsonResponse({ success: true, updated: streamId, status: body.status });
   } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500, headers: { 'Content-Type': 'application/json' }
-    });
+    console.error('handleUpdateState error:', error);
+    return jsonResponse({ error: error.message }, 500);
   }
 }
 
@@ -397,20 +389,15 @@ async function handleDeleteRecording(request, url, env) {
   try {
     const streamId = url.pathname.split('/').pop();
     if (!streamId || !/^\d+$/.test(streamId)) {
-      return new Response(JSON.stringify({ error: 'Invalid stream ID' }), {
-        status: 400, headers: { 'Content-Type': 'application/json' }
-      });
+      return jsonResponse({ error: 'Invalid stream ID' }, 400);
     }
     const recordings = await getRecordings(env);
     const filtered = recordings.filter(r => String(r.stream_id) !== streamId);
     await saveRecordings(env, filtered);
-    return new Response(JSON.stringify({
-      success: true, deleted: streamId, timestamp: new Date().toISOString()
-    }), { headers: { 'Content-Type': 'application/json' } });
+    return jsonResponse({ success: true, deleted: streamId, timestamp: new Date().toISOString() });
   } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500, headers: { 'Content-Type': 'application/json' }
-    });
+    console.error('handleDeleteRecording error:', error);
+    return jsonResponse({ error: error.message }, 500);
   }
 }
 
@@ -420,14 +407,9 @@ async function handleCleanup(env) {
     const active = recordings.filter(r => r.status === 'recording');
     const deletedCount = recordings.length - active.length;
     await saveRecordings(env, active);
-    return new Response(JSON.stringify({
-      success: true, deleted_count: deletedCount,
-      timestamp: new Date().toISOString()
-    }), { headers: { 'Content-Type': 'application/json' } });
+    return jsonResponse({ success: true, deleted_count: deletedCount, timestamp: new Date().toISOString() });
   } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500, headers: { 'Content-Type': 'application/json' }
-    });
+    return jsonResponse({ error: error.message }, 500);
   }
 }
 
@@ -435,9 +417,7 @@ async function handleCheckStop(request, url, env) {
   try {
     const streamId = url.pathname.split('/').pop();
     if (!streamId || !/^\d+$/.test(streamId)) {
-      return new Response(JSON.stringify({
-        error: 'Invalid stream ID', should_stop: false
-      }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      return jsonResponse({ error: 'Invalid stream ID', should_stop: false }, 400);
     }
     const recordings = await getRecordings(env);
     const recording = recordings.find(r => String(r.stream_id) === streamId);
@@ -447,16 +427,12 @@ async function handleCheckStop(request, url, env) {
       status = recording.status;
       if (['stopped', 'failed', 'finished'].includes(recording.status)) should_stop = true;
     }
-    return new Response(JSON.stringify({
+    return jsonResponse({
       stream_id: streamId, status: status, should_stop: should_stop,
       timestamp: new Date().toISOString()
-    }), {
-      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache, no-store' }
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: error.message, should_stop: false }), {
-      status: 500, headers: { 'Content-Type': 'application/json' }
-    });
+    return jsonResponse({ error: error.message, should_stop: false }, 500);
   }
 }
 
@@ -512,7 +488,7 @@ async function handleMessage(message, env) {
   } catch (error) {
     console.error('handleMessage error:', error);
     try {
-      await sendTelegramMessage(env, chatId, '❌ حدث خطأ.', { parse_mode: 'HTML' });
+      await sendTelegramMessage(env, chatId, '❌ حدث خطأ: ' + error.message, { parse_mode: 'HTML' });
     } catch (e) {}
   }
   return new Response('OK');
@@ -660,60 +636,88 @@ async function handleCleanupCommand(chatId, env) {
 }
 
 async function handleAddWatch(chatId, streamId, env) {
-  if (!streamId || !/^\d+$/.test(streamId)) {
-    await sendTelegramMessage(env, chatId, '❌ مثال: <code>/addwatch 123456</code>', { parse_mode: 'HTML' });
-    return;
+  try {
+    if (!streamId || !/^\d+$/.test(streamId)) {
+      await sendTelegramMessage(env, chatId, '❌ مثال: <code>/addwatch 123456</code>', { parse_mode: 'HTML' });
+      return;
+    }
+    
+    const watchlist = await getWatchlist(env);
+    
+    if (watchlist.some(e => String(e.stream_id) === streamId)) {
+      await sendTelegramMessage(env, chatId, '⚠️ موجود مسبقاً', { parse_mode: 'HTML' });
+      return;
+    }
+    
+    watchlist.push({ stream_id: streamId, added_at: new Date().toISOString(), display_name: null });
+    
+    try {
+      await saveWatchlist(env, watchlist);
+    } catch (e) {
+      await sendTelegramMessage(env, chatId, '❌ فشل الحفظ في التخزين: ' + e.message, { parse_mode: 'HTML' });
+      return;
+    }
+    
+    await sendTelegramMessage(env, chatId, '✅ تمت إضافة <code>' + streamId + '</code>', {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '📋 القائمة', callback_data: 'watchlist' }],
+        [{ text: '🔙 العودة', callback_data: 'back' }]
+      ]}
+    });
+  } catch (error) {
+    console.error('handleAddWatch error:', error);
+    await sendTelegramMessage(env, chatId, '❌ خطأ: ' + error.message, { parse_mode: 'HTML' });
   }
-  const watchlist = await getWatchlist(env);
-  if (watchlist.some(e => String(e.stream_id) === streamId)) {
-    await sendTelegramMessage(env, chatId, '⚠️ موجود مسبقاً', { parse_mode: 'HTML' });
-    return;
-  }
-  watchlist.push({ stream_id: streamId, added_at: new Date().toISOString(), display_name: null });
-  await saveWatchlist(env, watchlist);
-  await sendTelegramMessage(env, chatId, '✅ تمت إضافة <code>' + streamId + '</code>', {
-    parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: [[{ text: '📋 القائمة', callback_data: 'watchlist' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
-  });
 }
 
 async function handleRemoveWatch(chatId, streamId, env) {
-  if (!streamId || !/^\d+$/.test(streamId)) {
-    await sendTelegramMessage(env, chatId, '❌ مثال: <code>/removewatch 123456</code>', { parse_mode: 'HTML' });
-    return;
-  }
-  const watchlist = await getWatchlist(env);
-  const idx = watchlist.findIndex(e => String(e.stream_id) === streamId);
-  if (idx === -1) {
-    await sendTelegramMessage(env, chatId, '⚠️ غير موجود', { parse_mode: 'HTML' });
-    return;
-  }
-  watchlist.splice(idx, 1);
-  await saveWatchlist(env, watchlist);
-  await sendTelegramMessage(env, chatId, '🗑️ تم حذف <code>' + streamId + '</code>', {
-    parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
-  });
-}
-
-async function handleWatchlistCommand(chatId, env) {
-  const watchlist = await getWatchlist(env);
-  if (watchlist.length === 0) {
-    await sendTelegramMessage(env, chatId, '📋 فارغة. أضف: <code>/addwatch 123456</code>', {
+  try {
+    if (!streamId || !/^\d+$/.test(streamId)) {
+      await sendTelegramMessage(env, chatId, '❌ مثال: <code>/removewatch 123456</code>', { parse_mode: 'HTML' });
+      return;
+    }
+    const watchlist = await getWatchlist(env);
+    const idx = watchlist.findIndex(e => String(e.stream_id) === streamId);
+    if (idx === -1) {
+      await sendTelegramMessage(env, chatId, '⚠️ غير موجود', { parse_mode: 'HTML' });
+      return;
+    }
+    watchlist.splice(idx, 1);
+    await saveWatchlist(env, watchlist);
+    await sendTelegramMessage(env, chatId, '🗑️ تم حذف <code>' + streamId + '</code>', {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
     });
-    return;
+  } catch (error) {
+    console.error('handleRemoveWatch error:', error);
+    await sendTelegramMessage(env, chatId, '❌ خطأ: ' + error.message, { parse_mode: 'HTML' });
   }
-  let msg = '📋 <b>(' + watchlist.length + '):</b>\n\n';
-  for (const e of watchlist) {
-    const name = e.display_name ? (' → ' + escapeHtml(e.display_name)) : '';
-    msg += '• <code>' + e.stream_id + '</code>' + name + '\n';
+}
+
+async function handleWatchlistCommand(chatId, env) {
+  try {
+    const watchlist = await getWatchlist(env);
+    if (watchlist.length === 0) {
+      await sendTelegramMessage(env, chatId, '📋 فارغة. أضف: <code>/addwatch 123456</code>', {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
+      });
+      return;
+    }
+    let msg = '📋 <b>(' + watchlist.length + '):</b>\n\n';
+    for (const e of watchlist) {
+      const name = e.display_name ? (' → ' + escapeHtml(e.display_name)) : '';
+      msg += '• <code>' + e.stream_id + '</code>' + name + '\n';
+    }
+    await sendTelegramMessage(env, chatId, msg, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
+    });
+  } catch (error) {
+    console.error('handleWatchlistCommand error:', error);
+    await sendTelegramMessage(env, chatId, '❌ خطأ: ' + error.message, { parse_mode: 'HTML' });
   }
-  await sendTelegramMessage(env, chatId, msg, {
-    parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
-  });
 }
 
 async function handleTestMonitor(chatId, env) {
