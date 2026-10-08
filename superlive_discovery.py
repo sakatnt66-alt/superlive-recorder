@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-SuperLive Discovery Module - Version 9.5 (Stream ID Extraction)
+SuperLive Discovery Module - Version 9.6 (Strict Premium Detection)
 
-CRITICAL FIX in v9.5:
-- Extract REAL stream_id from API or video URL
-- user_id != stream_id on this website!
-- record_once.py needs: /fr/livestream/{stream_id}
-- NOT /fr/livestream/{user_id}
+CRITICAL FIX in v9.6:
+- Premium detection now checks if lock OVERLAYS the video (not just exists)
+- Uses bounding box comparison to verify lock covers video area
+- More aggressive video detection (check readyState >= 1)
 """
 
 import asyncio
@@ -27,7 +26,7 @@ class SuperLiveDiscovery:
     BASE_URL = "https://superlivetv.com"
     PAGE_TIMEOUT_MS = 30000
     SEARCH_WAIT_MS = 8000
-    VERIFY_WAIT_MS = 8000
+    VERIFY_WAIT_MS = 10000  # Increased wait time
 
     USER_AGENT = (
         "Mozilla/5.0 (X11; Linux x86_64) "
@@ -73,19 +72,9 @@ class SuperLiveDiscovery:
         return clean_url
 
     def _extract_stream_id_from_url(self, url: str) -> Optional[str]:
-        """
-        Extract stream_id from video URL.
-        
-        Example URLs:
-          https://cdn.superlivetv.com/stream/152586609/playlist.m3u8
-          https://cdn.superlivetv.com/live/152586609/chunklist.m3u8
-          https://media.superlivetv.com/152586609/master.mpd
-        
-        Extracts: 152586609
-        """
+        """Extract stream_id from video URL (5+ digit number)"""
         if not url:
             return None
-        # Match numeric ID (5+ digits) in URL path
         match = re.search(r'/(\d{5,})(?:/|$|\.)', url)
         if match:
             stream_id = match.group(1)
@@ -443,7 +432,7 @@ class SuperLiveDiscovery:
                 "username": None, "method": "method_d", "source": "fallback", "uncertain": True}
 
     # ============================================================
-    # PHASE 2: LIVE STATUS DETECTION - with STREAM_ID EXTRACTION
+    # PHASE 2: LIVE STATUS DETECTION - STRICT PREMIUM DETECTION
     # ============================================================
     async def check_live_status(self, profile_url: str, user_id: str = "", profile_id: str = "",
                                 phase1_username: str = None) -> Optional[Dict[str, Any]]:
@@ -483,48 +472,60 @@ class SuperLiveDiscovery:
                     await browser.close()
                     return {"is_live": False, "reason": "page_not_found_404", "source": "validation"}
 
-                # STEP 1: Check video element
+                # STEP 1: Check video element (AGGRESSIVE - check readyState >= 1)
                 has_active_video = False
                 video_stream_url = None
                 try:
                     videos = await page.locator("video").all()
-                    for video in videos:
+                    self.log(f"Found {len(videos)} video element(s)")
+                    
+                    for i, video in enumerate(videos):
                         try:
-                            src = await video.get_attribute("src")
-                            if src and any(ext in src for ext in [".m3u8", ".mpd", "rtmp"]):
-                                has_active_video = True
-                                video_stream_url = src
-                                self.log(f"Found active video src: {src[:80]}...")
-                                break
-                            sources = await video.locator("source").all()
-                            for source in sources:
-                                src = await source.get_attribute("src")
-                                if src and any(ext in src for ext in [".m3u8", ".mpd", "rtmp"]):
+                            # Get video dimensions
+                            dims = await video.evaluate("""el => ({
+                                width: el.videoWidth || el.clientWidth,
+                                height: el.videoHeight || el.clientHeight,
+                                readyState: el.readyState,
+                                paused: el.paused
+                            })""")
+                            
+                            self.log(f"Video {i}: {dims}")
+                            
+                            # Check if video has dimensions (not just a placeholder)
+                            if dims.get("width", 0) > 100 and dims.get("height", 0) > 100:
+                                ready_state = dims.get("readyState", 0)
+                                
+                                # readyState >= 1 means metadata loaded (video exists)
+                                if ready_state >= 1:
                                     has_active_video = True
-                                    video_stream_url = src
-                                    self.log(f"Found active video source: {src[:80]}...")
-                                    break
-                            if has_active_video:
-                                break
-                            try:
-                                ready_state = await video.evaluate("el => el.readyState")
-                                if ready_state >= 2:
-                                    has_active_video = True
+                                    
+                                    # Try to get src
                                     src = await video.get_attribute("src")
                                     if src:
                                         video_stream_url = src
-                                    self.log(f"Video readyState={ready_state} (active)")
+                                        self.log(f"Video {i} active (readyState={ready_state}), src={src[:80]}...")
+                                    else:
+                                        # Check source elements
+                                        sources = await video.locator("source").all()
+                                        for source in sources:
+                                            src = await source.get_attribute("src")
+                                            if src:
+                                                video_stream_url = src
+                                                self.log(f"Video {i} active via source, src={src[:80]}...")
+                                                break
+                                    
                                     break
-                            except: pass
-                        except: continue
+                        except Exception as e:
+                            self.log(f"Video {i} check error: {e}")
+                            continue
                 except Exception as e:
                     self.log(f"Video check error: {e}")
 
                 # STEP 2: Check DOM for live indicators
                 dom_is_live = await self._check_dom_live_indicator(page)
 
-                # STEP 3: Check DOM for PREMIUM (precise - lock inside video area)
-                dom_is_premium = await self._check_dom_premium_precise(page)
+                # STEP 3: Check DOM for PREMIUM (STRICT - lock must OVERLAY video)
+                dom_is_premium = await self._check_dom_premium_strict(page)
 
                 # STEP 4: Check API responses
                 api_result = self._check_api_live_status(api_responses, user_id)
@@ -536,32 +537,29 @@ class SuperLiveDiscovery:
                 stream_url = video_stream_url
 
                 if has_active_video:
+                    # Video exists with metadata loaded
                     if dom_is_live or api_says_live:
                         is_live = True
                         is_premium = False
-                        self.log(f"VIDEO ACTIVE + live indicator -> LIVE_NORMAL")
+                        self.log(f"VIDEO ACTIVE (metadata loaded) + live indicator -> LIVE_NORMAL")
                     else:
+                        # Video exists but no live indicator - might be loading
                         is_live = False
-                        self.log(f"VIDEO ACTIVE but no live indicator -> OFFLINE")
+                        self.log(f"VIDEO ACTIVE but no live indicator -> OFFLINE (might be loading)")
                 elif dom_is_live or api_says_live:
+                    # No video but live indicator exists
                     if dom_is_premium:
                         is_live = True
                         is_premium = True
-                        self.log(f"NO VIDEO + live indicator + LOCK in video area -> LIVE_PREMIUM")
+                        self.log(f"NO VIDEO + live indicator + LOCK overlay -> LIVE_PREMIUM")
                     else:
                         is_live = False
-                        self.log(f"NO VIDEO + live indicator + NO LOCK -> OFFLINE (false positive)")
+                        self.log(f"NO VIDEO + live indicator + NO LOCK overlay -> OFFLINE (false positive)")
                 else:
                     is_live = False
                     self.log(f"NO VIDEO + NO live indicator -> OFFLINE")
 
-                # ================================================================
-                # STEP 6: EXTRACT REAL stream_id (CRITICAL!)
-                # Priority:
-                #   1. API response stream_id
-                #   2. Extract from video src URL (regex for numeric ID)
-                #   3. Fallback to user_id (only if nothing else works)
-                # ================================================================
+                # STEP 6: EXTRACT REAL stream_id
                 stream_id = None
 
                 # Priority 1: API response
@@ -576,7 +574,7 @@ class SuperLiveDiscovery:
                     if stream_id:
                         self.log(f"stream_id from video URL: {stream_id}")
 
-                # Priority 3: Fallback to user_id (last resort)
+                # Priority 3: Fallback to user_id
                 if not stream_id:
                     stream_id = user_id
                     self.log(f"stream_id fallback to user_id: {stream_id}")
@@ -590,7 +588,7 @@ class SuperLiveDiscovery:
                     if page_username:
                         username = self._clean_username(page_username)
 
-                # Determine stream URL - CLEAN IT
+                # Clean URLs
                 if not stream_url:
                     if api_result:
                         stream_url = api_result.get("stream_url")
@@ -599,7 +597,6 @@ class SuperLiveDiscovery:
                 if stream_url:
                     stream_url = self._clean_stream_url(stream_url)
 
-                # Clean profile_url
                 clean_profile_url = self._clean_stream_url(profile_url)
 
                 await browser.close()
@@ -608,8 +605,8 @@ class SuperLiveDiscovery:
                     "is_live": is_live,
                     "stream_url": stream_url,
                     "profile_url": clean_profile_url,
-                    "stream_id": stream_id,  # CRITICAL: real stream_id for recording
-                    "user_id": user_id,       # Original user_id from watchlist
+                    "stream_id": stream_id,
+                    "user_id": user_id,
                     "profile_id": profile_id,
                     "is_premium": is_premium,
                     "username": username,
@@ -630,52 +627,122 @@ class SuperLiveDiscovery:
             self.log(f"check_live_status error: {e}")
             return None
 
-    async def _check_dom_premium_precise(self, page) -> bool:
+    # ============================================================
+    # STRICT PREMIUM DETECTION - Lock must OVERLAY video area
+    # ============================================================
+    async def _check_dom_premium_strict(self, page) -> bool:
+        """
+        Check if a lock/paywall overlay COVERS the video area.
+        
+        STRICT RULES:
+        1. If video exists, lock must be positioned OVER the video (same coordinates)
+        2. If no video, lock must be a large centered modal
+        3. Small lock icons in cards/sidebar are IGNORED
+        """
         try:
             js_code = """
             () => {
                 const videos = document.querySelectorAll('video');
-                if (videos.length === 0) {
-                    const mainArea = document.querySelector('main, .main-content, .video-container, .player-container, .stream-container, [class*="player"], [class*="stream"]');
-                    if (mainArea) {
-                        const locks = mainArea.querySelectorAll('[class*="lock"], [class*="paywall"], [class*="private"], [class*="premium-only"], [class*="exclusive"]');
-                        for (const lock of locks) {
-                            if (lock.offsetParent !== null) { return true; }
-                        }
-                    }
-                    const allLocks = document.querySelectorAll('[class*="lock"], [class*="paywall"]');
-                    for (const lock of allLocks) {
-                        const rect = lock.getBoundingClientRect();
-                        if (rect.width > 200 && rect.height > 200 && lock.offsetParent !== null) {
-                            const centerX = rect.left + rect.width / 2;
-                            const centerY = rect.top + rect.height / 2;
-                            const screenCenterX = window.innerWidth / 2;
-                            const screenCenterY = window.innerHeight / 2;
-                            if (Math.abs(centerX - screenCenterX) < 200 && Math.abs(centerY - screenCenterY) < 200) {
-                                return true;
+                
+                // Helper: Check if element is visible
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return (
+                        rect.width > 0 && 
+                        rect.height > 0 && 
+                        style.display !== 'none' && 
+                        style.visibility !== 'hidden' &&
+                        style.opacity !== '0'
+                    );
+                };
+                
+                // Helper: Check if two elements overlap
+                const elementsOverlap = (el1, el2) => {
+                    const rect1 = el1.getBoundingClientRect();
+                    const rect2 = el2.getBoundingClientRect();
+                    return !(
+                        rect1.right < rect2.left ||
+                        rect1.left > rect2.right ||
+                        rect1.bottom < rect2.top ||
+                        rect1.top > rect2.bottom
+                    );
+                };
+                
+                if (videos.length > 0) {
+                    // Video exists - check if lock OVERLAYS the video
+                    for (const video of videos) {
+                        if (!isVisible(video)) continue;
+                        
+                        const videoRect = video.getBoundingClientRect();
+                        
+                        // Look for lock elements that overlap this video
+                        const potentialLocks = document.querySelectorAll(
+                            '[class*="lock"], [class*="paywall"], [class*="private"], ' +
+                            '[class*="premium-only"], [class*="exclusive"], [class*="overlay"]'
+                        );
+                        
+                        for (const lock of potentialLocks) {
+                            if (!isVisible(lock)) continue;
+                            
+                            const lockRect = lock.getBoundingClientRect();
+                            
+                            // Lock must be LARGE (not just a small icon)
+                            if (lockRect.width < 100 || lockRect.height < 100) continue;
+                            
+                            // Lock must OVERLAP with video
+                            if (elementsOverlap(video, lock)) {
+                                // Lock must cover significant portion of video (>30%)
+                                const overlapArea = (
+                                    Math.max(0, Math.min(lockRect.right, videoRect.right) - Math.max(lockRect.left, videoRect.left)) *
+                                    Math.max(0, Math.min(lockRect.bottom, videoRect.bottom) - Math.max(lockRect.top, videoRect.top))
+                                );
+                                const videoArea = videoRect.width * videoRect.height;
+                                const overlapRatio = overlapArea / videoArea;
+                                
+                                if (overlapRatio > 0.3) {
+                                    return true;
+                                }
                             }
                         }
                     }
                     return false;
-                }
-                for (const video of videos) {
-                    const parent = video.closest('[class*="player"], [class*="container"], [class*="wrapper"], [class*="stream"]') || video.parentElement;
-                    if (parent) {
-                        const locks = parent.querySelectorAll('[class*="lock"], [class*="paywall"], [class*="private"], [class*="premium-only"]');
-                        for (const lock of locks) {
-                            if (lock.offsetParent !== null) { return true; }
+                } else {
+                    // No video - check for large centered paywall modal
+                    const potentialLocks = document.querySelectorAll(
+                        '[class*="paywall"], [class*="modal"], [class*="overlay"], ' +
+                        '[class*="premium-only"], [class*="exclusive"]'
+                    );
+                    
+                    for (const lock of potentialLocks) {
+                        if (!isVisible(lock)) continue;
+                        
+                        const rect = lock.getBoundingClientRect();
+                        
+                        // Must be large (>200x200)
+                        if (rect.width < 200 || rect.height < 200) continue;
+                        
+                        // Must be centered (within 200px of screen center)
+                        const centerX = rect.left + rect.width / 2;
+                        const centerY = rect.top + rect.height / 2;
+                        const screenCenterX = window.innerWidth / 2;
+                        const screenCenterY = window.innerHeight / 2;
+                        
+                        if (Math.abs(centerX - screenCenterX) < 200 && Math.abs(centerY - screenCenterY) < 200) {
+                            return true;
                         }
                     }
+                    return false;
                 }
-                return false;
             }
             """
             result = await page.evaluate(js_code)
             if result:
-                self.log("Premium lock found INSIDE video area")
+                self.log("Premium lock OVERLAYS video area")
             return bool(result)
         except Exception as e:
-            self.log(f"Premium precise check error: {e}")
+            self.log(f"Premium strict check error: {e}")
         return False
 
     async def _check_dom_live_indicator(self, page) -> bool:
