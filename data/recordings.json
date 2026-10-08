@@ -15,6 +15,11 @@
       "status": "recording",
       "started_at": "2026-10-08T21:17:52.273Z",
       "source": "auto"
+    },
+    {
+      "stream_id": "12259737",
+      "state": "failed",
+      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
