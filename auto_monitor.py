@@ -6,7 +6,6 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
@@ -15,7 +14,7 @@ AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SEND_REPORT = os.environ.get("SEND_REPORT", "1") not in ("0", "false", "False")
-UPDATE_WATCHLIST_NAMES = os.environ.get("UPDATE_WATCHLIST_NAMES", "1") not in ("0", "false", "False")
+UPDATE_WATCHLIST_NAMES = os.environ.get("UPDATE_WATCHLIST_NAMES", "0") not in ("0", "false", "False")
 
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "5"))
 API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "20"))
@@ -37,8 +36,6 @@ LIVE_NORMAL = "LIVE_NORMAL"
 LIVE_PREMIUM = "LIVE_PREMIUM"
 OFFLINE = "OFFLINE"
 UNKNOWN = "UNKNOWN"
-
-LOCK_STALE_MINUTES = 12
 
 
 def log(message: str) -> None:
@@ -229,68 +226,6 @@ async def load_active_recordings() -> Dict[str, Any]:
         "max_concurrent": int(data.get("max_concurrent", MAX_CONCURRENT)),
         "active_ids": active_ids,
     }
-
-
-async def acquire_monitor_lock() -> bool:
-    try:
-        status, data = await api_request("/api/monitor-lock/acquire", "POST")
-
-        if status == 200 and data.get("acquired", False):
-            log("Monitor lock acquired successfully")
-            return True
-
-        if status == 200 and data.get("reason") == "already_locked":
-            locked_at = data.get("locked_at", "")
-            log(f"Monitor lock is held (locked_at={locked_at}). Checking if stale...")
-
-            if locked_at:
-                try:
-                    lock_time = datetime.fromisoformat(
-                        locked_at.replace("Z", "+00:00")
-                    )
-                    now = datetime.now(timezone.utc)
-                    lock_age_minutes = (now - lock_time).total_seconds() / 60
-
-                    if lock_age_minutes > LOCK_STALE_MINUTES:
-                        log(
-                            f"Lock is stale ({lock_age_minutes:.1f} minutes old). "
-                            f"Force releasing..."
-                        )
-                        await api_request("/api/monitor-lock/release", "POST")
-                        await asyncio.sleep(2)
-
-                        status2, data2 = await api_request(
-                            "/api/monitor-lock/acquire", "POST"
-                        )
-                        if status2 == 200 and data2.get("acquired", False):
-                            log("Monitor lock acquired after stale lock release")
-                            return True
-                    else:
-                        log(
-                            f"Lock is fresh ({lock_age_minutes:.1f} minutes old). "
-                            f"Another instance is likely running."
-                        )
-                except Exception as e:
-                    log(f"Lock age check error: {e}")
-
-            return False
-
-        log(f"Monitor lock acquisition failed: status={status}, data={data}")
-        return False
-    except Exception as e:
-        log(f"Monitor lock acquire error: {e}")
-        return True
-
-
-async def release_monitor_lock():
-    try:
-        status, data = await api_request("/api/monitor-lock/release", "POST")
-        if status == 200:
-            log("Monitor lock released successfully")
-        else:
-            log(f"Monitor lock release warning: status={status}")
-    except Exception as e:
-        log(f"Monitor lock release error: {e}")
 
 
 async def trigger_auto_recording(
@@ -485,18 +420,32 @@ def _find_username_in_obj(obj, user_id, depth=0):
     return None
 
 
-# ============================================================
-# PAGE CHECK JS
-#
-# This is a simplified version of __superliveSelectTargetVideo
-# from record_once.py. It uses the SAME domContainsTargetId
-# logic and scoring system to identify the correct video.
-#
-# The key insight: domContainsTargetId checks 8 levels up
-# from the video element for data-stream-id, data-id, href,
-# etc. containing the target user_id. The video with the
-# highest score (identity + visible area) is selected.
-# ============================================================
+def classify_final(video_info: Dict[str, Any], json_bodies: List[str], user_id: str) -> str:
+    same_target_dom = bool(video_info.get("sameTargetDom", False))
+    premium = bool(video_info.get("premium", False))
+    stream_ended = bool(video_info.get("streamEnded", False))
+    candidates_count = int(video_info.get("candidates_count", 0))
+
+    premium_from_json = check_json_for_premium(json_bodies, user_id)
+    is_premium = premium or premium_from_json
+
+    if stream_ended and not same_target_dom:
+        return OFFLINE
+
+    if same_target_dom:
+        if is_premium:
+            return LIVE_PREMIUM
+        return LIVE_NORMAL
+
+    if candidates_count > 0 and not same_target_dom:
+        return OFFLINE
+
+    if not same_target_dom and not stream_ended:
+        return OFFLINE
+
+    return UNKNOWN
+
+
 PAGE_CHECK_JS = r"""
 (userId) => {
     const result = {
@@ -516,7 +465,6 @@ PAGE_CHECK_JS = r"""
         const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
         const targetId = userId ? String(userId) : null;
 
-        // Check if stream has ended
         const bodyText = document.body ? document.body.innerText : '';
         if (
             bodyText.includes("Le direct s'est termin") ||
@@ -526,7 +474,6 @@ PAGE_CHECK_JS = r"""
             result.streamEnded = true;
         }
 
-        // Check for premium indicators near the main video area
         try {
             const premiumSections = document.querySelectorAll(
                 '[class*="premium"], [class*="paywall"], [class*="lock"], [class*="subscribe"], [class*="unlock"]'
@@ -536,7 +483,6 @@ PAGE_CHECK_JS = r"""
             }
         } catch (e) {}
 
-        // domContainsTargetId - EXACT same logic as record_once.py WEBRTC_HOOK
         const domContainsTargetId = (element) => {
             if (!targetId || !element) return false;
             let node = element;
@@ -579,8 +525,6 @@ PAGE_CHECK_JS = r"""
             return false;
         };
 
-        // Find videos with srcObject and check target association
-        // Uses same scoring logic as record_once.py __superliveSelectTargetVideo
         const candidates = [];
         for (let index = 0; index < videos.length; index++) {
             const video = videos[index];
@@ -614,7 +558,6 @@ PAGE_CHECK_JS = r"""
 
                 const sameTargetDom = domContainsTargetId(video);
 
-                // Identity score - same as record_once.py
                 let identityScore = 0;
                 if (sameTargetDom) identityScore += 1000000;
 
@@ -638,11 +581,9 @@ PAGE_CHECK_JS = r"""
         result.candidates_count = candidates.length;
 
         if (!candidates.length) {
-            // No live video found at all
             return result;
         }
 
-        // Sort by score (same as record_once.py)
         candidates.sort((a, b) => b.score - a.score);
         const best = candidates[0];
 
@@ -650,7 +591,6 @@ PAGE_CHECK_JS = r"""
         result.sameTargetDom = best.sameTargetDom;
         result.visibleArea = best.visibleArea;
 
-        // Extract display name from the area around the best video
         try {
             let container = best.video.parentElement;
             let nameSearchDepth = 0;
@@ -673,7 +613,6 @@ PAGE_CHECK_JS = r"""
                 nameSearchDepth++;
             }
 
-            // Also try document.title and og:title
             if (!result.displayName) {
                 const ogTitle = document.querySelector('meta[property="og:title"]');
                 if (ogTitle && ogTitle.content) {
@@ -765,15 +704,12 @@ async def classify_user(context, user_id: str, semaphore: asyncio.Semaphore) -> 
         "streamEnded": check_result.get("streamEnded", False),
     }
 
-    # Extract display name
     display_name = None
 
-    # Priority 1: JSON API responses
     json_name = extract_name_from_json(json_bodies, user_id)
     if json_name:
         display_name = json_name
 
-    # Priority 2: DOM extraction from page
     if not display_name:
         raw_name = check_result.get("displayName")
         if raw_name:
@@ -781,12 +717,10 @@ async def classify_user(context, user_id: str, semaphore: asyncio.Semaphore) -> 
             if normalized:
                 display_name = normalized
 
-    # Check premium from JSON
     premium_from_json = check_json_for_premium(json_bodies, user_id)
     if premium_from_json:
         video_info["premium"] = True
 
-    # Decision logic
     if check_result.get("error"):
         return {
             "status": UNKNOWN,
@@ -796,36 +730,16 @@ async def classify_user(context, user_id: str, semaphore: asyncio.Semaphore) -> 
             "video_info": video_info,
         }
 
-    if check_result.get("streamEnded"):
-        return {
-            "status": OFFLINE,
-            "reason": "stream_ended",
-            "stream_url": BASE_LIVE_URL.format(user_id=user_id),
-            "display_name": display_name,
-            "video_info": video_info,
-        }
-
-    if not check_result.get("sameTargetDom"):
-        return {
-            "status": OFFLINE,
-            "reason": "no_target_video_found",
-            "stream_url": BASE_LIVE_URL.format(user_id=user_id),
-            "display_name": display_name,
-            "video_info": video_info,
-        }
-
-    if video_info.get("premium"):
-        return {
-            "status": LIVE_PREMIUM,
-            "reason": "premium_stream",
-            "stream_url": BASE_LIVE_URL.format(user_id=user_id),
-            "display_name": display_name,
-            "video_info": video_info,
-        }
+    final_status = classify_final(video_info, json_bodies, user_id)
 
     return {
-        "status": LIVE_NORMAL,
-        "reason": "target_video_active",
+        "status": final_status,
+        "reason": (
+            f"sameTargetDom={video_info.get('sameTargetDom')},"
+            f"premium={video_info.get('premium')},"
+            f"ended={video_info.get('streamEnded')},"
+            f"candidates={video_info.get('candidates_count')}"
+        ),
         "stream_url": BASE_LIVE_URL.format(user_id=user_id),
         "display_name": display_name,
         "video_info": video_info,
@@ -925,10 +839,8 @@ async def async_main() -> int:
         log("FATAL: AUTO_API_TOKEN is not set")
         return 1
 
-    lock_acquired = await acquire_monitor_lock()
-    if not lock_acquired:
-        log("Monitor lock not acquired. Another instance is running. Exiting.")
-        return 0
+    # NOTE: Monitor lock removed to avoid KV write limit exhaustion.
+    # Concurrency is handled by GitHub Actions concurrency group instead.
 
     try:
         try:
@@ -1010,6 +922,8 @@ async def async_main() -> int:
             final_name = discovered_name or stored_names.get(user_id)
             if final_name:
                 stats["names"][user_id] = final_name
+            # Only update watchlist names if explicitly enabled
+            # Disabled by default to save KV writes
             if UPDATE_WATCHLIST_NAMES and discovered_name:
                 await update_watchlist_name(user_id, discovered_name)
 
@@ -1104,7 +1018,8 @@ async def async_main() -> int:
         return 0
 
     finally:
-        await release_monitor_lock()
+        # No lock to release anymore
+        pass
 
 
 def main() -> int:
