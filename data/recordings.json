@@ -22,7 +22,9 @@
       "stream_name": "Super",
       "status": "recording",
       "started_at": "2026-10-08T21:17:54.182Z",
-      "source": "auto"
+      "source": "auto",
+      "state": "failed",
+      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
