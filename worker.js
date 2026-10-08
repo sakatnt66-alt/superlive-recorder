@@ -1,5 +1,5 @@
-// worker.js - SuperLive Recorder + Auto Monitor + Watchlist + Cron
-// Version: 12.0 - KV write limit protection
+// worker.js - Version 13.0 - Single-Key KV Architecture
+// Solves KV list() limit by storing everything in fixed keys
 
 export default {
   async fetch(request, env, ctx) {
@@ -43,64 +43,59 @@ export default {
     }
     if (url.pathname === '/health') {
       return new Response(JSON.stringify({
-        status: 'ok',
-        timestamp: new Date().toISOString()
-      }), {
-        headers: { 'Content-Type': 'application/json' }
-      });
+        status: 'ok', timestamp: new Date().toISOString()
+      }), { headers: { 'Content-Type': 'application/json' } });
     }
 
     return new Response('Not Found', { status: 404 });
   },
 
+  // Cron Trigger - Runs every 3 minutes
   async scheduled(event, env, ctx) {
-    console.log('[AUTO-CRON] Cron triggered at ' + new Date().toISOString());
+    console.log('[AUTO-CRON] Triggered at ' + new Date().toISOString());
     ctx.waitUntil(handleAutoMonitorCron(env));
   }
 };
 
 // ============================================================
-// HELPERS
+// CONSTANTS - Single-key architecture
 // ============================================================
+const WATCHLIST_KEY = 'watchlist:all';
+const RECORDINGS_KEY = 'recordings:active';
+
 function isAutoApiAuthorized(request, env) {
   if (!env.AUTO_API_TOKEN) return true;
-  const token = request.headers.get('X-Auto-Token');
-  return token === env.AUTO_API_TOKEN;
+  return request.headers.get('X-Auto-Token') === env.AUTO_API_TOKEN;
 }
 
 function unauthorizedResponse() {
   return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-    status: 401,
-    headers: { 'Content-Type': 'application/json' }
+    status: 401, headers: { 'Content-Type': 'application/json' }
   });
 }
 
 function escapeHtml(text) {
   if (!text) return '';
-  return String(text)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+  return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+// ============================================================
+// WATCHLIST - Single key storage
+// ============================================================
 async function getWatchlist(env) {
-  const { keys } = await env.SUPERLIVE_STATE.list({ prefix: 'watchlist:' });
-  const watchlist = [];
-  for (const key of keys) {
-    try {
-      const entry = await env.SUPERLIVE_STATE.get(key.name, 'json');
-      if (entry) {
-        if (!entry.stream_id) entry.stream_id = key.name.replace('watchlist:', '');
-        watchlist.push(entry);
-      }
-    } catch (e) {}
+  try {
+    const data = await env.SUPERLIVE_STATE.get(WATCHLIST_KEY, 'json');
+    if (Array.isArray(data)) return data;
+    return [];
+  } catch (e) {
+    return [];
   }
-  return watchlist;
 }
 
-// ============================================================
-// WATCHLIST API
-// ============================================================
+async function saveWatchlist(env, watchlist) {
+  await env.SUPERLIVE_STATE.put(WATCHLIST_KEY, JSON.stringify(watchlist));
+}
+
 async function handleWatchlistList(request, env) {
   if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
   try {
@@ -126,16 +121,18 @@ async function handleWatchlistAdd(request, env) {
         status: 400, headers: { 'Content-Type': 'application/json' }
       });
     }
-    const key = 'watchlist:' + streamId;
-    const existing = await env.SUPERLIVE_STATE.get(key, 'json');
-    if (existing) {
+    const watchlist = await getWatchlist(env);
+    if (watchlist.some(e => String(e.stream_id) === streamId)) {
       return new Response(JSON.stringify({
         success: true, message: 'Already in watchlist', stream_id: streamId
       }), { headers: { 'Content-Type': 'application/json' } });
     }
-    await env.SUPERLIVE_STATE.put(key, JSON.stringify({
-      stream_id: streamId, added_at: new Date().toISOString(), display_name: null
-    }));
+    watchlist.push({
+      stream_id: streamId,
+      added_at: new Date().toISOString(),
+      display_name: null
+    });
+    await saveWatchlist(env, watchlist);
     return new Response(JSON.stringify({
       success: true, stream_id: streamId, timestamp: new Date().toISOString()
     }), { headers: { 'Content-Type': 'application/json' } });
@@ -156,14 +153,15 @@ async function handleWatchlistRemove(request, env) {
         status: 400, headers: { 'Content-Type': 'application/json' }
       });
     }
-    const key = 'watchlist:' + streamId;
-    const existing = await env.SUPERLIVE_STATE.get(key, 'json');
-    if (!existing) {
+    const watchlist = await getWatchlist(env);
+    const idx = watchlist.findIndex(e => String(e.stream_id) === streamId);
+    if (idx === -1) {
       return new Response(JSON.stringify({
         success: false, error: 'Not found in watchlist'
       }), { status: 404, headers: { 'Content-Type': 'application/json' } });
     }
-    await env.SUPERLIVE_STATE.delete(key);
+    watchlist.splice(idx, 1);
+    await saveWatchlist(env, watchlist);
     return new Response(JSON.stringify({
       success: true, stream_id: streamId, timestamp: new Date().toISOString()
     }), { headers: { 'Content-Type': 'application/json' } });
@@ -185,8 +183,8 @@ async function handleWatchlistUpdateName(request, url, env) {
     }
     const body = await request.json();
     const displayName = String(body.display_name || '').trim();
-    const key = 'watchlist:' + streamId;
-    const entry = await env.SUPERLIVE_STATE.get(key, 'json');
+    const watchlist = await getWatchlist(env);
+    const entry = watchlist.find(e => String(e.stream_id) === streamId);
     if (!entry) {
       return new Response(JSON.stringify({
         success: false, error: 'Not found in watchlist'
@@ -194,7 +192,7 @@ async function handleWatchlistUpdateName(request, url, env) {
     }
     entry.display_name = displayName || null;
     entry.name_updated_at = new Date().toISOString();
-    await env.SUPERLIVE_STATE.put(key, JSON.stringify(entry));
+    await saveWatchlist(env, watchlist);
     return new Response(JSON.stringify({
       success: true, stream_id: streamId,
       display_name: displayName, timestamp: new Date().toISOString()
@@ -207,22 +205,30 @@ async function handleWatchlistUpdateName(request, url, env) {
 }
 
 // ============================================================
-// ACTIVE RECORDINGS API
+// RECORDINGS - Single key storage
 // ============================================================
+async function getRecordings(env) {
+  try {
+    const data = await env.SUPERLIVE_STATE.get(RECORDINGS_KEY, 'json');
+    if (Array.isArray(data)) return data;
+    return [];
+  } catch (e) {
+    return [];
+  }
+}
+
+async function saveRecordings(env, recordings) {
+  await env.SUPERLIVE_STATE.put(RECORDINGS_KEY, JSON.stringify(recordings));
+}
+
 async function handleActiveRecordings(request, env) {
   if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
   try {
-    const { keys } = await env.SUPERLIVE_STATE.list({ prefix: 'recording:' });
-    const activeRecordings = [];
-    for (const key of keys) {
-      try {
-        const recording = await env.SUPERLIVE_STATE.get(key.name, 'json');
-        if (recording && recording.status === 'recording') activeRecordings.push(recording);
-      } catch (e) {}
-    }
+    const recordings = await getRecordings(env);
+    const active = recordings.filter(r => r.status === 'recording');
     return new Response(JSON.stringify({
-      success: true, active_count: activeRecordings.length,
-      max_concurrent: 5, recordings: activeRecordings,
+      success: true, active_count: active.length,
+      max_concurrent: 5, recordings: active,
       timestamp: new Date().toISOString()
     }), { headers: { 'Content-Type': 'application/json' } });
   } catch (error) {
@@ -232,9 +238,6 @@ async function handleActiveRecordings(request, env) {
   }
 }
 
-// ============================================================
-// AUTO TRIGGER API
-// ============================================================
 async function handleAutoTrigger(request, url, env) {
   if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
   try {
@@ -249,28 +252,27 @@ async function handleAutoTrigger(request, url, env) {
     const streamName = body.stream_name || '';
     const source = body.source || 'auto';
 
-    const watchlistKey = 'watchlist:' + streamId;
-    const watchlistEntry = await env.SUPERLIVE_STATE.get(watchlistKey, 'json');
-    if (!watchlistEntry) {
+    const watchlist = await getWatchlist(env);
+    if (!watchlist.some(e => String(e.stream_id) === streamId)) {
       return new Response(JSON.stringify({
         success: false, error: 'not_in_watchlist', stream_id: streamId
       }), { status: 404, headers: { 'Content-Type': 'application/json' } });
     }
 
-    const recordingKey = 'recording:' + streamId;
-    const existing = await env.SUPERLIVE_STATE.get(recordingKey, 'json');
-    if (existing && existing.status === 'recording') {
+    const recordings = await getRecordings(env);
+    const existing = recordings.find(r => String(r.stream_id) === streamId && r.status === 'recording');
+    if (existing) {
       return new Response(JSON.stringify({
         success: false, error: 'already_recording', stream_id: streamId
       }), { status: 409, headers: { 'Content-Type': 'application/json' } });
     }
 
-    await autoCleanup(env);
-    const activeCount = await countActiveRecordings(env);
-    if (activeCount >= 5) {
+    // Cleanup finished/failed recordings
+    const active = recordings.filter(r => r.status === 'recording');
+    if (active.length >= 5) {
       return new Response(JSON.stringify({
         success: false, error: 'concurrency_limit',
-        active_count: activeCount, max_concurrent: 5
+        active_count: active.length, max_concurrent: 5
       }), { status: 429, headers: { 'Content-Type': 'application/json' } });
     }
 
@@ -281,7 +283,13 @@ async function handleAutoTrigger(request, url, env) {
       github_run_id: null, file_size_mb: 0, telegram_sent: false,
       error: null, source: source
     };
-    await env.SUPERLIVE_STATE.put(recordingKey, JSON.stringify(recordingState));
+
+    // Remove any finished/failed entries for this stream, add new
+    const filtered = recordings.filter(r =>
+      !(String(r.stream_id) === streamId && ['finished', 'failed', 'stopped'].includes(r.status))
+    );
+    filtered.push(recordingState);
+    await saveRecordings(env, filtered);
 
     const triggerResult = await triggerRecordWorkflow(env, streamUrl, streamId, streamName);
 
@@ -298,7 +306,9 @@ async function handleAutoTrigger(request, url, env) {
     } else {
       recordingState.status = 'failed';
       recordingState.error = triggerResult.error;
-      await env.SUPERLIVE_STATE.put(recordingKey, JSON.stringify(recordingState));
+      const idx = filtered.findIndex(r => String(r.stream_id) === streamId && r.status === 'recording');
+      if (idx >= 0) filtered[idx] = recordingState;
+      await saveRecordings(env, filtered);
       return new Response(JSON.stringify({
         success: false, error: triggerResult.error
       }), { status: 502, headers: { 'Content-Type': 'application/json' } });
@@ -310,9 +320,6 @@ async function handleAutoTrigger(request, url, env) {
   }
 }
 
-// ============================================================
-// TRIGGER MONITOR API
-// ============================================================
 async function handleTriggerMonitorApi(request, env) {
   if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
   try {
@@ -336,23 +343,20 @@ async function handleTriggerMonitorApi(request, env) {
   }
 }
 
-// ============================================================
-// CRON HANDLER
-// ============================================================
 async function handleAutoMonitorCron(env) {
   try {
-    console.log('[AUTO-CRON] Starting scheduled check...');
+    console.log('[AUTO-CRON] Starting...');
     const watchlist = await getWatchlist(env);
     if (!watchlist || watchlist.length === 0) {
-      console.log('[AUTO-CRON] Watchlist is empty, skipping');
+      console.log('[AUTO-CRON] Watchlist empty');
       return;
     }
     console.log('[AUTO-CRON] Watchlist has ' + watchlist.length + ' users');
     const result = await triggerMonitorWorkflow(env, 'cloudflare_cron');
     if (result.success) {
-      console.log('[AUTO-CRON] Auto monitor triggered successfully');
+      console.log('[AUTO-CRON] Monitor triggered successfully');
     } else {
-      console.error('[AUTO-CRON] Failed to trigger auto monitor: ' + result.error);
+      console.error('[AUTO-CRON] Failed: ' + result.error);
     }
   } catch (error) {
     console.error('[AUTO-CRON] Error:', error);
@@ -360,7 +364,7 @@ async function handleAutoMonitorCron(env) {
 }
 
 // ============================================================
-// ORIGINAL STATE APIs
+// LEGACY APIs (kept for compatibility)
 // ============================================================
 async function handleUpdateState(request, url, env) {
   try {
@@ -371,16 +375,16 @@ async function handleUpdateState(request, url, env) {
       });
     }
     const body = await request.json();
-    const key = 'recording:' + streamId;
-    let existing = {};
-    try {
-      const existingData = await env.SUPERLIVE_STATE.get(key, 'json');
-      if (existingData) existing = existingData;
-    } catch (e) {}
-    const newState = Object.assign({}, existing, body);
-    await env.SUPERLIVE_STATE.put(key, JSON.stringify(newState));
+    const recordings = await getRecordings(env);
+    const idx = recordings.findIndex(r => String(r.stream_id) === streamId && r.status === 'recording');
+    if (idx >= 0) {
+      recordings[idx] = Object.assign({}, recordings[idx], body);
+    } else {
+      recordings.push(Object.assign({ stream_id: streamId }, body));
+    }
+    await saveRecordings(env, recordings);
     return new Response(JSON.stringify({
-      success: true, updated: streamId, status: newState.status
+      success: true, updated: streamId, status: body.status
     }), { headers: { 'Content-Type': 'application/json' } });
   } catch (error) {
     return new Response(JSON.stringify({ error: error.message }), {
@@ -397,8 +401,9 @@ async function handleDeleteRecording(request, url, env) {
         status: 400, headers: { 'Content-Type': 'application/json' }
       });
     }
-    const key = 'recording:' + streamId;
-    await env.SUPERLIVE_STATE.delete(key);
+    const recordings = await getRecordings(env);
+    const filtered = recordings.filter(r => String(r.stream_id) !== streamId);
+    await saveRecordings(env, filtered);
     return new Response(JSON.stringify({
       success: true, deleted: streamId, timestamp: new Date().toISOString()
     }), { headers: { 'Content-Type': 'application/json' } });
@@ -411,19 +416,12 @@ async function handleDeleteRecording(request, url, env) {
 
 async function handleCleanup(env) {
   try {
-    const { keys } = await env.SUPERLIVE_STATE.list({ prefix: 'recording:' });
-    let deletedCount = 0;
-    const deletedIds = [];
-    for (const key of keys) {
-      const recording = await env.SUPERLIVE_STATE.get(key.name, 'json');
-      if (recording && ['finished', 'failed', 'stopped'].includes(recording.status)) {
-        await env.SUPERLIVE_STATE.delete(key.name);
-        deletedCount++;
-        deletedIds.push(recording.stream_id);
-      }
-    }
+    const recordings = await getRecordings(env);
+    const active = recordings.filter(r => r.status === 'recording');
+    const deletedCount = recordings.length - active.length;
+    await saveRecordings(env, active);
     return new Response(JSON.stringify({
-      success: true, deleted_count: deletedCount, deleted_ids: deletedIds,
+      success: true, deleted_count: deletedCount,
       timestamp: new Date().toISOString()
     }), { headers: { 'Content-Type': 'application/json' } });
   } catch (error) {
@@ -441,8 +439,8 @@ async function handleCheckStop(request, url, env) {
         error: 'Invalid stream ID', should_stop: false
       }), { status: 400, headers: { 'Content-Type': 'application/json' } });
     }
-    const key = 'recording:' + streamId;
-    const recording = await env.SUPERLIVE_STATE.get(key, 'json');
+    const recordings = await getRecordings(env);
+    const recording = recordings.find(r => String(r.stream_id) === streamId);
     let should_stop = false;
     let status = 'not_found';
     if (recording) {
@@ -463,17 +461,13 @@ async function handleCheckStop(request, url, env) {
 }
 
 // ============================================================
-// TELEGRAM WEBHOOK
+// TELEGRAM
 // ============================================================
 async function handleTelegramWebhook(request, env) {
   try {
     const update = await request.json();
-    if (update.callback_query) {
-      return handleCallbackQuery(update.callback_query, env);
-    }
-    if (update.message) {
-      return handleMessage(update.message, env);
-    }
+    if (update.callback_query) return handleCallbackQuery(update.callback_query, env);
+    if (update.message) return handleMessage(update.message, env);
     return new Response('OK');
   } catch (error) {
     console.error('Webhook error:', error);
@@ -481,587 +475,328 @@ async function handleTelegramWebhook(request, env) {
   }
 }
 
-// ============================================================
-// TELEGRAM MESSAGE HANDLER
-// ============================================================
 async function handleMessage(message, env) {
   const chatId = message.chat.id.toString();
   const text = (message.text || '').trim();
-
-  if (chatId !== env.TELEGRAM_CHAT_ID) {
-    return new Response('OK');
-  }
+  if (chatId !== env.TELEGRAM_CHAT_ID) return new Response('OK');
 
   const parts = text.split(/\s+/);
   const command = parts[0].toLowerCase();
   const args = parts.slice(1);
 
   try {
-    if (command === '/start' || command === '/help') {
-      await sendMainMenu(chatId, env);
-      return new Response('OK');
-    }
-    if (command === '/status') {
-      await handleStatus(chatId, env);
-      return new Response('OK');
-    }
-    if (command === '/cleanup') {
-      await handleCleanupCommand(chatId, env);
-      return new Response('OK');
-    }
-    if (command === '/stop') {
-      const streamId = args[0] || null;
-      await handleStop(chatId, streamId, env);
-      return new Response('OK');
-    }
-    if (command === '/addwatch') {
-      const streamId = args[0] || null;
-      await handleAddWatch(chatId, streamId, env);
-      return new Response('OK');
-    }
-    if (command === '/removewatch') {
-      const streamId = args[0] || null;
-      await handleRemoveWatch(chatId, streamId, env);
-      return new Response('OK');
-    }
-    if (command === '/watchlist') {
-      await handleWatchlistCommand(chatId, env);
-      return new Response('OK');
-    }
-    if (command === '/testmonitor') {
-      await handleTestMonitor(chatId, env);
-      return new Response('OK');
-    }
+    if (command === '/start' || command === '/help') { await sendMainMenu(chatId, env); return new Response('OK'); }
+    if (command === '/status') { await handleStatus(chatId, env); return new Response('OK'); }
+    if (command === '/cleanup') { await handleCleanupCommand(chatId, env); return new Response('OK'); }
+    if (command === '/stop') { await handleStop(chatId, args[0] || null, env); return new Response('OK'); }
+    if (command === '/addwatch') { await handleAddWatch(chatId, args[0] || null, env); return new Response('OK'); }
+    if (command === '/removewatch') { await handleRemoveWatch(chatId, args[0] || null, env); return new Response('OK'); }
+    if (command === '/watchlist') { await handleWatchlistCommand(chatId, env); return new Response('OK'); }
+    if (command === '/testmonitor') { await handleTestMonitor(chatId, env); return new Response('OK'); }
 
     const streamUrl = extractStreamUrl(text);
     if (streamUrl) {
       const streamId = extractStreamId(streamUrl);
-      if (streamId) {
-        await handleRecord(chatId, streamUrl, env);
-        return new Response('OK');
-      }
+      if (streamId) { await handleRecord(chatId, streamUrl, env); return new Response('OK'); }
     }
 
     await sendTelegramMessage(env, chatId,
-      '🤖 أرسل رابط البث المباشر للبدء بالتسجيل!\n' +
-      'مثال:\n<code>https://superlivetv.com/fr/livestream/123456</code>\n\n' +
+      '🤖 أرسل رابط البث المباشر للبدء!\n\n' +
       'الأوامر:\n' +
-      '<code>/addwatch 123456</code> - إضافة للمراقبة\n' +
-      '<code>/removewatch 123456</code> - حذف من المراقبة\n' +
-      '<code>/watchlist</code> - عرض القائمة\n' +
-      '<code>/testmonitor</code> - تشغيل المراقبة',
+      '<code>/addwatch 123456</code>\n' +
+      '<code>/removewatch 123456</code>\n' +
+      '<code>/watchlist</code>\n' +
+      '<code>/testmonitor</code>',
       { parse_mode: 'HTML' }
     );
   } catch (error) {
     console.error('handleMessage error:', error);
     try {
-      await sendTelegramMessage(env, chatId,
-        '❌ حدث خطأ في معالجة الرسالة.\nيرجى المحاولة مرة أخرى.',
-        { parse_mode: 'HTML' }
-      );
-    } catch (e) {
-      console.error('Failed to send error message:', e);
-    }
+      await sendTelegramMessage(env, chatId, '❌ حدث خطأ.', { parse_mode: 'HTML' });
+    } catch (e) {}
   }
-
   return new Response('OK');
 }
 
-// ============================================================
-// TELEGRAM CALLBACK HANDLER
-// ============================================================
 async function handleCallbackQuery(callbackQuery, env) {
   const chatId = callbackQuery.message.chat.id.toString();
   const data = callbackQuery.data;
-
   if (chatId !== env.TELEGRAM_CHAT_ID) {
     await answerCallbackQuery(callbackQuery.id, env, '❌ غير مصرح');
     return new Response('OK');
   }
-
   try {
-    if (data === 'status') {
-      await handleStatus(chatId, env);
-      await answerCallbackQuery(callbackQuery.id, env, '✅ تم التحديث');
-    } else if (data === 'cleanup') {
-      await handleCleanupCommand(chatId, env);
-      await answerCallbackQuery(callbackQuery.id, env, '🧹 تم التنظيف');
-    } else if (data === 'stop_menu') {
-      await showStopMenu(chatId, env);
-      await answerCallbackQuery(callbackQuery.id, env, '✅ اختر التسجيل');
-    } else if (data.startsWith('stop:')) {
-      const streamId = data.split(':')[1];
-      await handleStop(chatId, streamId, env);
-      await answerCallbackQuery(callbackQuery.id, env, '🛑 تم الإيقاف');
-    } else if (data === 'help') {
-      await sendHelp(chatId, env);
-      await answerCallbackQuery(callbackQuery.id, env, '✅ عرض المساعدة');
-    } else if (data === 'back') {
-      await sendMainMenu(chatId, env);
-      await answerCallbackQuery(callbackQuery.id, env, '✅ القائمة الرئيسية');
-    } else if (data === 'watchlist') {
-      await handleWatchlistCommand(chatId, env);
-      await answerCallbackQuery(callbackQuery.id, env, '📋 قائمة المراقبة');
-    } else if (data === 'test_monitor') {
-      await handleTestMonitor(chatId, env);
-      await answerCallbackQuery(callbackQuery.id, env, '🧪 تم التشغيل');
-    }
+    if (data === 'status') await handleStatus(chatId, env);
+    else if (data === 'cleanup') await handleCleanupCommand(chatId, env);
+    else if (data === 'stop_menu') await showStopMenu(chatId, env);
+    else if (data.startsWith('stop:')) await handleStop(chatId, data.split(':')[1], env);
+    else if (data === 'help') await sendHelp(chatId, env);
+    else if (data === 'back') await sendMainMenu(chatId, env);
+    else if (data === 'watchlist') await handleWatchlistCommand(chatId, env);
+    else if (data === 'test_monitor') await handleTestMonitor(chatId, env);
+    await answerCallbackQuery(callbackQuery.id, env, '✓');
   } catch (error) {
     console.error('Callback error:', error);
-    try {
-      await answerCallbackQuery(callbackQuery.id, env, '❌ خطأ');
-    } catch (e) {}
   }
-
   return new Response('OK');
 }
 
-// ============================================================
-// TELEGRAM COMMAND HANDLERS
-// ============================================================
 async function handleRecord(chatId, streamUrl, env) {
   const streamId = extractStreamId(streamUrl);
-  if (!streamId) {
-    await sendTelegramMessage(env, chatId, '❌ رابط غير صالح.');
+  if (!streamId) { await sendTelegramMessage(env, chatId, '❌ رابط غير صالح.'); return; }
+
+  const recordings = await getRecordings(env);
+  const existing = recordings.find(r => String(r.stream_id) === streamId && r.status === 'recording');
+  if (existing) {
+    await sendTelegramMessage(env, chatId,
+      '⚠️ البث <code>' + streamId + '</code> يُسجّل حالياً.', { parse_mode: 'HTML' });
     return;
   }
-  const existingKey = 'recording:' + streamId;
-  const existing = await env.SUPERLIVE_STATE.get(existingKey, 'json');
-  if (existing && existing.status === 'recording') {
-    await sendTelegramMessage(env, chatId,
-      '⚠️ البث <code>' + streamId + '</code> يُسجّل حالياً.\nبدأ: ' + getElapsedTime(existing.started_at),
-      { parse_mode: 'HTML' }
-    );
-    return;
-  }
-  await autoCleanup(env);
-  const activeCount = await countActiveRecordings(env);
-  if (activeCount >= 5) {
-    await sendTelegramMessage(env, chatId,
-      '❌ تم الوصول للحد الأقصى (5 تسجيلات متزامنة).\nاستخدم زر "🛑 إيقاف" لإيقاف تسجيل أولاً.'
-    );
+
+  const active = recordings.filter(r => r.status === 'recording');
+  if (active.length >= 5) {
+    await sendTelegramMessage(env, chatId, '❌ الحد الأقصى (5) تم الوصول إليه.');
     return;
   }
 
   let streamName = '';
-  try {
-    const watchEntry = await env.SUPERLIVE_STATE.get('watchlist:' + streamId, 'json');
-    if (watchEntry && watchEntry.display_name) streamName = watchEntry.display_name;
-  } catch (e) {}
+  const watchlist = await getWatchlist(env);
+  const watchEntry = watchlist.find(e => String(e.stream_id) === streamId);
+  if (watchEntry && watchEntry.display_name) streamName = watchEntry.display_name;
 
-  const recordingState = {
+  const state = {
     stream_id: streamId, stream_url: streamUrl,
     stream_name: streamName || null, status: 'recording',
-    started_at: new Date().toISOString(), duration_minutes: null,
-    github_run_id: null, file_size_mb: 0, telegram_sent: false,
-    error: null, source: 'manual'
+    started_at: new Date().toISOString(), source: 'manual'
   };
-  await env.SUPERLIVE_STATE.put(existingKey, JSON.stringify(recordingState));
+
+  const filtered = recordings.filter(r =>
+    !(String(r.stream_id) === streamId && ['finished', 'failed', 'stopped'].includes(r.status))
+  );
+  filtered.push(state);
+  await saveRecordings(env, filtered);
 
   const triggerResult = await triggerRecordWorkflow(env, streamUrl, streamId, streamName);
   if (triggerResult.success) {
     const nameLine = streamName ? ('\n👤 الاسم: <b>' + escapeHtml(streamName) + '</b>') : '';
     await sendTelegramMessage(env, chatId,
-      '🔴 <b>بدأ التسجيل المستمر!</b>\n📺 البث: <code>' + streamId + '</code>' + nameLine + '\n⏱️ سيستمر حتى ينتهي البث أو تضغط "إيقاف"\n🔗 الرابط: <a href="' + streamUrl + '">افتح</a>',
+      '🔴 <b>بدأ التسجيل!</b>\n📺 <code>' + streamId + '</code>' + nameLine,
       {
         parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '📊 الحالة', callback_data: 'status' }],
-            [{ text: '🛑 إيقاف هذا التسجيل', callback_data: 'stop:' + streamId }]
-          ]
-        }
+        reply_markup: { inline_keyboard: [
+          [{ text: '📊 الحالة', callback_data: 'status' }],
+          [{ text: '🛑 إيقاف', callback_data: 'stop:' + streamId }]
+        ]}
       }
     );
   } else {
-    recordingState.status = 'failed';
-    recordingState.error = triggerResult.error;
-    await env.SUPERLIVE_STATE.put(existingKey, JSON.stringify(recordingState));
-    await sendTelegramMessage(env, chatId,
-      '❌ <b>فشل بدء التسجيل!</b>\n<b>الخطأ:</b> ' + triggerResult.error,
-      { parse_mode: 'HTML' }
-    );
+    await sendTelegramMessage(env, chatId, '❌ فشل: ' + triggerResult.error, { parse_mode: 'HTML' });
   }
 }
 
 async function handleStatus(chatId, env) {
-  await autoCleanup(env);
-  const { keys } = await env.SUPERLIVE_STATE.list({ prefix: 'recording:' });
-  if (keys.length === 0) {
-    await sendTelegramMessage(env, chatId,
-      '📭 <b>لا توجد تسجيلات حالياً</b>\nأرسل رابط بث للبدء!',
-      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] } }
-    );
+  const recordings = await getRecordings(env);
+  const active = recordings.filter(r => r.status === 'recording');
+  if (active.length === 0) {
+    await sendTelegramMessage(env, chatId, '📭 لا توجد تسجيلات', {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
+    });
     return;
   }
-  let message = '📊 <b>حالة التسجيلات:</b>\n';
-  let hasActive = false;
-  for (const key of keys) {
-    const recording = await env.SUPERLIVE_STATE.get(key.name, 'json');
-    if (recording) {
-      const statusEmoji = getStatusEmoji(recording.status);
-      const duration = recording.started_at ? getElapsedTime(recording.started_at) : 'N/A';
-      if (recording.status === 'recording') hasActive = true;
-      message += statusEmoji + ' <b>البث ' + recording.stream_id + '</b>\n';
-      message += '   الحالة: <code>' + recording.status + '</code>\n';
-      message += '   بدأ: ' + duration + '\n';
-      if (recording.stream_name) message += '   الاسم: ' + escapeHtml(recording.stream_name) + '\n';
-      if (recording.file_size_mb > 0) message += '   الحجم: ' + recording.file_size_mb.toFixed(2) + ' MB\n';
-      if (recording.error) message += '   خطأ: ' + recording.error + '\n';
-      message += '\n';
-    }
+  let msg = '📊 <b>التسجيلات:</b>\n';
+  for (const r of active) {
+    msg += '🔴 <code>' + r.stream_id + '</code> - ' + getElapsedTime(r.started_at) + '\n';
+    if (r.stream_name) msg += '   ' + escapeHtml(r.stream_name) + '\n';
   }
-  const activeCount = await countActiveRecordings(env);
-  message += '\n<b>التسجيلات النشطة:</b> ' + activeCount + '/5';
-  const buttons = [[{ text: '🔄 تحديث', callback_data: 'status' }]];
-  if (hasActive) buttons.push([{ text: '🛑 إيقاف تسجيل', callback_data: 'stop_menu' }]);
-  buttons.push([{ text: '🧹 تنظيف', callback_data: 'cleanup' }]);
-  buttons.push([{ text: '🔙 القائمة الرئيسية', callback_data: 'back' }]);
-  await sendTelegramMessage(env, chatId, message, {
-    parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons }
+  msg += '\n<b>النشطة:</b> ' + active.length + '/5';
+  await sendTelegramMessage(env, chatId, msg, {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [
+      [{ text: '🔄 تحديث', callback_data: 'status' }],
+      [{ text: '🛑 إيقاف', callback_data: 'stop_menu' }],
+      [{ text: '🔙 العودة', callback_data: 'back' }]
+    ]}
   });
 }
 
 async function handleStop(chatId, streamId, env) {
-  if (!streamId) {
-    await sendTelegramMessage(env, chatId, '⚠️ يرجى تحديد البث المراد إيقافه.\nاستخدم زر "🛑 إيقاف" من القائمة.');
-    return;
-  }
-  const key = 'recording:' + streamId;
-  const recording = await env.SUPERLIVE_STATE.get(key, 'json');
-  if (!recording) {
-    await sendTelegramMessage(env, chatId, '⚠️ البث <code>' + streamId + '</code> غير موجود.', { parse_mode: 'HTML' });
-    return;
-  }
-  if (recording.status !== 'recording') {
-    await sendTelegramMessage(env, chatId, '⚠️ البث <code>' + streamId + '</code> لا يُسجّل حالياً.\nالحالة: <code>' + recording.status + '</code>', { parse_mode: 'HTML' });
-    return;
-  }
-  recording.status = 'stopped';
-  recording.stopped_at = new Date().toISOString();
-  await env.SUPERLIVE_STATE.put(key, JSON.stringify(recording));
-  const duration = recording.started_at ? getElapsedTime(recording.started_at) : 'N/A';
-  await sendTelegramMessage(env, chatId,
-    '🛑 <b>تم إرسال أمر الإيقاف!</b>\n📺 البث: <code>' + streamId + '</code>\n⏱️ مدة التسجيل: ' + duration,
-    {
-      parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [[{ text: '📊 الحالة', callback_data: 'status' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
-    }
-  );
+  if (!streamId) { await sendTelegramMessage(env, chatId, '⚠️ حدد البث'); return; }
+  const recordings = await getRecordings(env);
+  const r = recordings.find(x => String(x.stream_id) === streamId && x.status === 'recording');
+  if (!r) { await sendTelegramMessage(env, chatId, '⚠️ غير موجود', { parse_mode: 'HTML' }); return; }
+  r.status = 'stopped';
+  r.stopped_at = new Date().toISOString();
+  await saveRecordings(env, recordings);
+  await sendTelegramMessage(env, chatId, '🛑 تم الإيقاف: <code>' + streamId + '</code>', { parse_mode: 'HTML' });
 }
 
 async function showStopMenu(chatId, env) {
-  const { keys } = await env.SUPERLIVE_STATE.list({ prefix: 'recording:' });
-  const activeRecordings = [];
-  for (const key of keys) {
-    const recording = await env.SUPERLIVE_STATE.get(key.name, 'json');
-    if (recording && recording.status === 'recording') activeRecordings.push(recording);
-  }
-  if (activeRecordings.length === 0) {
-    await sendTelegramMessage(env, chatId, '✅ لا توجد تسجيلات نشطة حالياً.', {
-      parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
+  const recordings = await getRecordings(env);
+  const active = recordings.filter(r => r.status === 'recording');
+  if (active.length === 0) {
+    await sendTelegramMessage(env, chatId, '✅ لا تسجيلات', {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
     });
     return;
   }
-  const buttons = activeRecordings.map(function(rec) {
-    const duration = rec.started_at ? getElapsedTime(rec.started_at) : '';
-    return [{ text: '🛑 ' + rec.stream_id + ' (' + duration + ')', callback_data: 'stop:' + rec.stream_id }];
-  });
+  const buttons = active.map(r => [{ text: '🛑 ' + r.stream_id, callback_data: 'stop:' + r.stream_id }]);
   buttons.push([{ text: '🔙 العودة', callback_data: 'back' }]);
-  await sendTelegramMessage(env, chatId, '🛑 <b>اختر التسجيل المراد إيقافه:</b>', {
+  await sendTelegramMessage(env, chatId, '🛑 اختر:', {
     parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons }
   });
 }
 
 async function handleCleanupCommand(chatId, env) {
-  const { keys } = await env.SUPERLIVE_STATE.list({ prefix: 'recording:' });
-  let deletedCount = 0;
-  for (const key of keys) {
-    const recording = await env.SUPERLIVE_STATE.get(key.name, 'json');
-    if (recording && ['finished', 'failed', 'stopped'].includes(recording.status)) {
-      await env.SUPERLIVE_STATE.delete(key.name);
-      deletedCount++;
-    }
-  }
-  await sendTelegramMessage(env, chatId,
-    '🧹 <b>تم التنظيف!</b>\nتم حذف ' + deletedCount + ' تسجيل منتهي.',
-    {
-      parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [[{ text: '📊 الحالة', callback_data: 'status' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
-    }
-  );
+  const recordings = await getRecordings(env);
+  const active = recordings.filter(r => r.status === 'recording');
+  const deleted = recordings.length - active.length;
+  await saveRecordings(env, active);
+  await sendTelegramMessage(env, chatId, '🧹 تم حذف ' + deleted + ' تسجيل', {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
+  });
 }
 
 async function handleAddWatch(chatId, streamId, env) {
   if (!streamId || !/^\d+$/.test(streamId)) {
-    await sendTelegramMessage(env, chatId,
-      '❌ معرف غير صالح. يجب أن يكون رقماً.\nمثال: <code>/addwatch 123456</code>',
-      { parse_mode: 'HTML' }
-    );
+    await sendTelegramMessage(env, chatId, '❌ مثال: <code>/addwatch 123456</code>', { parse_mode: 'HTML' });
     return;
   }
-
-  try {
-    const key = 'watchlist:' + streamId;
-    const existing = await env.SUPERLIVE_STATE.get(key, 'json');
-    if (existing) {
-      await sendTelegramMessage(env, chatId,
-        '⚠️ البث <code>' + streamId + '</code> موجود مسبقاً في قائمة المراقبة.',
-        { parse_mode: 'HTML' }
-      );
-      return;
-    }
-    await env.SUPERLIVE_STATE.put(key, JSON.stringify({
-      stream_id: streamId, added_at: new Date().toISOString(), display_name: null
-    }));
-    await sendTelegramMessage(env, chatId,
-      '✅ تم إضافة <code>' + streamId + '</code> إلى قائمة المراقبة.\nسيتم فحصه تلقائياً كل 3 دقائق.',
-      {
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [[{ text: '📋 قائمة المراقبة', callback_data: 'watchlist' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
-      }
-    );
-  } catch (error) {
-    console.error('handleAddWatch KV error:', error);
-    await sendTelegramMessage(env, chatId,
-      '❌ فشلت الإضافة بسبب استنفاد حد عمليات الكتابة اليومي على التخزين.\n' +
-      'سيُعاد تعيين الحد تلقائياً عند منتصف الليل (UTC).\n' +
-      'حاول مرة أخرى غداً.',
-      { parse_mode: 'HTML' }
-    );
+  const watchlist = await getWatchlist(env);
+  if (watchlist.some(e => String(e.stream_id) === streamId)) {
+    await sendTelegramMessage(env, chatId, '⚠️ موجود مسبقاً', { parse_mode: 'HTML' });
+    return;
   }
+  watchlist.push({ stream_id: streamId, added_at: new Date().toISOString(), display_name: null });
+  await saveWatchlist(env, watchlist);
+  await sendTelegramMessage(env, chatId, '✅ تمت إضافة <code>' + streamId + '</code>', {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [[{ text: '📋 القائمة', callback_data: 'watchlist' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
+  });
 }
 
 async function handleRemoveWatch(chatId, streamId, env) {
   if (!streamId || !/^\d+$/.test(streamId)) {
-    await sendTelegramMessage(env, chatId,
-      '❌ معرف غير صالح. يجب أن يكون رقماً.\nمثال: <code>/removewatch 123456</code>',
-      { parse_mode: 'HTML' }
-    );
+    await sendTelegramMessage(env, chatId, '❌ مثال: <code>/removewatch 123456</code>', { parse_mode: 'HTML' });
     return;
   }
-
-  try {
-    const key = 'watchlist:' + streamId;
-    const existing = await env.SUPERLIVE_STATE.get(key, 'json');
-    if (!existing) {
-      await sendTelegramMessage(env, chatId,
-        '⚠️ البث <code>' + streamId + '</code> غير موجود في قائمة المراقبة.',
-        { parse_mode: 'HTML' }
-      );
-      return;
-    }
-    await env.SUPERLIVE_STATE.delete(key);
-    await sendTelegramMessage(env, chatId,
-      '🗑️ تم حذف <code>' + streamId + '</code> من قائمة المراقبة.',
-      {
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [[{ text: '📋 قائمة المراقبة', callback_data: 'watchlist' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
-      }
-    );
-  } catch (error) {
-    console.error('handleRemoveWatch KV error:', error);
-    await sendTelegramMessage(env, chatId,
-      '❌ فشل الحذف بسبب خطأ في التخزين. حاول مرة أخرى لاحقاً.',
-      { parse_mode: 'HTML' }
-    );
+  const watchlist = await getWatchlist(env);
+  const idx = watchlist.findIndex(e => String(e.stream_id) === streamId);
+  if (idx === -1) {
+    await sendTelegramMessage(env, chatId, '⚠️ غير موجود', { parse_mode: 'HTML' });
+    return;
   }
+  watchlist.splice(idx, 1);
+  await saveWatchlist(env, watchlist);
+  await sendTelegramMessage(env, chatId, '🗑️ تم حذف <code>' + streamId + '</code>', {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
+  });
 }
 
 async function handleWatchlistCommand(chatId, env) {
-  let watchlist = [];
-  try {
-    watchlist = await getWatchlist(env);
-  } catch (e) {
-    console.error('getWatchlist error in handleWatchlistCommand:', e);
-    await sendTelegramMessage(env, chatId,
-      '⚠️ حدث خطأ في قراءة قائمة المراقبة. حاول مرة أخرى لاحقاً.',
-      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] } }
-    );
-    return;
-  }
+  const watchlist = await getWatchlist(env);
   if (watchlist.length === 0) {
-    await sendTelegramMessage(env, chatId,
-      '📋 <b>قائمة المراقبة فارغة</b>\nأضف مستخدمين باستخدام:\n<code>/addwatch 123456</code>',
-      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] } }
-    );
+    await sendTelegramMessage(env, chatId, '📋 فارغة. أضف: <code>/addwatch 123456</code>', {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
+    });
     return;
   }
-  let message = '📋 <b>قائمة المراقبة (' + watchlist.length + ' مستخدم):</b>\n\n';
-  for (const entry of watchlist) {
-    const displayId = entry.stream_id || 'unknown';
-    const name = entry.display_name ? (' → ' + escapeHtml(entry.display_name)) : '';
-    message += '• <code>' + displayId + '</code>' + name + '\n';
+  let msg = '📋 <b>(' + watchlist.length + '):</b>\n\n';
+  for (const e of watchlist) {
+    const name = e.display_name ? (' → ' + escapeHtml(e.display_name)) : '';
+    msg += '• <code>' + e.stream_id + '</code>' + name + '\n';
   }
-  message += '\nأضف: <code>/addwatch 123456</code>\nاحذف: <code>/removewatch 123456</code>';
-  await sendTelegramMessage(env, chatId, message, {
+  await sendTelegramMessage(env, chatId, msg, {
     parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: [[{ text: '🔄 تحديث', callback_data: 'watchlist' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
+    reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
   });
 }
 
 async function handleTestMonitor(chatId, env) {
-  await sendTelegramMessage(env, chatId, '🧪 جاري تشغيل Auto Monitor...', { parse_mode: 'HTML' });
+  await sendTelegramMessage(env, chatId, '🧪 جاري التشغيل...', { parse_mode: 'HTML' });
   const result = await triggerMonitorWorkflow(env, 'telegram_button');
   if (result.success) {
-    await sendTelegramMessage(env, chatId, '✅ تم تشغيل Auto Monitor بنجاح!', { parse_mode: 'HTML' });
+    await sendTelegramMessage(env, chatId, '✅ تم التشغيل', { parse_mode: 'HTML' });
   } else {
-    await sendTelegramMessage(env, chatId, '❌ فشل تشغيل Auto Monitor.\n<b>الخطأ:</b> ' + result.error, { parse_mode: 'HTML' });
+    await sendTelegramMessage(env, chatId, '❌ فشل: ' + result.error, { parse_mode: 'HTML' });
   }
 }
 
 async function sendHelp(chatId, env) {
-  const message = '🤖 <b>دليل الاستخدام</b>\n\n' +
-    '<b>🎬 التسجيل:</b>\nأرسل رابط البث مباشرة\n\n' +
-    '<b>📋 المراقبة:</b>\n' +
-    '• <code>/addwatch 123456</code> - إضافة\n' +
-    '• <code>/removewatch 123456</code> - حذف\n' +
-    '• <code>/watchlist</code> - عرض القائمة\n' +
-    '• <code>/testmonitor</code> - تشغيل يدوي\n\n' +
-    '<b>⚠️ الحدود:</b>\n• حد أقصى 5 تسجيلات\n• فحص تلقائي كل 3 دقائق';
-  await sendTelegramMessage(env, chatId, message, {
-    parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 القائمة الرئيسية', callback_data: 'back' }]] }
-  });
+  await sendTelegramMessage(env, chatId,
+    '🤖 <b>الأوامر:</b>\n\n' +
+    '<code>/addwatch 123456</code>\n' +
+    '<code>/removewatch 123456</code>\n' +
+    '<code>/watchlist</code>\n' +
+    '<code>/testmonitor</code>',
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] } }
+  );
 }
 
-// ============================================================
-// MAIN MENU - PROTECTED with try/catch for each operation
-// ============================================================
 async function sendMainMenu(chatId, env) {
-  let activeCount = 0;
-  let watchlistCount = 0;
-
-  try {
-    activeCount = await countActiveRecordings(env);
-  } catch (e) {
-    console.error('countActiveRecordings error in sendMainMenu:', e);
-  }
-
-  try {
-    const watchlist = await getWatchlist(env);
-    watchlistCount = watchlist.length;
-  } catch (e) {
-    console.error('getWatchlist error in sendMainMenu:', e);
-  }
-
-  const message = '🎬 <b>SuperLive Recorder</b>\n\n' +
-    '<b>مرحباً!</b>\n' +
-    '📊 التسجيلات النشطة: <b>' + activeCount + '/5</b>\n' +
-    '📋 قائمة المراقبة: <b>' + watchlistCount + ' مستخدم</b>\n\n' +
-    'لبدء التسجيل، أرسل رابط البث أو استخدم الأزرار 👇';
-
-  const buttons = [
-    [{ text: '📊 الحالة', callback_data: 'status' }, { text: '🛑 إيقاف', callback_data: 'stop_menu' }],
-    [{ text: '📋 قائمة المراقبة', callback_data: 'watchlist' }, { text: '🧪 تشغيل المراقبة', callback_data: 'test_monitor' }],
-    [{ text: '🧹 تنظيف', callback_data: 'cleanup' }, { text: '❓ مساعدة', callback_data: 'help' }]
-  ];
-
-  await sendTelegramMessage(env, chatId, message, {
-    parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons }
-  });
-}
-
-// ============================================================
-// SHARED HELPERS
-// ============================================================
-async function autoCleanup(env) {
-  try {
-    const { keys } = await env.SUPERLIVE_STATE.list({ prefix: 'recording:' });
-    for (const key of keys) {
-      const recording = await env.SUPERLIVE_STATE.get(key.name, 'json');
-      if (recording && ['finished', 'failed'].includes(recording.status)) {
-        await env.SUPERLIVE_STATE.delete(key.name);
-      }
+  const watchlist = await getWatchlist(env);
+  const recordings = await getRecordings(env);
+  const active = recordings.filter(r => r.status === 'recording').length;
+  await sendTelegramMessage(env, chatId,
+    '🎬 <b>SuperLive Recorder</b>\n\n' +
+    '📊 النشطة: <b>' + active + '/5</b>\n' +
+    '📋 المراقبة: <b>' + watchlist.length + '</b>',
+    {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '📊 الحالة', callback_data: 'status' }, { text: '🛑 إيقاف', callback_data: 'stop_menu' }],
+        [{ text: '📋 القائمة', callback_data: 'watchlist' }, { text: '🧪 تشغيل', callback_data: 'test_monitor' }],
+        [{ text: '🧹 تنظيف', callback_data: 'cleanup' }, { text: '❓ مساعدة', callback_data: 'help' }]
+      ]}
     }
-  } catch (error) {
-    console.error('Auto-cleanup error:', error);
-  }
-}
-
-async function countActiveRecordings(env) {
-  try {
-    const { keys } = await env.SUPERLIVE_STATE.list({ prefix: 'recording:' });
-    let count = 0;
-    for (const key of keys) {
-      const recording = await env.SUPERLIVE_STATE.get(key.name, 'json');
-      if (recording && recording.status === 'recording') count++;
-    }
-    return count;
-  } catch (error) {
-    console.error('Error counting:', error);
-    return 0;
-  }
+  );
 }
 
 function extractStreamUrl(text) {
-  const urlRegex = /https?:\/\/[^\s]+/g;
-  const urls = text.match(urlRegex);
-  if (urls && urls.length > 0) {
-    const superLiveUrl = urls.find(function(url) { return url.includes('superlivetv.com'); });
-    return superLiveUrl || null;
-  }
+  const urls = text.match(/https?:\/\/[^\s]+/g);
+  if (urls) return urls.find(u => u.includes('superlivetv.com')) || null;
   return null;
 }
 
 function extractStreamId(url) {
-  const match = url.match(/livestream\/(\d+)/);
-  return match ? match[1] : null;
-}
-
-function getStatusEmoji(status) {
-  const emojis = {
-    'recording': '🔴', 'finished': '✅', 'failed': '❌',
-    'stopped': '🛑', 'uploading': '📤', 'completed': '🎉'
-  };
-  return emojis[status] || '❓';
+  const m = url.match(/livestream\/(\d+)/);
+  return m ? m[1] : null;
 }
 
 function getElapsedTime(isoString) {
-  const start = new Date(isoString);
-  const now = new Date();
-  const diffMs = now - start;
-  const diffMins = Math.floor(diffMs / 60000);
-  if (diffMins < 60) return diffMins + 'د';
-  const diffHours = Math.floor(diffMins / 60);
-  if (diffHours < 24) return diffHours + 'س ' + (diffMins % 60) + 'د';
-  const diffDays = Math.floor(diffHours / 24);
-  return diffDays + 'ي ' + (diffHours % 24) + 'س';
+  const diff = Date.now() - new Date(isoString).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 60) return mins + 'د';
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return hrs + 'س ' + (mins % 60) + 'د';
+  return Math.floor(hrs / 24) + 'ي ' + (hrs % 24) + 'س';
 }
 
 async function sendTelegramMessage(env, chatId, text, options) {
   options = options || {};
-  const url = 'https://api.telegram.org/bot' + env.TELEGRAM_BOT_TOKEN + '/sendMessage';
-  const payload = Object.assign({ chat_id: chatId, text: text, parse_mode: 'HTML' }, options);
   try {
-    const response = await fetch(url, {
+    await fetch('https://api.telegram.org/bot' + env.TELEGRAM_BOT_TOKEN + '/sendMessage', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(Object.assign({ chat_id: chatId, text: text, parse_mode: 'HTML' }, options))
     });
-    if (!response.ok) {
-      console.error('Telegram API error:', await response.text());
-    }
-  } catch (error) {
-    console.error('Failed to send message:', error);
-  }
+  } catch (e) {}
 }
 
-async function answerCallbackQuery(callbackQueryId, env, text) {
-  const url = 'https://api.telegram.org/bot' + env.TELEGRAM_BOT_TOKEN + '/answerCallbackQuery';
+async function answerCallbackQuery(id, env, text) {
   try {
-    await fetch(url, {
+    await fetch('https://api.telegram.org/bot' + env.TELEGRAM_BOT_TOKEN + '/answerCallbackQuery', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ callback_query_id: callbackQueryId, text: text })
+      body: JSON.stringify({ callback_query_id: id, text: text })
     });
-  } catch (error) {
-    console.error('Failed to answer callback:', error);
-  }
+  } catch (e) {}
 }
 
-// ============================================================
-// GITHUB WORKFLOW TRIGGERS
-// ============================================================
 async function triggerRecordWorkflow(env, streamUrl, streamId, streamName) {
   return triggerGitHubDispatch(env, 'record_stream', {
     stream_url: streamUrl, stream_id: streamId, stream_name: streamName || ''
@@ -1076,31 +811,22 @@ async function triggerGitHubDispatch(env, eventType, payload) {
   if (!env.GITHUB_REPO) return { success: false, error: 'GITHUB_REPO غير مُعد' };
   if (!env.GITHUB_TOKEN) return { success: false, error: 'GITHUB_TOKEN غير مُعد' };
   if (!env.GITHUB_TOKEN.startsWith('ghp_') && !env.GITHUB_TOKEN.startsWith('github_pat_')) {
-    return { success: false, error: 'GITHUB_TOKEN خاطئ (يجب أن يبدأ بـ ghp_ أو github_pat_)' };
+    return { success: false, error: 'GITHUB_TOKEN خاطئ' };
   }
   try {
-    const repo = env.GITHUB_REPO;
-    const url = 'https://api.github.com/repos/' + repo + '/dispatches';
-    const requestBody = { event_type: eventType, client_payload: payload };
-    const response = await fetch(url, {
+    const response = await fetch('https://api.github.com/repos/' + env.GITHUB_REPO + '/dispatches', {
       method: 'POST',
       headers: {
         'Authorization': 'token ' + env.GITHUB_TOKEN,
         'Accept': 'application/vnd.github.v3+json',
         'Content-Type': 'application/json',
-        'User-Agent': 'SuperLive-Recorder-Worker'
+        'User-Agent': 'SuperLive-Worker'
       },
-      body: JSON.stringify(requestBody)
+      body: JSON.stringify({ event_type: eventType, client_payload: payload })
     });
     if (response.status === 204) return { success: true };
-    const errorText = await response.text();
-    let errorMessage = 'GitHub API error: ' + response.status;
-    if (response.status === 401) errorMessage = 'فشل المصادقة مع GitHub';
-    else if (response.status === 403) errorMessage = 'صلاحيات غير كافية';
-    else if (response.status === 404) errorMessage = 'المستودع غير موجود: ' + repo;
-    else if (response.status === 422) errorMessage = 'طلب غير صالح: ' + errorText;
-    return { success: false, error: errorMessage };
-  } catch (error) {
-    return { success: false, error: 'خطأ في الشبكة: ' + error.message };
+    return { success: false, error: 'HTTP ' + response.status };
+  } catch (e) {
+    return { success: false, error: e.message };
   }
 }
