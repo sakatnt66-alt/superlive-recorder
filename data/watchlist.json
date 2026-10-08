@@ -88,6 +88,11 @@
       "added_at": "2026-10-08T21:17:33.648Z",
       "display_name": "Nom d'utilisateur",
       "name_updated_at": "2026-10-08T22:05:16.969Z"
+    },
+    {
+      "stream_id": "61325170",
+      "added_at": "2026-10-08T22:13:20.592Z",
+      "display_name": null
     }
   ]
 }
