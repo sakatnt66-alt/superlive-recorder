@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-SuperLive Discovery Module - Version 9.1 (Premium Fix)
+SuperLive Discovery Module - Version 9.2 (Premium + 404 Fix)
 
-CRITICAL FIXES in v9.1:
-1. Added 'followings', 'followers' to SYSTEM_PAGES_EXACT
-2. Premium detection now ONLY trusts API responses (not DOM text)
-   - Website has "premium" in navigation/footer on EVERY page
-   - Only API response 'is_premium' field is reliable
-3. Username cleaner removes @username from end of names
+CRITICAL FIXES in v9.2:
+1. Premium detection ONLY counts is_premium when is_live=true in SAME object
+   - Before: found is_premium anywhere in API → all users PREMIUM
+   - After: is_premium must be in same object as is_live=true
+2. Detect "Page introuvable" (404 pages) and mark as OFFLINE
+3. Reject /fr/followings and /fr/nonlogin-messages URLs
+4. Use username from Phase 1 when Phase 2 extraction fails
 """
 
 import asyncio
@@ -35,17 +36,19 @@ class SuperLiveDiscovery:
         "Chrome/131.0.0.0 Safari/537.36"
     )
 
-    # System pages to reject - FIXED: added followings, followers
+    # System pages to reject
     SYSTEM_PAGES_EXACT = {
         "discover", "explore", "trending", "popular", "categories",
         "search", "login", "register", "signup", "signin", "logout",
         "about", "contact", "terms", "privacy", "help", "support",
         "faq", "blog", "news", "home",
-        # ADDED: user-internal pages
+        # User-internal pages
         "followings", "followers", "messages", "notifications",
         "settings", "favorites", "history", "downloads", "uploads",
         "wallet", "coins", "recharge", "payment", "subscription",
         "profile-edit", "edit-profile", "account",
+        # ADDED: Login-required pages
+        "nonlogin-messages", "nonlogin-notifications",
     }
 
     # Bad usernames to filter out
@@ -56,6 +59,9 @@ class SuperLiveDiscovery:
         "live", "offline", "premium", "direct", "en direct",
         "undefined", "null", "none", "video", "stream",
         "suivis",  # French for "followings"
+        "page introuvable",  # 404 page
+        "page not found",
+        "404",
     }
 
     def __init__(self):
@@ -111,15 +117,13 @@ class SuperLiveDiscovery:
         return False
 
     # ============================================================
-    # USERNAME CLEANER - FIXED: removes @username from end
+    # USERNAME CLEANER
     # ============================================================
     def _clean_username(self, raw: str) -> Optional[str]:
         if not raw:
             return None
 
-        # FIXED: Remove @username pattern from end of name
-        # e.g., "Alisa (@alisa_xs)" -> "Alisa"
-        # e.g., "🇲🇦🦌غزلان فرنسي🦌 (@rizlani6479)" -> "🇲🇦🦌غزلان فرنسي🦌"
+        # Remove @username pattern from end
         raw = re.sub(r'\s*\(@[a-zA-Z0-9_]+\)\s*$', '', raw)
         raw = re.sub(r'\s*@[a-zA-Z0-9_]+\s*$', '', raw)
 
@@ -129,23 +133,17 @@ class SuperLiveDiscovery:
 
         valid_lines = []
         for line in lines:
-            # Skip pure numbers
             if re.match(r"^\d+$", line):
                 continue
-            # Skip @username patterns
             if re.match(r"^@[a-zA-Z0-9_]+$", line):
                 continue
-            # Skip short lines
             if len(line) < 2:
                 continue
-            # Skip long lines
             if len(line) > 80:
                 continue
-            # Skip pure small numbers
             if re.match(r"^\d{1,2}$", line):
                 continue
 
-            # Check against bad names
             lower = line.lower().strip()
             if lower in self.BAD_USERNAMES:
                 continue
@@ -160,14 +158,11 @@ class SuperLiveDiscovery:
             return None
 
         name = valid_lines[0]
-        # Remove leading numbers
         name = re.sub(r"^\d{1,3}\s*", "", name)
-        # Remove trailing @username again (just in case)
         name = re.sub(r'\s*\(@[a-zA-Z0-9_]+\)\s*$', '', name)
         name = re.sub(r'\s*@[a-zA-Z0-9_]+\s*$', '', name)
         name = name.strip()
 
-        # Final validation
         if len(name) < 2 or len(name) > 60:
             return None
         if re.match(r"^\d+$", name):
@@ -362,7 +357,7 @@ class SuperLiveDiscovery:
                 const systemSlugs = [
                     'search','discover','login','register','explore','trending',
                     'popular','followings','followers','messages','notifications',
-                    'settings','categories','home'
+                    'settings','categories','home','nonlogin-messages'
                 ];
                 
                 for (const link of links) {
@@ -592,7 +587,8 @@ class SuperLiveDiscovery:
     # PHASE 2: LIVE STATUS DETECTION
     # ============================================================
     async def check_live_status(
-        self, profile_url: str, user_id: str = "", profile_id: str = ""
+        self, profile_url: str, user_id: str = "", profile_id: str = "",
+        phase1_username: str = None
     ) -> Optional[Dict[str, Any]]:
         self.log(f"Phase 2: Checking live at {profile_url}")
 
@@ -638,21 +634,31 @@ class SuperLiveDiscovery:
                 except:
                     pass
 
+                # ADDED: Check for 404 / "Page introuvable"
+                page_lower = page_text.lower()
+                if "page introuvable" in page_lower or "page not found" in page_lower:
+                    self.log(f"Page shows 404 error - marking as OFFLINE")
+                    await browser.close()
+                    return {
+                        "is_live": False,
+                        "reason": "page_not_found_404",
+                        "source": "validation"
+                    }
+
                 # Check API responses
                 api_result = self._check_api_live_status(api_responses, user_id)
 
                 # Check DOM for live indicators
                 dom_result = await self._check_dom_live_status(page)
 
-                # FIXED: Premium detection ONLY trusts API, not DOM text
-                # Website has "premium" in navigation/footer on EVERY page
+                # FIXED: Premium detection ONLY when is_live is in same object
                 is_premium = False
-                if api_result and api_result.get("is_premium"):
+                if api_result and api_result.get("is_live") and api_result.get("is_premium"):
                     is_premium = True
 
-                # Extract username
-                username = None
-                if api_result and api_result.get("username"):
+                # Extract username - prefer Phase 1 username if available
+                username = phase1_username
+                if not username and api_result and api_result.get("username"):
                     username = self._clean_username(api_result["username"])
                 if not username:
                     page_username = await self._extract_username_from_page(page)
@@ -703,6 +709,11 @@ class SuperLiveDiscovery:
         return None
 
     def _find_live_status_in_obj(self, obj: Any, user_id: str, depth: int) -> Optional[Dict]:
+        """
+        FIXED: Only returns result if is_live=true AND is_premium are in SAME object.
+        Before: found is_premium anywhere → all users PREMIUM
+        After: is_premium must be sibling of is_live=true
+        """
         if depth > 10:
             return None
 
@@ -727,9 +738,11 @@ class SuperLiveDiscovery:
                 if kl in ("username", "nickname", "display_name", "displayname", "name"):
                     if isinstance(v, str) and v.strip():
                         result["username"] = v.strip()
+                # FIXED: Only set is_premium if we're in a live object
                 if kl in ("is_premium", "ispremium", "premium", "paywall"):
                     result["is_premium"] = bool(v)
 
+            # ONLY return if is_live is true in THIS object
             if result["is_live"]:
                 return result
 
@@ -750,7 +763,6 @@ class SuperLiveDiscovery:
             is_live = False
             stream_url = None
 
-            # Live indicators
             live_selectors = [
                 ".live-badge", ".live-indicator", ".is-live",
                 '[data-status="live"]', '[class*="live-badge"]',
@@ -771,7 +783,6 @@ class SuperLiveDiscovery:
                 except:
                     continue
 
-            # Text indicators
             if not is_live:
                 text_selectors = ["text=DIRECT", "text=LIVE", "text=En direct", "text=مباشر"]
                 for selector in text_selectors:
@@ -826,7 +837,6 @@ class SuperLiveDiscovery:
                 except:
                     continue
 
-            # Try og:title
             try:
                 og = await page.locator('meta[property="og:title"]').first.get_attribute("content")
                 if og:
