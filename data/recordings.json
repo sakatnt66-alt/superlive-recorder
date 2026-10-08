@@ -36,16 +36,6 @@
       "status": "recording",
       "started_at": "2026-10-08T21:25:31.012Z",
       "source": "auto"
-    },
-    {
-      "stream_id": "51527806",
-      "stream_url": "https://superlivetv.com/fr/profile/51527806",
-      "stream_name": "Super",
-      "status": "recording",
-      "started_at": "2026-10-08T21:25:33.756Z",
-      "source": "auto",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
