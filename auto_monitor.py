@@ -6,6 +6,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
@@ -37,6 +38,8 @@ LIVE_PREMIUM = "LIVE_PREMIUM"
 OFFLINE = "OFFLINE"
 UNKNOWN = "UNKNOWN"
 
+LOCK_STALE_MINUTES = 12
+
 
 def log(message: str) -> None:
     print(f"[AUTO] {message}", flush=True)
@@ -65,10 +68,9 @@ def log_detection(user_id: str, result: Dict[str, Any], source: str) -> None:
         log(
             f"video_state="
             f"sameTargetDom={vi.get('sameTargetDom', False)},"
-            f"activePackets={vi.get('activePackets', False)},"
             f"candidates={vi.get('candidates_count', 0)},"
-            f"streamEnded={vi.get('streamEnded', False)},"
-            f"premium={vi.get('premium', False)}"
+            f"premium={vi.get('premium', False)},"
+            f"visibleArea={vi.get('visibleArea', 0)}"
         )
 
 
@@ -232,7 +234,49 @@ async def load_active_recordings() -> Dict[str, Any]:
 async def acquire_monitor_lock() -> bool:
     try:
         status, data = await api_request("/api/monitor-lock/acquire", "POST")
-        return status == 200 and data.get("acquired", False)
+
+        if status == 200 and data.get("acquired", False):
+            log("Monitor lock acquired successfully")
+            return True
+
+        if status == 200 and data.get("reason") == "already_locked":
+            locked_at = data.get("locked_at", "")
+            log(f"Monitor lock is held (locked_at={locked_at}). Checking if stale...")
+
+            if locked_at:
+                try:
+                    lock_time = datetime.fromisoformat(
+                        locked_at.replace("Z", "+00:00")
+                    )
+                    now = datetime.now(timezone.utc)
+                    lock_age_minutes = (now - lock_time).total_seconds() / 60
+
+                    if lock_age_minutes > LOCK_STALE_MINUTES:
+                        log(
+                            f"Lock is stale ({lock_age_minutes:.1f} minutes old). "
+                            f"Force releasing..."
+                        )
+                        await api_request("/api/monitor-lock/release", "POST")
+                        await asyncio.sleep(2)
+
+                        status2, data2 = await api_request(
+                            "/api/monitor-lock/acquire", "POST"
+                        )
+                        if status2 == 200 and data2.get("acquired", False):
+                            log("Monitor lock acquired after stale lock release")
+                            return True
+                    else:
+                        log(
+                            f"Lock is fresh ({lock_age_minutes:.1f} minutes old). "
+                            f"Another instance is likely running."
+                        )
+                except Exception as e:
+                    log(f"Lock age check error: {e}")
+
+            return False
+
+        log(f"Monitor lock acquisition failed: status={status}, data={data}")
+        return False
     except Exception as e:
         log(f"Monitor lock acquire error: {e}")
         return True
@@ -240,7 +284,11 @@ async def acquire_monitor_lock() -> bool:
 
 async def release_monitor_lock():
     try:
-        await api_request("/api/monitor-lock/release", "POST")
+        status, data = await api_request("/api/monitor-lock/release", "POST")
+        if status == 200:
+            log("Monitor lock released successfully")
+        else:
+            log(f"Monitor lock release warning: status={status}")
     except Exception as e:
         log(f"Monitor lock release error: {e}")
 
@@ -322,28 +370,152 @@ def normalize_display_name(value):
         return None
     if "rechercher" in lowered or "résultats" in lowered:
         return None
+    if "membre superlive" in lowered:
+        return None
     return s
 
 
+def check_json_for_premium(json_bodies: List[str], user_id: str) -> bool:
+    for body in json_bodies:
+        if user_id not in body:
+            continue
+        if re.search(
+            r'"(?:isPremium|is_premium|premium)"\s*:\s*true', body, re.IGNORECASE
+        ):
+            return True
+        if re.search(
+            r'"(?:type|access|streamType|accessType|mode)"\s*:\s*"?premium',
+            body,
+            re.IGNORECASE,
+        ):
+            return True
+        if re.search(r'"(?:isPaywall|paywall)"\s*:\s*true', body, re.IGNORECASE):
+            return True
+        try:
+            obj = json.loads(body)
+            if _check_obj_for_premium(obj, user_id):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _check_obj_for_premium(obj, user_id, depth=0):
+    if depth > 6:
+        return False
+    if isinstance(obj, dict):
+        is_user_obj = False
+        for key, value in obj.items():
+            if isinstance(value, (str, int, float)) and str(value) == str(user_id):
+                is_user_obj = True
+                break
+        for key, value in obj.items():
+            key_lower = str(key).lower()
+            if key_lower in (
+                "ispremium", "is_premium", "premium", "ispaywall", "paywall",
+            ):
+                if value is True or str(value).lower() == "true":
+                    return True
+            if key_lower in ("type", "access", "streamtype", "accesstype", "mode"):
+                if str(value).lower() in (
+                    "premium", "paid", "private", "paywall", "subscription",
+                ):
+                    return True
+            if key_lower in ("locked", "isprivate", "is_private", "private"):
+                if (value is True or str(value).lower() == "true") and is_user_obj:
+                    return True
+        for value in obj.values():
+            if _check_obj_for_premium(value, user_id, depth + 1):
+                return True
+    elif isinstance(obj, list):
+        for item in obj[:50]:
+            if _check_obj_for_premium(item, user_id, depth + 1):
+                return True
+    return False
+
+
+def extract_name_from_json(json_bodies: List[str], user_id: str) -> Optional[str]:
+    for body in json_bodies:
+        if user_id not in body:
+            continue
+        try:
+            obj = json.loads(body)
+            name = _find_username_in_obj(obj, user_id, depth=0)
+            if name:
+                normalized = normalize_display_name(name)
+                if normalized:
+                    return normalized
+        except Exception:
+            continue
+    return None
+
+
+def _find_username_in_obj(obj, user_id, depth=0):
+    if depth > 8:
+        return None
+    if isinstance(obj, dict):
+        has_user_id = False
+        for key, value in obj.items():
+            if isinstance(value, (str, int, float)) and str(value) == str(user_id):
+                key_lower = str(key).lower()
+                if any(
+                    token in key_lower
+                    for token in ("id", "user", "stream", "channel", "broadcaster")
+                ):
+                    has_user_id = True
+                    break
+        if has_user_id:
+            for key in (
+                "username", "nickname", "display_name", "name",
+                "streamer_name", "broadcaster_name", "user_name",
+            ):
+                if key in obj:
+                    val = obj[key]
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+        for value in obj.values():
+            result = _find_username_in_obj(value, user_id, depth + 1)
+            if result:
+                return result
+    elif isinstance(obj, list):
+        for item in obj[:100]:
+            result = _find_username_in_obj(item, user_id, depth + 1)
+            if result:
+                return result
+    return None
+
+
 # ============================================================
-# PAGE CHECK JS - Uses the SAME domContainsTargetId logic
-# from record_once.py WEBRTC_HOOK to verify the video is
-# actually associated with the target user_id.
+# PAGE CHECK JS
+#
+# This is a simplified version of __superliveSelectTargetVideo
+# from record_once.py. It uses the SAME domContainsTargetId
+# logic and scoring system to identify the correct video.
+#
+# The key insight: domContainsTargetId checks 8 levels up
+# from the video element for data-stream-id, data-id, href,
+# etc. containing the target user_id. The video with the
+# highest score (identity + visible area) is selected.
 # ============================================================
 PAGE_CHECK_JS = r"""
 (userId) => {
     const result = {
-        streamEnded: false,
+        found: false,
         sameTargetDom: false,
-        activePackets: false,
-        candidates_count: 0,
         premium: false,
-        videoWidth: 0,
-        videoHeight: 0,
+        candidates_count: 0,
+        visibleArea: 0,
         displayName: null,
+        streamEnded: false,
+        error: null,
     };
 
     try {
+        const videos = Array.from(document.querySelectorAll("video"));
+        const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+        const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+        const targetId = userId ? String(userId) : null;
+
         // Check if stream has ended
         const bodyText = document.body ? document.body.innerText : '';
         if (
@@ -354,31 +526,19 @@ PAGE_CHECK_JS = r"""
             result.streamEnded = true;
         }
 
-        // Check for premium indicators
-        const premiumIndicators = ['premium', 'payant', 'privé', 'exclusive', 'abonnement'];
-        const lowerBody = bodyText.toLowerCase();
-        for (const indicator of premiumIndicators) {
-            if (lowerBody.includes(indicator)) {
-                // Only mark as premium if it appears near video-related content
-                // and not just in navigation/footer
-                const premiumSections = document.querySelectorAll(
-                    '[class*="premium"], [class*="paywall"], [class*="lock"], [class*="subscribe"], [class*="unlock"]'
-                );
-                if (premiumSections.length > 0) {
-                    result.premium = true;
-                    break;
-                }
+        // Check for premium indicators near the main video area
+        try {
+            const premiumSections = document.querySelectorAll(
+                '[class*="premium"], [class*="paywall"], [class*="lock"], [class*="subscribe"], [class*="unlock"]'
+            );
+            if (premiumSections.length > 0) {
+                result.premium = true;
             }
-        }
-
-        // Get all videos with srcObject (same logic as record_once.py)
-        const videos = Array.from(document.querySelectorAll("video"));
-        const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
-        const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+        } catch (e) {}
 
         // domContainsTargetId - EXACT same logic as record_once.py WEBRTC_HOOK
         const domContainsTargetId = (element) => {
-            if (!userId || !element) return false;
+            if (!targetId || !element) return false;
             let node = element;
             let depth = 0;
             while (node && depth < 8) {
@@ -393,7 +553,7 @@ PAGE_CHECK_JS = r"""
                         node.getAttribute && node.getAttribute("data-video-id"),
                         node.getAttribute && node.getAttribute("href"),
                     ];
-                    if (values.some(value => value != null && String(value).includes(userId))) {
+                    if (values.some(value => value != null && String(value).includes(targetId))) {
                         return true;
                     }
                     if (node.querySelector) {
@@ -407,7 +567,7 @@ PAGE_CHECK_JS = r"""
                                 descendant.getAttribute && descendant.getAttribute("data-livestream-id"),
                                 descendant.getAttribute && descendant.getAttribute("data-video-id"),
                             ];
-                            if (descendantValues.some(value => value != null && String(value).includes(userId))) {
+                            if (descendantValues.some(value => value != null && String(value).includes(targetId))) {
                                 return true;
                             }
                         }
@@ -434,7 +594,11 @@ PAGE_CHECK_JS = r"""
                 if (video.readyState < 2) continue;
 
                 const style = getComputedStyle(video);
-                if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
+                if (
+                    style.display === "none" ||
+                    style.visibility === "hidden" ||
+                    style.opacity === "0"
+                ) {
                     continue;
                 }
 
@@ -482,12 +646,11 @@ PAGE_CHECK_JS = r"""
         candidates.sort((a, b) => b.score - a.score);
         const best = candidates[0];
 
+        result.found = true;
         result.sameTargetDom = best.sameTargetDom;
-        result.videoWidth = best.video.videoWidth;
-        result.videoHeight = best.video.videoHeight;
+        result.visibleArea = best.visibleArea;
 
         // Extract display name from the area around the best video
-        // Look for text elements near the video that might contain the name
         try {
             let container = best.video.parentElement;
             let nameSearchDepth = 0;
@@ -521,25 +684,6 @@ PAGE_CHECK_JS = r"""
             }
         } catch (e) {}
 
-        // Check WebRTC inbound stats for active packets
-        try {
-            const peers = window.__superlivePeerConnections || [];
-            for (const pc of peers) {
-                try {
-                    const stats = await pc.getStats();
-                    stats.forEach(report => {
-                        if (report.type !== "inbound-rtp") return;
-                        const kind = report.kind || report.mediaType || null;
-                        if (kind !== "video") return;
-                        const packetsReceived = Number(report.packetsReceived || 0);
-                        if (packetsReceived > 0) {
-                            result.activePackets = true;
-                        }
-                    });
-                } catch (e) {}
-            }
-        } catch (e) {}
-
     } catch (e) {
         result.error = String(e);
     }
@@ -552,31 +696,41 @@ PAGE_CHECK_JS = r"""
 async def check_user_on_stream_page(
     context, user_id: str, semaphore: asyncio.Semaphore
 ) -> Dict[str, Any]:
-    """
-    Open the livestream page for the user and check:
-    1. Is there a video with srcObject associated with this user_id?
-    2. Has the stream ended?
-    3. Is it a premium stream?
-    4. What is the display name?
-
-    Uses the SAME domContainsTargetId logic as record_once.py
-    to ensure the video is actually associated with the target user.
-    """
     async with semaphore:
         page = await context.new_page()
         url = BASE_LIVE_URL.format(user_id=user_id)
+        json_bodies: List[str] = []
+        json_count = 0
 
         result = {
             "sameTargetDom": False,
-            "activePackets": False,
-            "candidates_count": 0,
-            "streamEnded": False,
             "premium": False,
+            "candidates_count": 0,
+            "visibleArea": 0,
             "displayName": None,
-            "videoWidth": 0,
-            "videoHeight": 0,
+            "streamEnded": False,
             "error": None,
         }
+
+        async def on_response(response):
+            nonlocal json_count
+            if json_count >= 30:
+                return
+            try:
+                content_type = (response.headers or {}).get("content-type", "")
+                if "json" not in content_type.lower():
+                    return
+                response_url = response.url or ""
+                body = await response.text()
+                if not body:
+                    return
+                if user_id in body or user_id in response_url:
+                    json_count += 1
+                    json_bodies.append(body[:200000])
+            except Exception:
+                pass
+
+        page.on("response", on_response)
 
         try:
             await page.goto(url, timeout=PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
@@ -593,33 +747,44 @@ async def check_user_on_stream_page(
             result["error"] = f"page_goto: {str(e)[:100]}"
 
         await page.close()
+
+        result["json_bodies"] = json_bodies
         return result
 
 
 async def classify_user(context, user_id: str, semaphore: asyncio.Semaphore) -> Dict[str, Any]:
-    """
-    Classify a user based on the stream page check.
-    Uses the same verification logic as record_once.py.
-    """
     check_result = await check_user_on_stream_page(context, user_id, semaphore)
+
+    json_bodies = check_result.pop("json_bodies", [])
 
     video_info = {
         "sameTargetDom": check_result.get("sameTargetDom", False),
-        "activePackets": check_result.get("activePackets", False),
         "candidates_count": check_result.get("candidates_count", 0),
-        "streamEnded": check_result.get("streamEnded", False),
+        "visibleArea": check_result.get("visibleArea", 0),
         "premium": check_result.get("premium", False),
-        "videoWidth": check_result.get("videoWidth", 0),
-        "videoHeight": check_result.get("videoHeight", 0),
+        "streamEnded": check_result.get("streamEnded", False),
     }
 
     # Extract display name
     display_name = None
-    raw_name = check_result.get("displayName")
-    if raw_name:
-        normalized = normalize_display_name(raw_name)
-        if normalized:
-            display_name = normalized
+
+    # Priority 1: JSON API responses
+    json_name = extract_name_from_json(json_bodies, user_id)
+    if json_name:
+        display_name = json_name
+
+    # Priority 2: DOM extraction from page
+    if not display_name:
+        raw_name = check_result.get("displayName")
+        if raw_name:
+            normalized = normalize_display_name(raw_name)
+            if normalized:
+                display_name = normalized
+
+    # Check premium from JSON
+    premium_from_json = check_json_for_premium(json_bodies, user_id)
+    if premium_from_json:
+        video_info["premium"] = True
 
     # Decision logic
     if check_result.get("error"):
@@ -641,8 +806,6 @@ async def classify_user(context, user_id: str, semaphore: asyncio.Semaphore) -> 
         }
 
     if not check_result.get("sameTargetDom"):
-        # No video associated with this user_id found
-        # This means the user is either offline or only has recommended streams
         return {
             "status": OFFLINE,
             "reason": "no_target_video_found",
@@ -651,8 +814,7 @@ async def classify_user(context, user_id: str, semaphore: asyncio.Semaphore) -> 
             "video_info": video_info,
         }
 
-    # Video is associated with the user
-    if check_result.get("premium"):
+    if video_info.get("premium"):
         return {
             "status": LIVE_PREMIUM,
             "reason": "premium_stream",
@@ -661,7 +823,6 @@ async def classify_user(context, user_id: str, semaphore: asyncio.Semaphore) -> 
             "video_info": video_info,
         }
 
-    # Live normal stream
     return {
         "status": LIVE_NORMAL,
         "reason": "target_video_active",
