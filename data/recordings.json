@@ -1,14 +1,6 @@
 {
   "recordings": [
     {
-      "stream_id": "24353293",
-      "stream_url": "https://superlivetv.com/fr/profile/24353293",
-      "stream_name": "Super",
-      "status": "recording",
-      "started_at": "2026-10-08T21:17:48.290Z",
-      "source": "auto"
-    },
-    {
       "stream_id": "40544532",
       "stream_url": "https://superlivetv.com/fr/profile/40544532",
       "stream_name": "Super",
