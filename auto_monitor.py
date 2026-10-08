@@ -14,6 +14,7 @@ AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SEND_REPORT = os.environ.get("SEND_REPORT", "1") not in ("0", "false", "False")
+# CRITICAL: Disabled by default to save KV writes (free plan: 1000 writes/day)
 UPDATE_WATCHLIST_NAMES = os.environ.get("UPDATE_WATCHLIST_NAMES", "0") not in ("0", "false", "False")
 
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "5"))
@@ -251,6 +252,7 @@ async def trigger_auto_recording(
 
 
 async def update_watchlist_name(user_id: str, display_name: str):
+    """Update name in KV. Only called when UPDATE_WATCHLIST_NAMES=1."""
     try:
         payload = {"display_name": display_name}
         status, data = await api_request(
@@ -839,8 +841,8 @@ async def async_main() -> int:
         log("FATAL: AUTO_API_TOKEN is not set")
         return 1
 
-    # NOTE: Monitor lock removed to avoid KV write limit exhaustion.
-    # Concurrency is handled by GitHub Actions concurrency group instead.
+    # NOTE: No KV lock used. Concurrency handled by GitHub Actions
+    # concurrency group to save KV writes (free plan: 1000 writes/day).
 
     try:
         try:
@@ -923,7 +925,7 @@ async def async_main() -> int:
             if final_name:
                 stats["names"][user_id] = final_name
             # Only update watchlist names if explicitly enabled
-            # Disabled by default to save KV writes
+            # Disabled by default to save KV writes (free plan limit)
             if UPDATE_WATCHLIST_NAMES and discovered_name:
                 await update_watchlist_name(user_id, discovered_name)
 
@@ -1018,7 +1020,7 @@ async def async_main() -> int:
         return 0
 
     finally:
-        # No lock to release anymore
+        # No lock to release - concurrency handled by GitHub Actions
         pass
 
 
