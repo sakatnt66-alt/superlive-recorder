@@ -20,11 +20,11 @@ MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "5"))
 API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "20"))
 
 PLAYWRIGHT_CONCURRENCY = int(os.environ.get("PLAYWRIGHT_CONCURRENCY", "2"))
-PLAYWRIGHT_WAIT_MS = int(os.environ.get("PLAYWRIGHT_WAIT_MS", "8000"))
+PLAYWRIGHT_WAIT_MS = int(os.environ.get("PLAYWRIGHT_WAIT_MS", "10000"))
+PLAYWRIGHT_RETRY_WAIT_MS = int(os.environ.get("PLAYWRIGHT_RETRY_WAIT_MS", "5000"))
 PAGE_TIMEOUT_MS = int(os.environ.get("PAGE_TIMEOUT_MS", "30000"))
 PLAYWRIGHT_MAX_USERS_PER_CYCLE = int(os.environ.get("PLAYWRIGHT_MAX_USERS_PER_CYCLE", "12"))
 
-SEARCH_URL = "https://superlivetv.com/fr/search"
 BASE_LIVE_URL = "https://superlivetv.com/fr/livestream/{user_id}"
 
 USER_AGENT = (
@@ -38,8 +38,10 @@ LIVE_PREMIUM = "LIVE_PREMIUM"
 OFFLINE = "OFFLINE"
 UNKNOWN = "UNKNOWN"
 
+
 def log(message: str) -> None:
     print(f"[AUTO] {message}", flush=True)
+
 
 def log_detection(user_id: str, result: Dict[str, Any], source: str) -> None:
     status = result.get("status", UNKNOWN)
@@ -59,9 +61,24 @@ def log_detection(user_id: str, result: Dict[str, Any], source: str) -> None:
     log(f"reason={result.get('reason', 'unknown')}")
     if result.get("display_name"):
         log(f"display_name={result['display_name']}")
+    vi = result.get("video_info")
+    if vi:
+        log(
+            f"video_state="
+            f"videos={vi.get('videoCount', 0)},"
+            f"srcObj={vi.get('srcObjectCount', 0)},"
+            f"live={vi.get('liveVideoCandidate', False)},"
+            f"belongs={vi.get('belongsToUser', False)},"
+            f"mainActive={vi.get('mainVideoActive', False)},"
+            f"premium={vi.get('premiumFromJson', False)},"
+            f"ended={vi.get('streamEnded', False)},"
+            f"nameSource={vi.get('nameSource', 'none')}"
+        )
+
 
 def html_escape(text: str) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 
 def split_telegram_text(text: str, limit: int = 3900) -> List[str]:
     lines = text.split("\n")
@@ -84,6 +101,7 @@ def split_telegram_text(text: str, limit: int = 3900) -> List[str]:
         chunks.append(current)
     return chunks or [""]
 
+
 def send_telegram_report(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log("Telegram report skipped: credentials missing")
@@ -95,8 +113,13 @@ def send_telegram_report(text: str) -> bool:
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "HTML"}
         try:
             data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(url, data=data, method="POST",
-                headers={"Content-Type": "application/json", "User-Agent": "AutoMonitor/1.0"})
+            req = urllib.request.Request(
+                url, data=data, method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "AutoMonitor/1.0",
+                },
+            )
             with urllib.request.urlopen(req, timeout=20) as response:
                 response.read()
         except Exception as e:
@@ -105,6 +128,7 @@ def send_telegram_report(text: str) -> bool:
     if ok:
         log("Telegram report sent successfully")
     return ok
+
 
 def build_report(elapsed_seconds: float, stats: Dict[str, Any]) -> str:
     lines = []
@@ -130,6 +154,10 @@ def build_report(elapsed_seconds: float, stats: Dict[str, Any]) -> str:
     lines.append(f"🔴 تم تشغيل {stats['started_recordings']} تسجيل(ات) جديد(ة).")
     return "\n".join(lines)
 
+
+# ============================================================
+# WORKER API CLIENT
+# ============================================================
 def api_request_sync(path: str, method: str = "GET", payload: Optional[dict] = None):
     url = f"{WORKER_URL}{path}"
     headers = {
@@ -162,8 +190,10 @@ def api_request_sync(path: str, method: str = "GET", payload: Optional[dict] = N
     except Exception as e:
         return 0, {"error": str(e)}
 
+
 async def api_request(path: str, method: str = "GET", payload: Optional[dict] = None):
     return await asyncio.to_thread(api_request_sync, path, method, payload)
+
 
 async def load_watchlist():
     status, data = await api_request("/api/watchlist", "GET")
@@ -173,7 +203,9 @@ async def load_watchlist():
     users = []
     stored_names = {}
     for item in items:
-        username = str(item.get("stream_id") or item.get("username") or item.get("id") or "").strip()
+        username = str(
+            item.get("stream_id") or item.get("username") or item.get("id") or ""
+        ).strip()
         if not username or username in ("undefined", "null", ""):
             continue
         if not username.isdigit():
@@ -184,10 +216,13 @@ async def load_watchlist():
             stored_names[username] = str(display_name).strip()
     return users, stored_names
 
+
 async def load_active_recordings() -> Dict[str, Any]:
     status, data = await api_request("/api/active-recordings", "GET")
     if status != 200:
-        raise RuntimeError(f"Failed to load active recordings: HTTP {status} - {data}")
+        raise RuntimeError(
+            f"Failed to load active recordings: HTTP {status} - {data}"
+        )
     active_ids = set()
     for rec in data.get("recordings", []):
         if rec.get("status") == "recording":
@@ -200,6 +235,7 @@ async def load_active_recordings() -> Dict[str, Any]:
         "active_ids": active_ids,
     }
 
+
 async def acquire_monitor_lock() -> bool:
     try:
         status, data = await api_request("/api/monitor-lock/acquire", "POST")
@@ -208,15 +244,25 @@ async def acquire_monitor_lock() -> bool:
         log(f"Monitor lock acquire error: {e}")
         return True
 
+
 async def release_monitor_lock():
     try:
         await api_request("/api/monitor-lock/release", "POST")
     except Exception as e:
         log(f"Monitor lock release error: {e}")
 
-async def trigger_auto_recording(user_id: str, stream_url: str, stream_name: str = ""):
-    payload = {"stream_url": stream_url, "source": "auto", "stream_name": stream_name}
-    status, data = await api_request(f"/api/auto-trigger/{user_id}", "POST", payload)
+
+async def trigger_auto_recording(
+    user_id: str, stream_url: str, stream_name: str = ""
+):
+    payload = {
+        "stream_url": stream_url,
+        "source": "auto",
+        "stream_name": stream_name,
+    }
+    status, data = await api_request(
+        f"/api/auto-trigger/{user_id}", "POST", payload
+    )
     if status == 200 and data.get("started"):
         return True, "started"
     if status == 409:
@@ -227,15 +273,84 @@ async def trigger_auto_recording(user_id: str, stream_url: str, stream_name: str
         return False, "not_in_watchlist"
     return False, data.get("error", f"http_{status}")
 
+
 async def update_watchlist_name(user_id: str, display_name: str):
     try:
         payload = {"display_name": display_name}
-        status, data = await api_request(f"/api/watchlist/name/{user_id}", "POST", payload)
+        status, data = await api_request(
+            f"/api/watchlist/name/{user_id}", "POST", payload
+        )
         if status == 200:
             log(f"Saved display name for {user_id}: {display_name}")
     except Exception as e:
         log(f"Name save error for {user_id}: {e}")
 
+
+# ============================================================
+# PREMIUM DETECTION FROM JSON API
+# ============================================================
+def check_json_for_premium(json_bodies: List[str], user_id: str) -> bool:
+    for body in json_bodies:
+        if user_id not in body:
+            continue
+        if re.search(
+            r'"(?:isPremium|is_premium|premium)"\s*:\s*true', body, re.IGNORECASE
+        ):
+            return True
+        if re.search(
+            r'"(?:type|access|streamType|accessType|mode)"\s*:\s*"?premium',
+            body,
+            re.IGNORECASE,
+        ):
+            return True
+        if re.search(r'"(?:isPaywall|paywall)"\s*:\s*true', body, re.IGNORECASE):
+            return True
+        try:
+            obj = json.loads(body)
+            if _check_obj_for_premium(obj, user_id):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _check_obj_for_premium(obj, user_id, depth=0):
+    if depth > 6:
+        return False
+    if isinstance(obj, dict):
+        is_user_obj = False
+        for key, value in obj.items():
+            if isinstance(value, (str, int, float)) and str(value) == str(user_id):
+                is_user_obj = True
+                break
+        for key, value in obj.items():
+            key_lower = str(key).lower()
+            if key_lower in (
+                "ispremium", "is_premium", "premium", "ispaywall", "paywall",
+            ):
+                if value is True or str(value).lower() == "true":
+                    return True
+            if key_lower in ("type", "access", "streamtype", "accesstype", "mode"):
+                if str(value).lower() in (
+                    "premium", "paid", "private", "paywall", "subscription",
+                ):
+                    return True
+            if key_lower in ("locked", "isprivate", "is_private", "private"):
+                if (value is True or str(value).lower() == "true") and is_user_obj:
+                    return True
+        for value in obj.values():
+            if _check_obj_for_premium(value, user_id, depth + 1):
+                return True
+    elif isinstance(obj, list):
+        for item in obj[:50]:
+            if _check_obj_for_premium(item, user_id, depth + 1):
+                return True
+    return False
+
+
+# ============================================================
+# NAME EXTRACTION FROM JSON API (MOST RELIABLE SOURCE)
+# ============================================================
 def normalize_display_name(value):
     if value is None:
         return None
@@ -249,425 +364,463 @@ def normalize_display_name(value):
         return None
     if re.search(r"^\d+$", s):
         return None
-    if not re.search(r"[\u0600-\u06FFa-zA-Z\U0001F300-\U0001FAFF\u2600-\u27BF]", s):
+    if re.search(r"\d+[.,\s]?\d*\s*[kKmM]\b", s, re.IGNORECASE):
+        return None
+    if re.search(r"^[0-9.,\s\-+%]+$", s):
+        return None
+    if not re.search(
+        r"[\u0600-\u06FFa-zA-Z\U0001F300-\U0001FAFF\u2600-\u27BF]", s
+    ):
         return None
     word_count = len(s.split())
-    if word_count > 6:
+    if word_count > 5:
         return None
     lowered = s.lower()
     blocked = {
         "live", "offline", "premium", "superlive", "super live",
         "recording", "unknown", "none", "null", "video", "stream",
-        "direct", "en direct", "super", "membre", "member",
-        "undefined", "search", "rechercher",
+        "views", "viewers", "followers", "fans", "likes",
+        "watching", "subscribe", "follow", "following",
+        "k", "m", "b", "undefined", "super",
+        "membre", "member", "user", "guest",
+        "membre super", "super membre",
+        "direct", "en direct",
     }
     if lowered in blocked:
         return None
-    if "rencontrez" in lowered or "diffusions" in lowered:
+    if "rencontrez" in lowered or "diffusions" in lowered or "regardez" in lowered:
         return None
     if "nouvelles personnes" in lowered:
-        return None
-    if "membre super" in lowered:
         return None
     if "rechercher" in lowered or "résultats" in lowered:
         return None
     return s
 
+
+def extract_name_from_json(json_bodies: List[str], user_id: str) -> Optional[str]:
+    """Extract the CORRECT username from JSON API responses.
+    This is the most reliable source because the API always returns
+    data for the target user_id, never for recommended streams.
+    """
+    for body in json_bodies:
+        if user_id not in body:
+            continue
+        try:
+            obj = json.loads(body)
+            name = _find_username_in_obj(obj, user_id, depth=0)
+            if name:
+                normalized = normalize_display_name(name)
+                if normalized:
+                    return normalized
+        except Exception:
+            continue
+    return None
+
+
+def _find_username_in_obj(obj, user_id, depth=0):
+    if depth > 8:
+        return None
+    if isinstance(obj, dict):
+        has_user_id = False
+        for key, value in obj.items():
+            if isinstance(value, (str, int, float)) and str(value) == str(user_id):
+                key_lower = str(key).lower()
+                if any(
+                    token in key_lower
+                    for token in ("id", "user", "stream", "channel", "broadcaster")
+                ):
+                    has_user_id = True
+                    break
+        if has_user_id:
+            for key in (
+                "username", "nickname", "display_name", "name",
+                "streamer_name", "broadcaster_name", "user_name",
+            ):
+                if key in obj:
+                    val = obj[key]
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+        for value in obj.values():
+            result = _find_username_in_obj(value, user_id, depth + 1)
+            if result:
+                return result
+    elif isinstance(obj, list):
+        for item in obj[:100]:
+            result = _find_username_in_obj(item, user_id, depth + 1)
+            if result:
+                return result
+    return None
+
+
 # ============================================================
-# SEARCH PAGE — JAVASCRIPT FOR FINDING AND FILLING SEARCH INPUT
+# CLASSIFICATION LOGIC (SAME AS record_once.py)
 # ============================================================
-FIND_AND_SEARCH_JS = r"""
+def classify_final(video_info: Dict[str, Any], json_bodies: List[str], user_id: str) -> str:
+    live_video_candidate = bool(video_info.get("liveVideoCandidate", False))
+    stream_ended = bool(video_info.get("streamEnded", False))
+    belongs_to_user = bool(video_info.get("belongsToUser", False))
+    main_video_active = bool(video_info.get("mainVideoActive", False))
+    premium_json = bool(video_info.get("premiumFromJson", False))
+
+    is_premium = premium_json
+
+    # RULE 1: Main video is active AND belongs to user
+    if main_video_active and belongs_to_user:
+        if is_premium:
+            return LIVE_PREMIUM
+        return LIVE_NORMAL
+
+    # RULE 2: Video exists and belongs to user
+    if live_video_candidate and belongs_to_user:
+        if is_premium:
+            return LIVE_PREMIUM
+        return LIVE_NORMAL
+
+    # RULE 3: Video exists but does NOT belong to user (recommended streams)
+    if live_video_candidate and not belongs_to_user:
+        return OFFLINE
+
+    # RULE 4: No active video at all
+    if not live_video_candidate:
+        return OFFLINE
+
+    return UNKNOWN
+
+
+# ============================================================
+# PAGE INFO JS — SAME domContainsTargetId AS record_once.py
+# ============================================================
+PAGE_INFO_JS = r"""
 (userId) => {
-    // Find ALL input elements on the page
-    const allInputs = Array.from(document.querySelectorAll('input'));
-    let searchInput = null;
+    const videos = Array.from(document.querySelectorAll('video'));
+    let srcObjectCount = 0;
+    let visibleCount = 0;
+    let liveVideoCandidate = false;
+    let belongsToUser = false;
+    let mainVideoActive = false;
+    let streamEnded = false;
 
-    // Strategy 1: Find by placeholder text
-    for (const input of allInputs) {
-        const placeholder = (input.placeholder || '').toLowerCase();
-        if (placeholder.includes('rechercher') ||
-            placeholder.includes('nom') ||
-            placeholder.includes('utilisateur') ||
-            placeholder.includes('search') ||
-            placeholder.includes('id')) {
-            searchInput = input;
-            break;
-        }
-    }
-
-    // Strategy 2: Find by type
-    if (!searchInput) {
-        for (const input of allInputs) {
-            if (input.type === 'search' || input.type === 'text') {
-                searchInput = input;
-                break;
-            }
-        }
-    }
-
-    // Strategy 3: Find any input that's visible or can be made visible
-    if (!searchInput && allInputs.length > 0) {
-        searchInput = allInputs[0];
-    }
-
-    if (!searchInput) {
-        return { success: false, error: 'no_input_found', inputCount: allInputs.length };
-    }
-
-    // Make the input visible if hidden
-    try {
-        searchInput.style.display = 'block';
-        searchInput.style.visibility = 'visible';
-        searchInput.style.opacity = '1';
-        searchInput.style.position = 'relative';
-        searchInput.style.zIndex = '99999';
-
-        // Also show parent elements
-        let parent = searchInput.parentElement;
+    // ============================================================
+    // DOM CONTAINS TARGET ID — EXACT SAME LOGIC AS record_once.py
+    // 8 levels deep, checks id, className, data-*, href, descendants
+    // ============================================================
+    const domContainsTargetId = (element) => {
+        if (!userId || !element) return false;
+        let node = element;
         let depth = 0;
-        while (parent && depth < 5) {
-            parent.style.display = 'block';
-            parent.style.visibility = 'visible';
-            parent.style.opacity = '1';
-            parent = parent.parentElement;
+        while (node && depth < 8) {
+            try {
+                const values = [
+                    node.id,
+                    node.className,
+                    node.getAttribute && node.getAttribute("data-stream-id"),
+                    node.getAttribute && node.getAttribute("data-id"),
+                    node.getAttribute && node.getAttribute("data-livestream-id"),
+                    node.getAttribute && node.getAttribute("data-channel-id"),
+                    node.getAttribute && node.getAttribute("data-video-id"),
+                    node.getAttribute && node.getAttribute("href"),
+                ];
+                if (values.some(value => value != null && String(value).includes(userId))) {
+                    return true;
+                }
+                if (node.querySelector) {
+                    const descendants = node.querySelectorAll(
+                        '[href], [data-stream-id], [data-livestream-id], [data-video-id]'
+                    );
+                    for (const descendant of descendants) {
+                        const descendantValues = [
+                            descendant.getAttribute && descendant.getAttribute("href"),
+                            descendant.getAttribute && descendant.getAttribute("data-stream-id"),
+                            descendant.getAttribute && descendant.getAttribute("data-livestream-id"),
+                            descendant.getAttribute && descendant.getAttribute("data-video-id"),
+                        ];
+                        if (descendantValues.some(value => value != null && String(value).includes(userId))) {
+                            return true;
+                        }
+                    }
+                }
+            } catch (e) {}
+            node = node.parentElement;
             depth++;
         }
+        return false;
+    };
+
+    // ============================================================
+    // CHECK STREAM ENDED — ONLY in the main video container
+    // NOT in the entire page body
+    // ============================================================
+    try {
+        if (videos.length > 0) {
+            // Check first 3 videos (likely the main player + nearby)
+            for (let i = 0; i < Math.min(3, videos.length); i++) {
+                let container = videos[i].parentElement;
+                let cDepth = 0;
+                while (container && cDepth < 5) {
+                    const text = container.innerText || '';
+                    if (
+                        text.includes("Le direct s'est termin") ||
+                        text.includes("Stream ended") ||
+                        text.includes("diffusion est terminée")
+                    ) {
+                        streamEnded = true;
+                        break;
+                    }
+                    container = container.parentElement;
+                    cDepth++;
+                }
+                if (streamEnded) break;
+            }
+        }
     } catch (e) {}
 
-    // Set the value using native setter to trigger React/Vue reactivity
-    try {
-        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, 'value'
-        ).set;
-        nativeInputValueSetter.call(searchInput, userId);
-    } catch (e) {
-        searchInput.value = userId;
+    // ============================================================
+    // CHECK ALL VIDEOS WITH domContainsTargetId (8 levels)
+    // ============================================================
+    for (const video of videos) {
+        if (video.srcObject) {
+            srcObjectCount++;
+        }
+        const rect = video.getBoundingClientRect();
+        const visible = rect.width > 50 && rect.height > 50;
+        if (visible) {
+            visibleCount++;
+        }
+        if (video.srcObject && video.readyState >= 2 && visible) {
+            liveVideoCandidate = true;
+            if (domContainsTargetId(video)) {
+                belongsToUser = true;
+            }
+        }
     }
 
-    // Dispatch events to trigger search
-    try {
-        searchInput.dispatchEvent(new Event('input', { bubbles: true }));
-        searchInput.dispatchEvent(new Event('change', { bubbles: true }));
-        searchInput.dispatchEvent(new KeyboardEvent('keydown', {
-            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
-        }));
-        searchInput.dispatchEvent(new KeyboardEvent('keypress', {
-            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
-        }));
-        searchInput.dispatchEvent(new KeyboardEvent('keyup', {
-            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
-        }));
-    } catch (e) {}
+    // ============================================================
+    // FIND THE MAIN VIDEO (largest one with srcObject)
+    // ============================================================
+    let mainVideo = null;
+    let mainVideoArea = 0;
+    for (const video of videos) {
+        if (!video.srcObject) continue;
+        const rect = video.getBoundingClientRect();
+        const area = rect.width * rect.height;
+        if (area > mainVideoArea) {
+            mainVideoArea = area;
+            mainVideo = video;
+        }
+    }
+
+    if (mainVideo) {
+        const mainHasSrcObject = !!mainVideo.srcObject;
+        const mainRect = mainVideo.getBoundingClientRect();
+        const mainIsVisible = mainRect.width > 100 && mainRect.height > 100;
+        const mainIsReady = mainVideo.readyState >= 2;
+        const mainBelongs = domContainsTargetId(mainVideo);
+
+        if (mainHasSrcObject && mainIsVisible && mainIsReady && mainBelongs) {
+            mainVideoActive = true;
+        }
+
+        // If main video has NO srcObject but other videos do,
+        // those other videos are likely recommended streams
+        if (!mainHasSrcObject && srcObjectCount > 0) {
+            belongsToUser = false;
+            mainVideoActive = false;
+        }
+    }
+
+    // Override streamEnded if main video IS active and belongs to user
+    if (streamEnded && mainVideoActive && belongsToUser) {
+        streamEnded = false;
+    }
 
     return {
-        success: true,
-        inputType: searchInput.type,
-        inputPlaceholder: searchInput.placeholder || '',
-        inputValue: searchInput.value
+        videoCount: videos.length,
+        srcObjectCount,
+        visibleCount,
+        liveVideoCandidate,
+        belongsToUser,
+        mainVideoActive,
+        streamEnded,
     };
 }
 """
 
-EXTRACT_SEARCH_RESULTS_JS = r"""
-(userId) => {
-    const results = [];
-    const bodyText = document.body ? document.body.innerText : '';
 
-    // Check if user_id appears in the page at all
-    if (!bodyText.includes(userId)) {
-        return {
-            found: false,
-            reason: 'user_id_not_in_page',
-            pageTextLength: bodyText.length,
-            pageTitle: document.title || ''
-        };
-    }
+async def classify_user_on_stream_page(
+    context, user_id: str, semaphore: asyncio.Semaphore
+) -> Dict[str, Any]:
+    """
+    Open the livestream page for the user and check:
+    1. Is there an active video that belongs to this user?
+    2. What is the username (from JSON API responses)?
+    3. Is it a premium stream?
 
-    // Strategy 1: Look for result cards/containers
-    const containers = document.querySelectorAll(
-        '[class*="result"], [class*="card"], [class*="user"], [class*="profile"], ' +
-        '[class*="streamer"], [class*="broadcaster"], article, li, [class*="item"]'
-    );
-
-    for (const container of containers) {
-        const text = container.innerText || '';
-        if (!text.includes(userId)) continue;
-
-        // Extract name
-        let displayName = '';
-        const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-
-        for (const line of lines) {
-            if (line === userId) continue;
-            if (/^\d+$/.test(line)) continue;
-            if (line.startsWith('@')) continue;
-            if (line.includes('Rechercher')) continue;
-            if (line.includes('Résultats')) continue;
-            if (line.includes('ProfilePicture')) continue;
-            if (line.toUpperCase() === 'DIRECT') continue;
-            if (line.toUpperCase() === 'LIVE') continue;
-            if (line.toLowerCase().includes('verified')) continue;
-
-            if (line.length >= 2 && line.length <= 50) {
-                displayName = line;
-                break;
-            }
-        }
-
-        // Check for DIRECT/LIVE indicator
-        let isLive = false;
-        const upperText = text.toUpperCase();
-        if (upperText.includes('DIRECT') || upperText.includes('EN DIRECT')) {
-            isLive = true;
-        }
-
-        // Also check for links with DIRECT text
-        const links = container.querySelectorAll('a, button');
-        let directLink = '';
-        for (const link of links) {
-            const linkText = (link.innerText || link.textContent || '').trim().toUpperCase();
-            if (linkText === 'DIRECT' || linkText === 'LIVE' || linkText === 'EN DIRECT') {
-                isLive = true;
-                if (link.tagName === 'A' && link.href) {
-                    directLink = link.href;
-                }
-            }
-        }
-
-        // Check for premium
-        let isPremium = false;
-        const lowerText = text.toLowerCase();
-        if (lowerText.includes('premium') || lowerText.includes('payant') || lowerText.includes('exclusive')) {
-            isPremium = true;
-        }
-
-        if (displayName) {
-            results.push({ displayName, isLive, isPremium, directLink });
-        }
-    }
-
-    // Strategy 2: If no containers found, try to extract from raw text
-    if (results.length === 0 && bodyText.includes(userId)) {
-        const lines = bodyText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-        let displayName = '';
-        let isLive = false;
-
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            if (line === userId || line.includes(userId)) {
-                // Look at surrounding lines for the name
-                for (let j = Math.max(0, i - 3); j <= Math.min(lines.length - 1, i + 3); j++) {
-                    const candidate = lines[j];
-                    if (candidate === userId) continue;
-                    if (/^\d+$/.test(candidate)) continue;
-                    if (candidate.startsWith('@')) continue;
-                    if (candidate.includes('Rechercher')) continue;
-                    if (candidate.includes('Résultats')) continue;
-                    if (candidate.includes('ProfilePicture')) continue;
-                    if (candidate.toUpperCase() === 'DIRECT') continue;
-                    if (candidate.toLowerCase().includes('verified')) continue;
-                    if (candidate.length >= 2 && candidate.length <= 50) {
-                        displayName = candidate;
-                        break;
-                    }
-                }
-
-                // Check nearby lines for DIRECT
-                for (let j = Math.max(0, i - 5); j <= Math.min(lines.length - 1, i + 5); j++) {
-                    if (lines[j].toUpperCase().includes('DIRECT')) {
-                        isLive = true;
-                        break;
-                    }
-                }
-                break;
-            }
-        }
-
-        if (displayName) {
-            results.push({ displayName, isLive, isPremium: false, directLink: '' });
-        }
-    }
-
-    return {
-        found: results.length > 0,
-        results,
-        pageTitle: document.title || ''
-    };
-}
-"""
-
-async def search_user(context, user_id: str, semaphore: asyncio.Semaphore) -> Dict[str, Any]:
+    This uses the EXACT same logic as record_once.py which is
+    proven to work correctly for manual recordings.
+    """
     async with semaphore:
         page = await context.new_page()
-        result = {
-            "user_id": user_id,
-            "display_name": None,
-            "is_live": False,
-            "is_premium": False,
-            "direct_link": None,
-            "error": None,
+        json_bodies: List[str] = []
+        json_count = 0
+        url = BASE_LIVE_URL.format(user_id=user_id)
+        video_info = {
+            "videoCount": 0,
+            "srcObjectCount": 0,
+            "visibleCount": 0,
+            "liveVideoCandidate": False,
+            "belongsToUser": False,
+            "mainVideoActive": False,
+            "streamEnded": False,
+            "nameSource": "none",
         }
 
-        try:
-            # Navigate to search page
-            await page.goto(SEARCH_URL, timeout=PAGE_TIMEOUT_MS, wait_until="networkidle")
-            await page.wait_for_timeout(3000)
-
-            # Use JavaScript to find and fill the search input
-            # This bypasses the "element is not visible" error
-            fill_result = await page.evaluate(FIND_AND_SEARCH_JS, user_id)
-
-            if not fill_result.get("success"):
-                # Try alternative: direct URL with query param
-                alt_url = f"{SEARCH_URL}?q={user_id}"
-                await page.goto(alt_url, timeout=PAGE_TIMEOUT_MS, wait_until="networkidle")
-                await page.wait_for_timeout(3000)
-
-                # Try again
-                fill_result = await page.evaluate(FIND_AND_SEARCH_JS, user_id)
-                if not fill_result.get("success"):
-                    # Try another URL format
-                    alt_url2 = f"{SEARCH_URL}?search={user_id}"
-                    await page.goto(alt_url2, timeout=PAGE_TIMEOUT_MS, wait_until="networkidle")
-                    await page.wait_for_timeout(3000)
-                    fill_result = await page.evaluate(FIND_AND_SEARCH_JS, user_id)
-
-            if not fill_result.get("success"):
-                result["error"] = f"cannot_fill_search: {fill_result.get('error', 'unknown')}"
-                await page.close()
-                return result
-
-            log(f"Search input filled for {user_id}: "
-                f"type={fill_result.get('inputType')}, "
-                f"placeholder={fill_result.get('inputPlaceholder', '')[:30]}")
-
-            # Wait for search results to load
-            await page.wait_for_timeout(PLAYWRIGHT_WAIT_MS)
-
-            # Also press Enter via keyboard as backup
+        async def on_response(response):
+            nonlocal json_count
+            if json_count >= 30:
+                return
             try:
-                await page.keyboard.press("Enter")
-                await page.wait_for_timeout(3000)
+                content_type = (response.headers or {}).get("content-type", "")
+                if "json" not in content_type.lower():
+                    return
+                response_url = response.url or ""
+                body = await response.text()
+                if not body:
+                    return
+                # Only capture responses related to the target user
+                if user_id in body or user_id in response_url:
+                    json_count += 1
+                    json_bodies.append(body[:200000])
             except Exception:
                 pass
 
-            # Extract results
-            search_result = await page.evaluate(EXTRACT_SEARCH_RESULTS_JS, user_id)
+        page.on("response", on_response)
 
-            if search_result.get("found") and search_result.get("results"):
-                first_result = search_result["results"][0]
-                raw_name = first_result.get("displayName", "")
-                normalized = normalize_display_name(raw_name)
+        try:
+            await page.goto(url, timeout=PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
+            # Wait for the page to load and video to start
+            await page.wait_for_timeout(PLAYWRIGHT_WAIT_MS)
 
-                if normalized:
-                    result["display_name"] = normalized
-                elif raw_name and len(raw_name) >= 2:
-                    result["display_name"] = raw_name
+            try:
+                video_info = await page.evaluate(PAGE_INFO_JS, user_id)
+            except Exception:
+                video_info = {
+                    "videoCount": 0,
+                    "srcObjectCount": 0,
+                    "visibleCount": 0,
+                    "liveVideoCandidate": False,
+                    "belongsToUser": False,
+                    "mainVideoActive": False,
+                    "streamEnded": False,
+                    "nameSource": "none",
+                }
 
-                result["is_live"] = bool(first_result.get("isLive", False))
-                result["is_premium"] = bool(first_result.get("isPremium", False))
-                result["direct_link"] = first_result.get("directLink") or None
-
-                log(f"Search result for {user_id}: "
-                    f"name={result['display_name']}, "
-                    f"is_live={result['is_live']}, "
-                    f"is_premium={result['is_premium']}")
-            else:
-                reason = search_result.get("reason", "no_results")
-                result["error"] = f"search_no_results: {reason}"
-                log(f"Search: no results for {user_id} ({reason})")
+            # Retry once if no video detected
+            if (
+                not video_info.get("liveVideoCandidate")
+                and video_info.get("srcObjectCount", 0) == 0
+            ):
+                await page.wait_for_timeout(PLAYWRIGHT_RETRY_WAIT_MS)
+                try:
+                    video_info = await page.evaluate(PAGE_INFO_JS, user_id)
+                except Exception:
+                    pass
 
         except Exception as e:
-            result["error"] = str(e)[:200]
-            log(f"Search error for {user_id}: {result['error']}")
+            await page.close()
+            return {
+                "status": UNKNOWN,
+                "reason": f"page_error:{str(e)[:100]}",
+                "stream_url": url,
+                "display_name": None,
+            }
 
         await page.close()
+
+        # Premium detection from JSON API responses
+        video_info["premiumFromJson"] = check_json_for_premium(json_bodies, user_id)
+
+        # Name extraction from JSON API responses (most reliable)
+        display_name = None
+        json_name = extract_name_from_json(json_bodies, user_id)
+        if json_name:
+            display_name = json_name
+            video_info["nameSource"] = "json_api"
+
+        final_status = classify_final(video_info, json_bodies, user_id)
+
+        result = {
+            "status": final_status,
+            "reason": (
+                f"video={video_info.get('liveVideoCandidate')},"
+                f"belongs={video_info.get('belongsToUser')},"
+                f"mainActive={video_info.get('mainVideoActive')},"
+                f"premium={video_info.get('premiumFromJson')},"
+                f"ended={video_info.get('streamEnded')}"
+            ),
+            "stream_url": url,
+            "display_name": display_name,
+            "video_info": video_info,
+        }
+
         return result
 
 
-async def classify_user_via_search(context, user_id: str, semaphore: asyncio.Semaphore) -> Dict[str, Any]:
-    search_result = await search_user(context, user_id, semaphore)
-
-    if search_result.get("error"):
-        return {
-            "status": UNKNOWN,
-            "reason": f"search_error:{search_result['error'][:80]}",
-            "stream_url": BASE_LIVE_URL.format(user_id=user_id),
-            "display_name": search_result.get("display_name"),
-            "video_info": {},
-        }
-
-    display_name = search_result.get("display_name")
-    is_live = search_result.get("is_live", False)
-    is_premium = search_result.get("is_premium", False)
-
-    if not is_live:
-        return {
-            "status": OFFLINE,
-            "reason": "search:no_direct_button",
-            "stream_url": BASE_LIVE_URL.format(user_id=user_id),
-            "display_name": display_name,
-            "video_info": {},
-        }
-
-    if is_premium:
-        return {
-            "status": LIVE_PREMIUM,
-            "reason": "search:premium_detected",
-            "stream_url": BASE_LIVE_URL.format(user_id=user_id),
-            "display_name": display_name,
-            "video_info": {},
-        }
-
-    # User is live and not premium
-    return {
-        "status": LIVE_NORMAL,
-        "reason": "search:direct_button_found",
-        "stream_url": BASE_LIVE_URL.format(user_id=user_id),
-        "display_name": display_name,
-        "video_info": {"search_live": True},
-    }
-
-
-async def classify_many_users(user_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+async def classify_many_users(
+    user_ids: List[str], stored_names: Dict[str, str] = None
+) -> Dict[str, Dict[str, Any]]:
     results = {}
     if not user_ids:
         return results
+    if stored_names is None:
+        stored_names = {}
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        log("Playwright is not installed.")
+        log("Playwright is not installed. Skipping browser detection.")
         for user_id in user_ids:
             results[user_id] = {
-                "status": UNKNOWN, "reason": "playwright_not_installed",
+                "status": UNKNOWN,
+                "reason": "playwright_not_installed",
                 "stream_url": BASE_LIVE_URL.format(user_id=user_id),
-                "display_name": None,
+                "display_name": stored_names.get(user_id),
             }
         return results
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=[
-                "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                "--disable-background-timer-throttling",
-                "--disable-renderer-backgrounding",
-            ])
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-background-timer-throttling",
+                    "--disable-renderer-backgrounding",
+                ],
+            )
             context = await browser.new_context(
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 800},
                 locale="fr-FR",
             )
             semaphore = asyncio.Semaphore(PLAYWRIGHT_CONCURRENCY)
-            tasks = [classify_user_via_search(context, uid, semaphore) for uid in user_ids]
+            tasks = [
+                classify_user_on_stream_page(context, uid, semaphore)
+                for uid in user_ids
+            ]
             gathered = await asyncio.gather(*tasks, return_exceptions=True)
-            for user_id, res in zip(user_ids, gathered):
-                if isinstance(res, Exception):
+            for user_id, result in zip(user_ids, gathered):
+                if isinstance(result, Exception):
                     results[user_id] = {
-                        "status": UNKNOWN, "reason": str(res)[:120],
+                        "status": UNKNOWN,
+                        "reason": str(result)[:120],
                         "stream_url": BASE_LIVE_URL.format(user_id=user_id),
-                        "display_name": None,
+                        "display_name": stored_names.get(user_id),
                     }
                 else:
-                    results[user_id] = res
+                    # If no name from JSON but we have stored name, use it
+                    if not result.get("display_name") and stored_names.get(user_id):
+                        result["display_name"] = stored_names[user_id]
+                    results[user_id] = result
             await context.close()
             await browser.close()
     except Exception as e:
@@ -675,19 +828,29 @@ async def classify_many_users(user_ids: List[str]) -> Dict[str, Dict[str, Any]]:
         for user_id in user_ids:
             if user_id not in results:
                 results[user_id] = {
-                    "status": UNKNOWN, "reason": "playwright_global_error",
+                    "status": UNKNOWN,
+                    "reason": "playwright_global_error",
                     "stream_url": BASE_LIVE_URL.format(user_id=user_id),
-                    "display_name": None,
+                    "display_name": stored_names.get(user_id),
                 }
     return results
 
 
+# ============================================================
+# MAIN MONITOR LOOP
+# ============================================================
 async def async_main() -> int:
     monitor_start_time = time.monotonic()
     stats = {
-        "total_watchlist": 0, "already_recording": 0, "checked_now": 0,
-        "live_normal": 0, "live_premium": 0, "offline": 0, "unknown": 0,
-        "started_recordings": 0, "names": {},
+        "total_watchlist": 0,
+        "already_recording": 0,
+        "checked_now": 0,
+        "live_normal": 0,
+        "live_premium": 0,
+        "offline": 0,
+        "unknown": 0,
+        "started_recordings": 0,
+        "names": {},
     }
 
     log("Starting monitor")
@@ -715,7 +878,7 @@ async def async_main() -> int:
         stats["total_watchlist"] = len(watchlist)
 
         if not watchlist:
-            log("Watchlist is empty.")
+            log("Watchlist is empty. Nothing to do.")
             log("Monitor completed")
             return 0
 
@@ -725,7 +888,10 @@ async def async_main() -> int:
             log(f"FATAL: {e}")
             return 1
 
-        log(f"Active recordings: {active['active_count']}/{active['max_concurrent']}")
+        log(
+            f"Active recordings: "
+            f"{active['active_count']}/{active['max_concurrent']}"
+        )
 
         if active["active_count"] >= active["max_concurrent"]:
             log("Concurrency limit already reached.")
@@ -759,11 +925,11 @@ async def async_main() -> int:
         selected = users_to_check[:PLAYWRIGHT_MAX_USERS_PER_CYCLE]
         stats["checked_now"] = len(selected)
 
-        log(f"Running search-based detection for {len(selected)} users")
-        results = await classify_many_users(selected)
+        log(f"Running stream-page detection for {len(selected)} users")
+        results = await classify_many_users(selected, stored_names)
 
         for user_id, result in results.items():
-            log_detection(user_id, result, "search_page")
+            log_detection(user_id, result, "stream_page")
 
         for user_id in users_to_check:
             result = results.get(user_id, {})
@@ -795,7 +961,9 @@ async def async_main() -> int:
             return 0
 
         slots_available = active["max_concurrent"] - active["active_count"]
-        log(f"Slots: {active['active_count']}/{active['max_concurrent']}")
+        log(
+            f"Slots: {active['active_count']}/{active['max_concurrent']}"
+        )
 
         if slots_available <= 0:
             log("No recording slots available.")
@@ -824,16 +992,24 @@ async def async_main() -> int:
                 log("action=WAIT_NEXT_CYCLE")
                 log("reason=no_slot_available")
                 break
-            stream_url = result.get("stream_url") or BASE_LIVE_URL.format(user_id=user_id)
-            stream_name = result.get("display_name") or stats["names"].get(user_id, "")
+            stream_url = result.get("stream_url") or BASE_LIVE_URL.format(
+                user_id=user_id
+            )
+            stream_name = (
+                result.get("display_name") or stats["names"].get(user_id, "")
+            )
             log(f"username={user_id}")
             log("status=LIVE_NORMAL")
             log("Recording state: NOT_RECORDING")
-            log(f"Slots: {active['active_count']}/{active['max_concurrent']}")
+            log(
+                f"Slots: {active['active_count']}/{active['max_concurrent']}"
+            )
             if stream_name:
                 log(f"display_name={stream_name}")
             log("Action: START_RECORDING")
-            ok, reason = await trigger_auto_recording(user_id, stream_url, stream_name)
+            ok, reason = await trigger_auto_recording(
+                user_id, stream_url, stream_name
+            )
             if ok:
                 log(f"username={user_id}")
                 log("trigger=SUCCESS")
