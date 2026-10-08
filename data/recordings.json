@@ -38,9 +38,10 @@
       "stream_id": "33018909",
       "stream_url": "https://superlivetv.com/fr/profile/33018909",
       "stream_name": "Super",
-      "status": "recording",
+      "status": "stopped",
       "started_at": "2026-10-08T21:37:04.963Z",
-      "source": "auto"
+      "source": "auto",
+      "stopped_at": "2026-10-08T21:39:06.589Z"
     }
   ]
 }
