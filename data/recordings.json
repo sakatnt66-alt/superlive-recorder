@@ -12,11 +12,12 @@
       "stream_id": "24353293",
       "stream_url": "https://superlivetv.com/fr/profile/24353293",
       "stream_name": "Super",
-      "status": "recording",
+      "status": "stopped",
       "started_at": "2026-10-08T21:25:31.012Z",
       "source": "auto",
       "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
+      "error": "Live video was not detected; last selector error=Error: No visible live video target found",
+      "stopped_at": "2026-10-08T21:39:13.229Z"
     },
     {
       "stream_id": "12259737",
