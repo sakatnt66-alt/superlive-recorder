@@ -14,7 +14,9 @@
       "stream_name": "نجلاء💎🎀",
       "status": "recording",
       "started_at": "2026-10-08T21:25:29.347Z",
-      "source": "auto"
+      "source": "auto",
+      "state": "failed",
+      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     },
     {
       "stream_id": "24353293",
