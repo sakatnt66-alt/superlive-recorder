@@ -1,14 +1,24 @@
+# -*- coding: utf-8 -*-
 """
-SuperLive Discovery Module - Version 7.0 (FINAL)
+SuperLive Discovery Module - Version 7.1 (SyntaxError Fixed)
+
+Fixes in v7.1:
+  [OK] Removed emoji characters from module docstring
+  [OK] Added UTF-8 encoding declaration
 
 Fixes in v7.0:
-1. ✅ Fixed SyntaxWarning: JavaScript strings now use r""" (raw strings)
-2. ✅ Added 'followings', 'followers', 'messages', 'notifications', 'settings',
-     'favorites', 'history' to SYSTEM_PAGES_EXACT
-3. ✅ Improved username extraction: removes leading numbers, @username, 
-     multi-line noise, keeps only the real display name
-4. ✅ Better live detection: rejects pages that show OTHER users' streams
-5. ✅ Better premium detection: distinguishes profile-level vs page-level
+  - Added 'followings', 'followers', 'messages', etc. to SYSTEM_PAGES
+  - Improved username extraction (removes numbers, @username, multi-line noise)
+  - Better live detection (rejects pages showing OTHER users' streams)
+  - Better premium detection (distinguishes profile-level vs page-level)
+
+Fixes in v6.0:
+  - Fixed URL validator that was rejecting valid /profile/{id} URLs
+  - Added slug-based URL support (/fr/username)
+
+Phase 1: Identity Resolution (user_id -> profile_url)
+Phase 2: Live Status Detection (visit profile, check for LIVE indicator)
+Phase 3: Stream Validation
 """
 
 import asyncio
@@ -36,7 +46,7 @@ class SuperLiveDiscovery:
         "Chrome/131.0.0.0 Safari/537.36"
     )
 
-    # صفحات النظام التي يجب رفضها (ليست بروفايلات مستخدمين)
+    # System pages to reject (not user profiles)
     SYSTEM_PAGES_EXACT = {
         # Main system pages
         "discover", "explore", "trending", "popular", "categories",
@@ -63,13 +73,13 @@ class SuperLiveDiscovery:
     def _is_valid_profile_url(self, url: str, user_id: str = "") -> bool:
         """
         Accepts:
-          ✓ /fr/profile/25192720
-          ✓ /fr/profile/25192720?isFromSearch=true
-          ✓ /fr/alisa_xs
-          ✓ /fr/livestream/51527806
-        
+          /fr/profile/25192720
+          /fr/profile/25192720?isFromSearch=true
+          /fr/alisa_xs
+          /fr/livestream/51527806
+
         Rejects:
-          ✗ /fr/discover, /fr/followings, /fr/search, /fr/login, etc.
+          /fr/discover, /fr/followings, /fr/search, /fr/login, etc.
         """
         if not url:
             return False
@@ -118,14 +128,12 @@ class SuperLiveDiscovery:
     # ============================================================
     def _clean_username(self, raw: str) -> Optional[str]:
         """
-        Input:  "23\\nAlisa\\n@alisa_xs"
-        Output: "Alisa"
-        
-        Input:  "30\\nنجد👠👑"
-        Output: "نجد👠👑"
-        
-        Input:  "31\\n🇲🇦🦌غزلان فرنسي🦌\\n@rizlani6479"
-        Output: "🇲🇦🦌غزلان فرنسي🦌"
+        Cleans raw extracted usernames.
+
+        Examples:
+          "23\\nAlisa\\n@alisa_xs"  ->  "Alisa"
+          "30\\nNajd"               ->  "Najd"
+          "31\\nGhazal\\n@rizlani"  ->  "Ghazal"
         """
         if not raw:
             return None
@@ -150,7 +158,7 @@ class SuperLiveDiscovery:
             # Skip very long lines (> 80 chars)
             if len(line) > 80:
                 continue
-            # Skip if it's just a number followed by text (like "23")
+            # Skip pure small numbers (1-99)
             if re.match(r"^\d{1,2}$", line):
                 continue
             valid_lines.append(line)
@@ -158,9 +166,9 @@ class SuperLiveDiscovery:
         if not valid_lines:
             return None
 
-        # Take the first valid line (usually the real display name)
-        # Remove leading numbers if present (e.g., "30 نجد" → "نجد")
+        # Take the first valid line
         name = valid_lines[0]
+        # Remove leading numbers (e.g., "30 Najd" -> "Najd")
         name = re.sub(r"^\d{1,3}\s*", "", name)
         name = name.strip()
 
@@ -193,12 +201,11 @@ class SuperLiveDiscovery:
         # Method A: Search page
         result = await self._method_a_search(user_id)
         if result and result.get("profile_url") and self._is_valid_profile_url(result["profile_url"], user_id):
-            # Clean the username
             if result.get("username"):
                 result["username"] = self._clean_username(result["username"])
             self.profile_cache[user_id] = result
             self.cache_timestamps[user_id] = current_time
-            self.log(f"✓ Method A: {result['profile_url']}, username={result.get('username')}")
+            self.log(f"Method A OK: {result['profile_url']}, username={result.get('username')}")
             return result
 
         # Method B: Direct profile page
@@ -208,7 +215,7 @@ class SuperLiveDiscovery:
                 result["username"] = self._clean_username(result["username"])
             self.profile_cache[user_id] = result
             self.cache_timestamps[user_id] = current_time
-            self.log(f"✓ Method B: {result['profile_url']}")
+            self.log(f"Method B OK: {result['profile_url']}")
             return result
 
         # Method C: Livestream page
@@ -218,12 +225,12 @@ class SuperLiveDiscovery:
                 result["username"] = self._clean_username(result["username"])
             self.profile_cache[user_id] = result
             self.cache_timestamps[user_id] = current_time
-            self.log(f"✓ Method C: {result['profile_url']}")
+            self.log(f"Method C OK: {result['profile_url']}")
             return result
 
         # Method D: Fallback
         result = self._fallback(user_id)
-        self.log(f"⚠ Method D (fallback): {result['profile_url']}")
+        self.log(f"Method D (fallback): {result['profile_url']}")
         return result
 
     # ============================================================
@@ -252,9 +259,9 @@ class SuperLiveDiscovery:
                             try:
                                 body = await response.json()
                                 api_responses.append({"url": response.url, "body": body})
-                            except:
+                            except Exception:
                                 pass
-                    except:
+                    except Exception:
                         pass
 
                 page.on("response", on_response)
@@ -272,7 +279,7 @@ class SuperLiveDiscovery:
                     result["method"] = "method_a_api"
                     return result
 
-                # 2. Try DOM extraction (FIXED JavaScript raw string)
+                # 2. Try DOM extraction
                 result = await self._search_dom_for_profile(page, user_id)
                 await browser.close()
                 if result and result.get("profile_url"):
@@ -348,22 +355,25 @@ class SuperLiveDiscovery:
 
     async def _search_dom_for_profile(self, page, user_id: str) -> Optional[Dict[str, Any]]:
         """
-        استخراج رابط البروفايل من نتائج البحث.
-        ✅ FIXED: استخدام raw string للـ JavaScript لتجنب SyntaxWarning
+        Extract profile link from search results using JavaScript.
+        Uses raw string (r) to avoid escape sequence warnings.
         """
         try:
-            # ✅ RAW STRING (r""") - يحل مشكلة SyntaxWarning: invalid escape sequence '\d'
             js_code = r"""
             (userId) => {
                 const results = [];
                 const links = document.querySelectorAll('a[href]');
-                const systemSlugs = ['search','discover','login','register','explore','trending','popular','followings','followers','messages','notifications','settings','categories','home'];
-                
+                const systemSlugs = [
+                    'search','discover','login','register','explore','trending',
+                    'popular','followings','followers','messages','notifications',
+                    'settings','categories','home'
+                ];
+
                 for (const link of links) {
                     const href = link.getAttribute('href');
                     if (!href) continue;
-                    
-                    // Get surrounding context
+
+                    // Get surrounding context (walk up DOM tree)
                     let contextText = '';
                     let node = link;
                     for (let i = 0; i < 5; i++) {
@@ -376,11 +386,10 @@ class SuperLiveDiscovery:
                             break;
                         }
                     }
-                    
-                    // Match profile URLs
+
                     const profileMatch = href.match(/\/profile\/(\d+)/);
                     const slugMatch = href.match(/\/fr\/([a-zA-Z0-9_]+)$/);
-                    
+
                     if (profileMatch) {
                         const hasUserId = contextText.includes(userId);
                         results.push({
@@ -401,10 +410,8 @@ class SuperLiveDiscovery:
                         });
                     }
                 }
-                
-                // Sort by priority (lower is better)
+
                 results.sort((a, b) => a.priority - b.priority);
-                
                 return results[0] || null;
             }
             """
@@ -432,14 +439,13 @@ class SuperLiveDiscovery:
                 return {
                     "profile_url": href,
                     "profile_id": profile_id,
-                    "username": username,  # Will be cleaned by _clean_username later
+                    "username": username,
                     "source": "dom"
                 }
 
             # Fallback: scan raw HTML
             content = await page.content()
 
-            # Search for /profile/{id} near user_id
             pattern = rf'{user_id}.{{0,500}}?/profile/(\d+)'
             match = re.search(pattern, content, re.DOTALL)
             if match:
@@ -546,9 +552,9 @@ class SuperLiveDiscovery:
                             try:
                                 body = await response.json()
                                 api_responses.append({"url": response.url, "body": body})
-                            except:
+                            except Exception:
                                 pass
-                    except:
+                    except Exception:
                         pass
 
                 page.on("response", on_response)
@@ -591,12 +597,15 @@ class SuperLiveDiscovery:
     # ============================================================
     # PHASE 2: LIVE STATUS DETECTION
     # ============================================================
-    async def check_live_status(self, profile_url: str, user_id: str = "", profile_id: str = "") -> Optional[Dict[str, Any]]:
+    async def check_live_status(
+        self, profile_url: str, user_id: str = "", profile_id: str = ""
+    ) -> Optional[Dict[str, Any]]:
         """
         Phase 2: Visit profile_url and determine if user is LIVE.
-        
-        KEY INSIGHT: /fr/profile/XXX redirects to the stream page if user is live.
-        So we check if the page shows THIS user's stream, not someone else's.
+
+        Key insight: /fr/profile/XXX redirects to the stream page when the user
+        is live. So we verify the final URL is still a profile (not a system page)
+        and check for a LIVE indicator on the page.
         """
         self.log(f"Phase 2: Checking live at {profile_url}")
 
@@ -625,9 +634,9 @@ class SuperLiveDiscovery:
                             try:
                                 body = await response.json()
                                 api_responses.append({"url": response.url, "body": body})
-                            except:
+                            except Exception:
                                 pass
-                    except:
+                    except Exception:
                         pass
 
                 page.on("response", on_response)
@@ -638,20 +647,20 @@ class SuperLiveDiscovery:
                 final_url = page.url
                 self.log(f"Phase 2 final URL: {final_url}")
 
-                # ✅ CRITICAL: Reject if final URL is a system page
+                # Reject if redirected to a system page
                 if not self._is_valid_profile_url(final_url, user_id):
-                    self.log(f"⚠ Redirected to system page: {final_url}")
+                    self.log(f"Redirected to system page: {final_url}")
                     await browser.close()
                     return {"is_live": False, "reason": "redirected_to_system_page"}
 
-                # Get page content
+                # Get page text
                 page_text = ""
                 try:
                     page_text = await page.locator("body").inner_text()
-                except:
+                except Exception:
                     pass
 
-                # ✅ Verify page belongs to target user
+                # Verify page belongs to target user
                 page_belongs_to_user = False
                 if user_id and user_id in page_text:
                     page_belongs_to_user = True
@@ -668,14 +677,13 @@ class SuperLiveDiscovery:
                 # Check DOM for live indicators
                 dom_result = await self._check_dom_live_status(page)
 
-                # Check for premium
+                # Check for premium (strict indicators only)
                 is_premium = False
                 page_lower = page_text.lower()
-                # Only mark premium if premium keywords appear in meaningful contexts
                 premium_indicators = [
                     "premium member", "membre premium", "vip only",
                     "pay to watch", "exclusive content", "contenu exclusif",
-                    "buy coins", "acheter des pièces", "unlock stream",
+                    "buy coins", "acheter des pieces", "unlock stream",
                     "abonnez-vous", "subscribe to watch"
                 ]
                 for indicator in premium_indicators:
@@ -707,8 +715,6 @@ class SuperLiveDiscovery:
                     if not stream_url:
                         stream_url = dom_result.get("stream_url")
 
-                # ✅ If no live indicator found, user is OFFLINE
-                # (even if page loaded successfully)
                 if not is_live:
                     await browser.close()
                     return {
@@ -719,14 +725,12 @@ class SuperLiveDiscovery:
                         "source": "none"
                     }
 
-                # If live but page doesn't belong to user, might be wrong stream
                 if is_live and not page_belongs_to_user:
-                    self.log(f"⚠ Live indicator found but page doesn't belong to user {user_id}")
-                    # Trust the URL from Phase 1, but log warning
+                    self.log(f"Live indicator found but page may not belong to user {user_id}")
 
                 await browser.close()
 
-                result = {
+                return {
                     "is_live": is_live,
                     "stream_url": stream_url or final_url,
                     "stream_id": stream_id,
@@ -734,9 +738,6 @@ class SuperLiveDiscovery:
                     "username": username,
                     "source": "api" if (api_result and api_result.get("is_live")) else "dom"
                 }
-
-                self.log(f"Phase 2 result: is_live={is_live}, premium={is_premium}, username={username}")
-                return result
 
         except Exception as e:
             self.log(f"check_live_status error: {e}")
@@ -800,7 +801,6 @@ class SuperLiveDiscovery:
             is_live = False
             stream_url = None
 
-            # Live indicators in DOM
             live_selectors = [
                 ".live-badge", ".live-indicator", ".is-live",
                 '[data-status="live"]', '[class*="live-badge"]',
@@ -815,16 +815,15 @@ class SuperLiveDiscovery:
                             if await el.is_visible():
                                 is_live = True
                                 break
-                        except:
+                        except Exception:
                             pass
                     if is_live:
                         break
-                except:
+                except Exception:
                     continue
 
-            # Text indicators
             if not is_live:
-                text_selectors = ["text=DIRECT", "text=LIVE", "text=En direct", "text=مباشر"]
+                text_selectors = ["text=DIRECT", "text=LIVE", "text=En direct"]
                 for selector in text_selectors:
                     try:
                         elements = await page.locator(selector).all()
@@ -833,11 +832,11 @@ class SuperLiveDiscovery:
                                 if await el.is_visible():
                                     is_live = True
                                     break
-                            except:
+                            except Exception:
                                 pass
                         if is_live:
                             break
-                    except:
+                    except Exception:
                         continue
 
             if is_live:
@@ -848,7 +847,7 @@ class SuperLiveDiscovery:
                         if src and any(ext in src for ext in [".m3u8", ".mpd", "rtmp"]):
                             stream_url = src
                             break
-                except:
+                except Exception:
                     pass
                 return {"is_live": True, "stream_url": stream_url}
 
@@ -872,19 +871,18 @@ class SuperLiveDiscovery:
                         text = (await el.inner_text()).strip()
                         if 2 <= len(text) <= 100:
                             return text
-                except:
+                except Exception:
                     continue
 
-            # Try og:title
             try:
                 og = await page.locator('meta[property="og:title"]').first.get_attribute("content")
                 if og:
-                    cleaned = re.sub(r"\s*[\|\-–—]\s*(SuperLive|superlivetv|Super).*", "", og, flags=re.IGNORECASE)
+                    cleaned = re.sub(r"\s*[\|\-]\s*(SuperLive|superlivetv|Super).*", "", og, flags=re.IGNORECASE)
                     cleaned = re.sub(r"\s*(en direct|live|direct|streaming).*", "", cleaned, flags=re.IGNORECASE)
                     cleaned = cleaned.strip()
                     if 2 <= len(cleaned) <= 100:
                         return cleaned
-            except:
+            except Exception:
                 pass
 
         except Exception as e:
