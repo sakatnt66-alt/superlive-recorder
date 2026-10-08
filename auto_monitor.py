@@ -69,7 +69,6 @@ def log_detection(user_id: str, result: Dict[str, Any], source: str) -> None:
             f"belongs={vi.get('belongsToUser', False)},"
             f"mainActive={vi.get('mainVideoActive', False)},"
             f"premium={vi.get('premiumFromJson', False)},"
-            f"premiumDom={vi.get('premiumDom', False)},"
             f"ended={vi.get('streamEnded', False)},"
             f"name={vi.get('streamerName', '')[:40]}"
         )
@@ -327,7 +326,7 @@ def normalize_display_name(value):
         "watching", "subscribe", "follow", "following",
         "k", "m", "b", "undefined", "super",
         "membre", "member", "user", "guest",
-        "membre super", "super membre",
+        "membre super", "super membre", "membre superlive",
     }
     if lowered in blocked:
         return None
@@ -388,9 +387,11 @@ def classify_final(video_info: Dict[str, Any], json_bodies: List[str], user_id: 
     belongs_to_user = bool(video_info.get("belongsToUser", False))
     main_video_active = bool(video_info.get("mainVideoActive", False))
     premium_json = bool(video_info.get("premiumFromJson", False))
-    premium_dom = bool(video_info.get("premiumDom", False))
 
-    is_premium = premium_json or premium_dom
+    # FIXED: Only use premium_json, NOT premium_dom
+    # premium_dom was removed because it gave false positives
+    # (site has "subscribe"/"premium" buttons on ALL pages)
+    is_premium = premium_json
 
     # RULE 1: Main video is active and belongs to user
     if main_video_active and belongs_to_user:
@@ -399,14 +400,12 @@ def classify_final(video_info: Dict[str, Any], json_bodies: List[str], user_id: 
         return LIVE_NORMAL
 
     # RULE 2: Video exists, belongs to user, but main video not confirmed
-    # Still treat as live if video is active and belongs to user
     if live_video_candidate and belongs_to_user:
         if is_premium:
             return LIVE_PREMIUM
         return LIVE_NORMAL
 
-    # RULE 3: Video exists but does NOT belong to user
-    # These are recommended/suggested streams
+    # RULE 3: Video exists but does NOT belong to user (recommended streams)
     if live_video_candidate and not belongs_to_user:
         if stream_ended:
             return OFFLINE
@@ -419,8 +418,7 @@ def classify_final(video_info: Dict[str, Any], json_bodies: List[str], user_id: 
     return UNKNOWN
 
 # ============================================================
-# PAGE_INFO_JS — SAME domContainsTargetId AS record_once.py
-# 8 levels deep, checks id/className/data-*/href/descendants
+# PAGE_INFO_JS — FIXED: premium_dom REMOVED
 # ============================================================
 PAGE_INFO_JS = r"""
 (userId) => {
@@ -432,11 +430,9 @@ PAGE_INFO_JS = r"""
     let mainVideoActive = false;
     let streamEnded = false;
     let streamerName = '';
-    let premiumDom = false;
 
     // ============================================================
-    // DOM CONTAINS TARGET ID — EXACT SAME LOGIC AS record_once.py
-    // 8 levels deep, checks id, className, data-*, href, descendants
+    // DOM CONTAINS TARGET ID — SAME LOGIC AS record_once.py
     // ============================================================
     const domContainsTargetId = (element) => {
         if (!userId || !element) return false;
@@ -481,12 +477,9 @@ PAGE_INFO_JS = r"""
     };
 
     // ============================================================
-    // CHECK STREAM ENDED — ONLY in the main video area
-    // NOT in the entire page body (which always contains it)
+    // CHECK STREAM ENDED — ONLY near the main video container
     // ============================================================
     try {
-        // Check for ended message ONLY near the main video container
-        // NOT in the full page body
         if (videos.length > 0) {
             const mainVideo = videos[0];
             let container = mainVideo.parentElement;
@@ -504,36 +497,18 @@ PAGE_INFO_JS = r"""
     } catch (e) {}
 
     // ============================================================
-    // CHECK PREMIUM — DOM elements near the main video
+    // PREMIUM DETECTION: JSON ONLY (DOM check removed)
+    // The DOM check was removed because the site has
+    // "subscribe"/"premium" buttons on ALL pages, causing
+    // false positives for every user.
+    // Premium detection is now done ONLY from JSON API responses
+    // in the Python code (check_json_for_premium).
     // ============================================================
-    try {
-        if (videos.length > 0) {
-            const mainVideo = videos[0];
-            let container = mainVideo.parentElement;
-            let pDepth = 0;
-            while (container && pDepth < 5) {
-                const premiumEls = container.querySelectorAll(
-                    '[class*="premium"], [class*="paywall"], [class*="lock"], [class*="subscribe"], [class*="unlock"]'
-                );
-                for (const el of premiumEls) {
-                    const rect = el.getBoundingClientRect();
-                    if (rect.width > 50 && rect.height > 50) {
-                        premiumDom = true;
-                        break;
-                    }
-                }
-                if (premiumDom) break;
-                container = container.parentElement;
-                pDepth++;
-            }
-        }
-    } catch (e) {}
 
     // ============================================================
-    // EXTRACT NAME — from JSON embedded in page + DOM near video
+    // EXTRACT NAME
     // ============================================================
     try {
-        // Method 1: Look for name in script tags containing JSON
         const scripts = document.querySelectorAll('script');
         for (const script of scripts) {
             const text = script.textContent || '';
@@ -551,7 +526,6 @@ PAGE_INFO_JS = r"""
             }
         }
 
-        // Method 2: Look for name in DOM elements near the main video
         if (!streamerName && videos.length > 0) {
             const mainVideo = videos[0];
             let container = mainVideo.parentElement;
@@ -575,7 +549,6 @@ PAGE_INFO_JS = r"""
             }
         }
 
-        // Method 3: og:title / document.title (last resort)
         if (!streamerName) {
             const ogTitle = document.querySelector('meta[property="og:title"]');
             if (ogTitle && ogTitle.content) {
@@ -590,7 +563,7 @@ PAGE_INFO_JS = r"""
     } catch (e) {}
 
     // ============================================================
-    // CHECK ALL VIDEOS WITH domContainsTargetId (8 levels)
+    // CHECK ALL VIDEOS
     // ============================================================
     for (const video of videos) {
         if (video.srcObject) {
@@ -610,7 +583,7 @@ PAGE_INFO_JS = r"""
     }
 
     // ============================================================
-    // CHECK MAIN VIDEO (largest/first)
+    // CHECK MAIN VIDEO
     // ============================================================
     let mainVideo = null;
     let mainVideoArea = 0;
@@ -637,18 +610,13 @@ PAGE_INFO_JS = r"""
             mainVideoActive = true;
         }
 
-        // If main video has NO srcObject but other videos do,
-        // those other videos are likely recommended streams
         if (!mainHasSrcObject && srcObjectCount > 0) {
             belongsToUser = false;
             mainVideoActive = false;
         }
     }
 
-    // ============================================================
-    // CRITICAL: Override streamEnded if main video IS active
-    // The "ended" text appears on ALL pages, not just offline ones
-    // ============================================================
+    // Override streamEnded if main video IS active
     if (streamEnded && mainVideoActive) {
         streamEnded = false;
     }
@@ -664,8 +632,7 @@ PAGE_INFO_JS = r"""
         belongsToUser,
         mainVideoActive,
         streamEnded,
-        streamerName,
-        premiumDom
+        streamerName
     };
 }
 """
@@ -680,7 +647,7 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
             "videoCount": 0, "srcObjectCount": 0, "visibleCount": 0,
             "liveVideoCandidate": False, "belongsToUser": False,
             "mainVideoActive": False, "streamEnded": False,
-            "streamerName": "", "premiumDom": False,
+            "streamerName": "",
         }
 
         async def on_response(response):
@@ -714,7 +681,7 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
                     "videoCount": 0, "srcObjectCount": 0, "visibleCount": 0,
                     "liveVideoCandidate": False, "belongsToUser": False,
                     "mainVideoActive": False, "streamEnded": False,
-                    "streamerName": "", "premiumDom": False,
+                    "streamerName": "",
                 }
 
             if not video_info.get("liveVideoCandidate") and video_info.get("srcObjectCount", 0) == 0:
@@ -735,14 +702,12 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
 
         await page.close()
 
+        # Premium detection ONLY from JSON API responses
         video_info["premiumFromJson"] = check_json_for_premium(json_bodies, user_id)
         final_status = classify_final(video_info, json_bodies, user_id)
 
-        # Name extraction priority:
-        # 1. JSON API (most reliable)
-        # 2. DOM/page extraction (from PAGE_INFO_JS)
+        # Name extraction: JSON first, then DOM
         display_name = None
-
         json_name = extract_name_from_json(json_bodies, user_id)
         if json_name:
             display_name = json_name
@@ -760,7 +725,6 @@ async def playwright_classify_user(context, user_id: str, semaphore: asyncio.Sem
                       f"belongs={video_info.get('belongsToUser')},"
                       f"mainActive={video_info.get('mainVideoActive')},"
                       f"premium_json={video_info.get('premiumFromJson')},"
-                      f"premium_dom={video_info.get('premiumDom')},"
                       f"ended={video_info.get('streamEnded')}",
             "stream_url": url,
             "display_name": display_name,
