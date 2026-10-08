@@ -1,19 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-SuperLive Discovery Module - Version 9.3 (VIDEO IS KING - Final Fix)
+SuperLive Discovery Module - Version 9.5 (Stream ID Extraction)
 
-CRITICAL INSIGHT:
-- API 'is_premium' means "user has premium account", NOT "this stream is premium"
-- A premium user can have FREE public streams
-- The ONLY reliable way to detect premium streams:
-  * Normal stream: video element ACTIVE (has src with .m3u8/.mpd)
-  * Premium stream: video element INACTIVE + lock/paywall banner visible
-
-RULES:
-1. If is_live=True + video ACTIVE → LIVE_NORMAL (always)
-2. If is_live=True + video INACTIVE + lock icon visible → LIVE_PREMIUM
-3. If is_live=True + video INACTIVE + no lock → OFFLINE (false positive)
-4. API is_premium field is IGNORED (unreliable)
+CRITICAL FIX in v9.5:
+- Extract REAL stream_id from API or video URL
+- user_id != stream_id on this website!
+- record_once.py needs: /fr/livestream/{stream_id}
+- NOT /fr/livestream/{user_id}
 """
 
 import asyncio
@@ -21,6 +14,7 @@ import json
 import re
 import time
 from typing import Dict, List, Optional, Any
+from urllib.parse import urlparse
 
 try:
     from playwright.async_api import async_playwright
@@ -68,6 +62,36 @@ class SuperLiveDiscovery:
 
     def log(self, message: str) -> None:
         print(f"[Discovery] {message}", flush=True)
+
+    def _clean_stream_url(self, url: str) -> str:
+        if not url:
+            return url
+        parsed = urlparse(url)
+        clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        if parsed.fragment:
+            clean_url += f"#{parsed.fragment}"
+        return clean_url
+
+    def _extract_stream_id_from_url(self, url: str) -> Optional[str]:
+        """
+        Extract stream_id from video URL.
+        
+        Example URLs:
+          https://cdn.superlivetv.com/stream/152586609/playlist.m3u8
+          https://cdn.superlivetv.com/live/152586609/chunklist.m3u8
+          https://media.superlivetv.com/152586609/master.mpd
+        
+        Extracts: 152586609
+        """
+        if not url:
+            return None
+        # Match numeric ID (5+ digits) in URL path
+        match = re.search(r'/(\d{5,})(?:/|$|\.)', url)
+        if match:
+            stream_id = match.group(1)
+            self.log(f"Extracted stream_id from URL: {stream_id}")
+            return stream_id
+        return None
 
     def _is_valid_profile_url(self, url: str, user_id: str = "") -> bool:
         if not url:
@@ -178,15 +202,8 @@ class SuperLiveDiscovery:
     async def _method_a_search(self, user_id: str) -> Optional[Dict[str, Any]]:
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
-                )
-                context = await browser.new_context(
-                    user_agent=self.USER_AGENT,
-                    viewport={"width": 1280, "height": 800},
-                    locale="fr-FR"
-                )
+                browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+                context = await browser.new_context(user_agent=self.USER_AGENT, viewport={"width": 1280, "height": 800}, locale="fr-FR")
                 page = await context.new_page()
                 api_responses = []
 
@@ -426,7 +443,7 @@ class SuperLiveDiscovery:
                 "username": None, "method": "method_d", "source": "fallback", "uncertain": True}
 
     # ============================================================
-    # PHASE 2: LIVE STATUS DETECTION - VIDEO IS KING
+    # PHASE 2: LIVE STATUS DETECTION - with STREAM_ID EXTRACTION
     # ============================================================
     async def check_live_status(self, profile_url: str, user_id: str = "", profile_id: str = "",
                                 phase1_username: str = None) -> Optional[Dict[str, Any]]:
@@ -466,9 +483,7 @@ class SuperLiveDiscovery:
                     await browser.close()
                     return {"is_live": False, "reason": "page_not_found_404", "source": "validation"}
 
-                # ============================================
-                # STEP 1: Check video element (MOST IMPORTANT)
-                # ============================================
+                # STEP 1: Check video element
                 has_active_video = False
                 video_stream_url = None
                 try:
@@ -481,7 +496,6 @@ class SuperLiveDiscovery:
                                 video_stream_url = src
                                 self.log(f"Found active video src: {src[:80]}...")
                                 break
-                            # Check source elements
                             sources = await video.locator("source").all()
                             for source in sources:
                                 src = await source.get_attribute("src")
@@ -492,7 +506,6 @@ class SuperLiveDiscovery:
                                     break
                             if has_active_video:
                                 break
-                            # Check readyState (>= 2 means video loaded enough to play)
                             try:
                                 ready_state = await video.evaluate("el => el.readyState")
                                 if ready_state >= 2:
@@ -507,58 +520,66 @@ class SuperLiveDiscovery:
                 except Exception as e:
                     self.log(f"Video check error: {e}")
 
-                # ============================================
                 # STEP 2: Check DOM for live indicators
-                # ============================================
                 dom_is_live = await self._check_dom_live_indicator(page)
 
-                # ============================================
-                # STEP 3: Check DOM for PREMIUM indicators (lock, paywall)
-                # ============================================
-                dom_is_premium = await self._check_dom_premium(page)
+                # STEP 3: Check DOM for PREMIUM (precise - lock inside video area)
+                dom_is_premium = await self._check_dom_premium_precise(page)
 
-                # ============================================
                 # STEP 4: Check API responses
-                # ============================================
                 api_result = self._check_api_live_status(api_responses, user_id)
                 api_says_live = bool(api_result and api_result.get("is_live"))
 
-                # ============================================
-                # STEP 5: DETERMINE STATUS - VIDEO IS KING
-                # ============================================
+                # STEP 5: DETERMINE STATUS
                 is_live = False
                 is_premium = False
                 stream_url = video_stream_url
 
                 if has_active_video:
-                    # ACTIVE VIDEO = NORMAL STREAM (always)
-                    # Premium streams don't play video - they show paywall
                     if dom_is_live or api_says_live:
                         is_live = True
-                        is_premium = False  # ← Video playing means it's NOT premium
-                        self.log(f"VIDEO ACTIVE + live indicator → LIVE_NORMAL")
+                        is_premium = False
+                        self.log(f"VIDEO ACTIVE + live indicator -> LIVE_NORMAL")
                     else:
-                        # Video but no live indicator - probably a preview or unrelated video
                         is_live = False
-                        self.log(f"VIDEO ACTIVE but no live indicator → OFFLINE")
-
+                        self.log(f"VIDEO ACTIVE but no live indicator -> OFFLINE")
                 elif dom_is_live or api_says_live:
-                    # Live indicator but NO video
                     if dom_is_premium:
-                        # Live indicator + lock icon = PREMIUM STREAM
                         is_live = True
                         is_premium = True
-                        self.log(f"NO VIDEO + live indicator + LOCK → LIVE_PREMIUM")
+                        self.log(f"NO VIDEO + live indicator + LOCK in video area -> LIVE_PREMIUM")
                     else:
-                        # Live indicator + no video + no lock = False positive
-                        # This is likely the API lying (common on this site)
                         is_live = False
-                        self.log(f"NO VIDEO + live indicator + NO LOCK → OFFLINE (false positive)")
-
+                        self.log(f"NO VIDEO + live indicator + NO LOCK -> OFFLINE (false positive)")
                 else:
-                    # No live indicator, no video
                     is_live = False
-                    self.log(f"NO VIDEO + NO live indicator → OFFLINE")
+                    self.log(f"NO VIDEO + NO live indicator -> OFFLINE")
+
+                # ================================================================
+                # STEP 6: EXTRACT REAL stream_id (CRITICAL!)
+                # Priority:
+                #   1. API response stream_id
+                #   2. Extract from video src URL (regex for numeric ID)
+                #   3. Fallback to user_id (only if nothing else works)
+                # ================================================================
+                stream_id = None
+
+                # Priority 1: API response
+                if api_result:
+                    stream_id = api_result.get("stream_id")
+                    if stream_id:
+                        self.log(f"stream_id from API: {stream_id}")
+
+                # Priority 2: Extract from video src URL
+                if not stream_id and video_stream_url:
+                    stream_id = self._extract_stream_id_from_url(video_stream_url)
+                    if stream_id:
+                        self.log(f"stream_id from video URL: {stream_id}")
+
+                # Priority 3: Fallback to user_id (last resort)
+                if not stream_id:
+                    stream_id = user_id
+                    self.log(f"stream_id fallback to user_id: {stream_id}")
 
                 # Extract username
                 username = phase1_username
@@ -569,19 +590,27 @@ class SuperLiveDiscovery:
                     if page_username:
                         username = self._clean_username(page_username)
 
-                # Determine stream URL
+                # Determine stream URL - CLEAN IT
                 if not stream_url:
                     if api_result:
                         stream_url = api_result.get("stream_url")
                     if not stream_url:
                         stream_url = profile_url
+                if stream_url:
+                    stream_url = self._clean_stream_url(stream_url)
+
+                # Clean profile_url
+                clean_profile_url = self._clean_stream_url(profile_url)
 
                 await browser.close()
 
                 result = {
                     "is_live": is_live,
                     "stream_url": stream_url,
-                    "stream_id": api_result.get("stream_id") if api_result else None,
+                    "profile_url": clean_profile_url,
+                    "stream_id": stream_id,  # CRITICAL: real stream_id for recording
+                    "user_id": user_id,       # Original user_id from watchlist
+                    "profile_id": profile_id,
                     "is_premium": is_premium,
                     "username": username,
                     "source": "video_dom_api",
@@ -593,71 +622,60 @@ class SuperLiveDiscovery:
                     }
                 }
 
-                self.log(f"Phase 2 FINAL: is_live={is_live}, premium={is_premium}, username={username}")
+                self.log(f"Phase 2 FINAL: is_live={is_live}, premium={is_premium}, "
+                         f"stream_id={stream_id}, user_id={user_id}, username={username}")
                 return result
 
         except Exception as e:
             self.log(f"check_live_status error: {e}")
             return None
 
-    # ============================================================
-    # NEW: Check DOM for premium-only indicators (lock, paywall banner)
-    # ============================================================
-    async def _check_dom_premium(self, page) -> bool:
-        """Check DOM for premium-only indicators like lock icons and paywall banners"""
+    async def _check_dom_premium_precise(self, page) -> bool:
         try:
-            # CSS selectors for premium indicators
-            premium_selectors = [
-                '[class*="lock"]',
-                '[class*="paywall"]',
-                '[class*="premium-only"]',
-                '[class*="private-room"]',
-                '[class*="exclusive"]',
-                '[class*="paid"]',
-                '[class*="subscribe"]',
-                '[class*="unlock"]',
-                '[class*="coin"]',
-                'svg[class*="lock"]',
-                '[data-premium="true"]',
-                '[data-private="true"]',
-            ]
-            for selector in premium_selectors:
-                try:
-                    elements = await page.locator(selector).all()
-                    for el in elements:
-                        try:
-                            if await el.is_visible():
-                                self.log(f"Premium indicator found: {selector}")
-                                return True
-                        except: pass
-                except: continue
-
-            # Text indicators (must be prominent, not in footer)
-            text_patterns = [
-                "text=Premium Only",
-                "text=Premium only",
-                "text=Contenu Premium",
-                "text=Private Room",
-                "text=Salon Privé",
-                "text=Salon privé",
-                "text=Pay to watch",
-                "text=Payer pour regarder",
-                "text=Unlock with coins",
-                "text=Débloquer avec",
-            ]
-            for pattern in text_patterns:
-                try:
-                    elements = await page.locator(pattern).all()
-                    for el in elements:
-                        try:
-                            if await el.is_visible():
-                                self.log(f"Premium text found: {pattern}")
-                                return True
-                        except: pass
-                except: continue
-
+            js_code = """
+            () => {
+                const videos = document.querySelectorAll('video');
+                if (videos.length === 0) {
+                    const mainArea = document.querySelector('main, .main-content, .video-container, .player-container, .stream-container, [class*="player"], [class*="stream"]');
+                    if (mainArea) {
+                        const locks = mainArea.querySelectorAll('[class*="lock"], [class*="paywall"], [class*="private"], [class*="premium-only"], [class*="exclusive"]');
+                        for (const lock of locks) {
+                            if (lock.offsetParent !== null) { return true; }
+                        }
+                    }
+                    const allLocks = document.querySelectorAll('[class*="lock"], [class*="paywall"]');
+                    for (const lock of allLocks) {
+                        const rect = lock.getBoundingClientRect();
+                        if (rect.width > 200 && rect.height > 200 && lock.offsetParent !== null) {
+                            const centerX = rect.left + rect.width / 2;
+                            const centerY = rect.top + rect.height / 2;
+                            const screenCenterX = window.innerWidth / 2;
+                            const screenCenterY = window.innerHeight / 2;
+                            if (Math.abs(centerX - screenCenterX) < 200 && Math.abs(centerY - screenCenterY) < 200) {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+                for (const video of videos) {
+                    const parent = video.closest('[class*="player"], [class*="container"], [class*="wrapper"], [class*="stream"]') || video.parentElement;
+                    if (parent) {
+                        const locks = parent.querySelectorAll('[class*="lock"], [class*="paywall"], [class*="private"], [class*="premium-only"]');
+                        for (const lock of locks) {
+                            if (lock.offsetParent !== null) { return true; }
+                        }
+                    }
+                }
+                return false;
+            }
+            """
+            result = await page.evaluate(js_code)
+            if result:
+                self.log("Premium lock found INSIDE video area")
+            return bool(result)
         except Exception as e:
-            self.log(f"Premium DOM check error: {e}")
+            self.log(f"Premium precise check error: {e}")
         return False
 
     async def _check_dom_live_indicator(self, page) -> bool:
@@ -701,17 +719,12 @@ class SuperLiveDiscovery:
         return None
 
     def _find_live_status_in_obj(self, obj: Any, user_id: str, depth: int) -> Optional[Dict]:
-        """
-        NOTE: is_premium from API is IGNORED here.
-        We only use API for is_live, stream_url, stream_id, username.
-        Premium detection is done via DOM (lock icon) and video element.
-        """
         if depth > 10: return None
         if isinstance(obj, dict):
             result = {
                 "is_live": False, "stream_url": None,
                 "stream_id": None, "username": None,
-                "is_premium": False  # Always False - we don't trust API for this
+                "is_premium": False
             }
             for k, v in obj.items():
                 kl = str(k).lower()
@@ -720,12 +733,12 @@ class SuperLiveDiscovery:
                 if kl in ("stream_url", "streamurl", "hls_url", "hlsurl", "play_url", "playurl"):
                     if isinstance(v, str) and (".m3u8" in v or "rtmp" in v or ".mpd" in v):
                         result["stream_url"] = v
-                if kl in ("stream_id", "streamid", "broadcast_id", "id"):
-                    result["stream_id"] = str(v)
+                if kl in ("stream_id", "streamid", "broadcast_id", "broadcastid", "live_id", "liveid"):
+                    if v and str(v).isdigit():
+                        result["stream_id"] = str(v)
                 if kl in ("username", "nickname", "display_name", "displayname", "name"):
                     if isinstance(v, str) and v.strip():
                         result["username"] = v.strip()
-                # INTENTIONALLY NOT extracting is_premium from API
             if result["is_live"]:
                 return result
             for v in obj.values():
