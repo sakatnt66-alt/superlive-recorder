@@ -1,5 +1,5 @@
-// worker.js - Version 16.0 - GitHub Files Storage (No KV Limits)
-// Uses GitHub repository files as database - FREE and INSTANT
+// worker.js - Version 17.0 - UTF-8 Encoding Fix
+// Fixes Arabic text corruption when reading from GitHub files
 
 export default {
   async fetch(request, env, ctx) {
@@ -55,7 +55,7 @@ export default {
 };
 
 // ============================================================
-// GITHUB FILE STORAGE - No limits, works instantly
+// GITHUB FILE STORAGE
 // ============================================================
 const WATCHLIST_FILE = 'data/watchlist.json';
 const RECORDINGS_FILE = 'data/recordings.json';
@@ -84,7 +84,45 @@ function jsonResponse(data, status) {
 }
 
 // ============================================================
-// GITHUB FILE OPERATIONS
+// BASE64 DECODE WITH UTF-8 SUPPORT
+// This fixes the Arabic text corruption issue
+// ============================================================
+function base64ToUtf8(base64) {
+  // Step 1: Decode base64 to binary string
+  const binaryString = atob(base64);
+  
+  // Step 2: Convert binary string to bytes
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i) & 0xff;
+  }
+  
+  // Step 3: Decode bytes as UTF-8
+  const decoder = new TextDecoder('utf-8');
+  return decoder.decode(bytes);
+}
+
+function utf8ToBase64(text) {
+  // Step 1: Encode text to UTF-8 bytes
+  const encoder = new TextEncoder();
+  const bytes = encoder.encode(text);
+  
+  // Step 2: Convert bytes to binary string
+  let binary = '';
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.slice(i, i + chunkSize);
+    for (let j = 0; j < chunk.length; j++) {
+      binary += String.fromCharCode(chunk[j]);
+    }
+  }
+  
+  // Step 3: Encode binary string to base64
+  return btoa(binary);
+}
+
+// ============================================================
+// GITHUB FILE OPERATIONS - WITH UTF-8 FIX
 // ============================================================
 async function githubApiRequest(env, method, path, body) {
   const url = 'https://api.github.com/repos/' + env.GITHUB_REPO + path;
@@ -110,7 +148,10 @@ async function readFile(env, filePath) {
       return { data: null, sha: null };
     }
     const result = await response.json();
-    const content = atob(result.content);
+    
+    // FIXED: Use UTF-8 decoder instead of raw atob
+    const content = base64ToUtf8(result.content);
+    
     return {
       data: JSON.parse(content),
       sha: result.sha
@@ -123,7 +164,9 @@ async function readFile(env, filePath) {
 
 async function writeFile(env, filePath, data, sha) {
   try {
-    const content = btoa(unescape(encodeURIComponent(JSON.stringify(data, null, 2))));
+    const json = JSON.stringify(data, null, 2);
+    const content = utf8ToBase64(json);
+    
     const body = {
       message: 'Update ' + filePath + ' at ' + new Date().toISOString(),
       content: content,
@@ -144,7 +187,7 @@ async function writeFile(env, filePath, data, sha) {
 }
 
 // ============================================================
-// DATA LAYER - Using GitHub files
+// DATA LAYER
 // ============================================================
 async function getWatchlist(env) {
   const result = await readFile(env, WATCHLIST_FILE);
@@ -350,7 +393,6 @@ async function handleAutoTrigger(request, url, env) {
       if (rec) {
         rec.status = 'failed';
         rec.error = triggerResult.error;
-        // Re-read to get fresh sha
         const freshResult = await getRecordings(env);
         await saveRecordings(env, filtered, freshResult.sha);
       }
