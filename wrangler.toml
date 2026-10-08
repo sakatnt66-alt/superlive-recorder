@@ -7,4 +7,4 @@ binding = "SUPERLIVE_STATE"
 id = "64750a5f7887455e88305120e1fc651f"
 
 [triggers]
-crons = ["*/3 * * * *"]
+crons = ["*/5 * * * *"]
