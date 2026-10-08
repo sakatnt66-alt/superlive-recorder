@@ -1,5 +1,5 @@
 // worker.js - SuperLive Recorder + Auto Monitor + Watchlist + Cron
-// Version: 11.0 - KV limit protection + full commands
+// Version: 12.0 - KV write limit protection
 
 export default {
   async fetch(request, env, ctx) {
@@ -800,25 +800,36 @@ async function handleAddWatch(chatId, streamId, env) {
     );
     return;
   }
-  const key = 'watchlist:' + streamId;
-  const existing = await env.SUPERLIVE_STATE.get(key, 'json');
-  if (existing) {
+
+  try {
+    const key = 'watchlist:' + streamId;
+    const existing = await env.SUPERLIVE_STATE.get(key, 'json');
+    if (existing) {
+      await sendTelegramMessage(env, chatId,
+        '⚠️ البث <code>' + streamId + '</code> موجود مسبقاً في قائمة المراقبة.',
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+    await env.SUPERLIVE_STATE.put(key, JSON.stringify({
+      stream_id: streamId, added_at: new Date().toISOString(), display_name: null
+    }));
     await sendTelegramMessage(env, chatId,
-      '⚠️ البث <code>' + streamId + '</code> موجود مسبقاً في قائمة المراقبة.',
+      '✅ تم إضافة <code>' + streamId + '</code> إلى قائمة المراقبة.\nسيتم فحصه تلقائياً كل 3 دقائق.',
+      {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '📋 قائمة المراقبة', callback_data: 'watchlist' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
+      }
+    );
+  } catch (error) {
+    console.error('handleAddWatch KV error:', error);
+    await sendTelegramMessage(env, chatId,
+      '❌ فشلت الإضافة بسبب استنفاد حد عمليات الكتابة اليومي على التخزين.\n' +
+      'سيُعاد تعيين الحد تلقائياً عند منتصف الليل (UTC).\n' +
+      'حاول مرة أخرى غداً.',
       { parse_mode: 'HTML' }
     );
-    return;
   }
-  await env.SUPERLIVE_STATE.put(key, JSON.stringify({
-    stream_id: streamId, added_at: new Date().toISOString(), display_name: null
-  }));
-  await sendTelegramMessage(env, chatId,
-    '✅ تم إضافة <code>' + streamId + '</code> إلى قائمة المراقبة.\nسيتم فحصه تلقائياً كل 3 دقائق.',
-    {
-      parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [[{ text: '📋 قائمة المراقبة', callback_data: 'watchlist' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
-    }
-  );
 }
 
 async function handleRemoveWatch(chatId, streamId, env) {
@@ -829,23 +840,32 @@ async function handleRemoveWatch(chatId, streamId, env) {
     );
     return;
   }
-  const key = 'watchlist:' + streamId;
-  const existing = await env.SUPERLIVE_STATE.get(key, 'json');
-  if (!existing) {
+
+  try {
+    const key = 'watchlist:' + streamId;
+    const existing = await env.SUPERLIVE_STATE.get(key, 'json');
+    if (!existing) {
+      await sendTelegramMessage(env, chatId,
+        '⚠️ البث <code>' + streamId + '</code> غير موجود في قائمة المراقبة.',
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+    await env.SUPERLIVE_STATE.delete(key);
     await sendTelegramMessage(env, chatId,
-      '⚠️ البث <code>' + streamId + '</code> غير موجود في قائمة المراقبة.',
+      '🗑️ تم حذف <code>' + streamId + '</code> من قائمة المراقبة.',
+      {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '📋 قائمة المراقبة', callback_data: 'watchlist' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
+      }
+    );
+  } catch (error) {
+    console.error('handleRemoveWatch KV error:', error);
+    await sendTelegramMessage(env, chatId,
+      '❌ فشل الحذف بسبب خطأ في التخزين. حاول مرة أخرى لاحقاً.',
       { parse_mode: 'HTML' }
     );
-    return;
   }
-  await env.SUPERLIVE_STATE.delete(key);
-  await sendTelegramMessage(env, chatId,
-    '🗑️ تم حذف <code>' + streamId + '</code> من قائمة المراقبة.',
-    {
-      parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [[{ text: '📋 قائمة المراقبة', callback_data: 'watchlist' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
-    }
-  );
 }
 
 async function handleWatchlistCommand(chatId, env) {
