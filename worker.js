@@ -1,4 +1,6 @@
-// worker.js - Version 14.0 - Fixed error handling
+// worker.js - Version 15.0 - Unified Single Write
+// Writes ALL data in ONE KV put() per cycle
+// Saves 1000+ writes/day -> only 1 write per cycle
 
 export default {
   async fetch(request, env, ctx) {
@@ -41,9 +43,7 @@ export default {
       return handleTelegramWebhook(request, env);
     }
     if (url.pathname === '/health') {
-      return new Response(JSON.stringify({
-        status: 'ok', timestamp: new Date().toISOString()
-      }), { headers: { 'Content-Type': 'application/json' } });
+      return jsonResponse({ status: 'ok', timestamp: new Date().toISOString() });
     }
 
     return new Response('Not Found', { status: 404 });
@@ -56,12 +56,11 @@ export default {
 };
 
 // ============================================================
-// CONSTANTS
+// UNIFIED DATA STORAGE - Single key for everything
 // ============================================================
-const WATCHLIST_KEY = 'watchlist:all';
-const RECORDINGS_KEY = 'recordings:active';
+const DATA_KEY = 'superlive:data';
 
-function isAutoApiAuthorized(request, env) {
+function isAuthorized(request, env) {
   if (!env.AUTO_API_TOKEN) return true;
   return request.headers.get('X-Auto-Token') === env.AUTO_API_TOKEN;
 }
@@ -85,36 +84,48 @@ function jsonResponse(data, status) {
 }
 
 // ============================================================
-// WATCHLIST
+// DATA LAYER - One read, one write
 // ============================================================
-async function getWatchlist(env) {
+async function getAllData(env) {
   try {
-    const data = await env.SUPERLIVE_STATE.get(WATCHLIST_KEY, 'json');
-    if (Array.isArray(data)) return data;
-    return [];
+    const data = await env.SUPERLIVE_STATE.get(DATA_KEY, 'json');
+    if (data && typeof data === 'object') {
+      return {
+        watchlist: Array.isArray(data.watchlist) ? data.watchlist : [],
+        recordings: Array.isArray(data.recordings) ? data.recordings : []
+      };
+    }
+    return { watchlist: [], recordings: [] };
   } catch (e) {
-    console.error('getWatchlist error:', e);
-    return [];
+    console.error('getAllData error:', e);
+    return { watchlist: [], recordings: [] };
   }
 }
 
-async function saveWatchlist(env, watchlist) {
+async function saveAllData(env, data) {
   try {
-    await env.SUPERLIVE_STATE.put(WATCHLIST_KEY, JSON.stringify(watchlist));
+    await env.SUPERLIVE_STATE.put(DATA_KEY, JSON.stringify({
+      watchlist: data.watchlist,
+      recordings: data.recordings,
+      last_updated: new Date().toISOString()
+    }));
     return true;
   } catch (e) {
-    console.error('saveWatchlist error:', e);
+    console.error('saveAllData error:', e);
     throw new Error('KV save failed: ' + e.message);
   }
 }
 
+// ============================================================
+// WATCHLIST APIs
+// ============================================================
 async function handleWatchlistList(request, env) {
-  if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
+  if (!isAuthorized(request, env)) return unauthorizedResponse();
   try {
-    const watchlist = await getWatchlist(env);
+    const data = await getAllData(env);
     return jsonResponse({
-      success: true, count: watchlist.length,
-      watchlist: watchlist, timestamp: new Date().toISOString()
+      success: true, count: data.watchlist.length,
+      watchlist: data.watchlist, timestamp: new Date().toISOString()
     });
   } catch (error) {
     return jsonResponse({ error: error.message }, 500);
@@ -122,37 +133,24 @@ async function handleWatchlistList(request, env) {
 }
 
 async function handleWatchlistAdd(request, env) {
-  if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
+  if (!isAuthorized(request, env)) return unauthorizedResponse();
   try {
     const body = await request.json();
     const streamId = String(body.stream_id || '').trim();
-    
     if (!streamId || !/^\d+$/.test(streamId)) {
       return jsonResponse({ error: 'Invalid stream ID' }, 400);
     }
-    
-    const watchlist = await getWatchlist(env);
-    
-    // Check if already exists
-    if (watchlist.some(e => String(e.stream_id) === streamId)) {
-      return jsonResponse({
-        success: true, message: 'Already in watchlist', stream_id: streamId
-      });
+    const data = await getAllData(env);
+    if (data.watchlist.some(e => String(e.stream_id) === streamId)) {
+      return jsonResponse({ success: true, message: 'Already exists', stream_id: streamId });
     }
-    
-    // Add new entry
-    watchlist.push({
+    data.watchlist.push({
       stream_id: streamId,
       added_at: new Date().toISOString(),
       display_name: null
     });
-    
-    // Save
-    await saveWatchlist(env, watchlist);
-    
-    return jsonResponse({
-      success: true, stream_id: streamId, timestamp: new Date().toISOString()
-    });
+    await saveAllData(env, data);
+    return jsonResponse({ success: true, stream_id: streamId, timestamp: new Date().toISOString() });
   } catch (error) {
     console.error('handleWatchlistAdd error:', error);
     return jsonResponse({ error: error.message }, 500);
@@ -160,23 +158,21 @@ async function handleWatchlistAdd(request, env) {
 }
 
 async function handleWatchlistRemove(request, env) {
-  if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
+  if (!isAuthorized(request, env)) return unauthorizedResponse();
   try {
     const body = await request.json();
     const streamId = String(body.stream_id || '').trim();
     if (!streamId || !/^\d+$/.test(streamId)) {
       return jsonResponse({ error: 'Invalid stream ID' }, 400);
     }
-    const watchlist = await getWatchlist(env);
-    const idx = watchlist.findIndex(e => String(e.stream_id) === streamId);
+    const data = await getAllData(env);
+    const idx = data.watchlist.findIndex(e => String(e.stream_id) === streamId);
     if (idx === -1) {
-      return jsonResponse({ success: false, error: 'Not found in watchlist' }, 404);
+      return jsonResponse({ success: false, error: 'Not found' }, 404);
     }
-    watchlist.splice(idx, 1);
-    await saveWatchlist(env, watchlist);
-    return jsonResponse({
-      success: true, stream_id: streamId, timestamp: new Date().toISOString()
-    });
+    data.watchlist.splice(idx, 1);
+    await saveAllData(env, data);
+    return jsonResponse({ success: true, stream_id: streamId });
   } catch (error) {
     console.error('handleWatchlistRemove error:', error);
     return jsonResponse({ error: error.message }, 500);
@@ -184,7 +180,7 @@ async function handleWatchlistRemove(request, env) {
 }
 
 async function handleWatchlistUpdateName(request, url, env) {
-  if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
+  if (!isAuthorized(request, env)) return unauthorizedResponse();
   try {
     const streamId = url.pathname.split('/').pop();
     if (!streamId || !/^\d+$/.test(streamId)) {
@@ -192,18 +188,15 @@ async function handleWatchlistUpdateName(request, url, env) {
     }
     const body = await request.json();
     const displayName = String(body.display_name || '').trim();
-    const watchlist = await getWatchlist(env);
-    const entry = watchlist.find(e => String(e.stream_id) === streamId);
+    const data = await getAllData(env);
+    const entry = data.watchlist.find(e => String(e.stream_id) === streamId);
     if (!entry) {
-      return jsonResponse({ success: false, error: 'Not found in watchlist' }, 404);
+      return jsonResponse({ success: false, error: 'Not found' }, 404);
     }
     entry.display_name = displayName || null;
     entry.name_updated_at = new Date().toISOString();
-    await saveWatchlist(env, watchlist);
-    return jsonResponse({
-      success: true, stream_id: streamId,
-      display_name: displayName, timestamp: new Date().toISOString()
-    });
+    await saveAllData(env, data);
+    return jsonResponse({ success: true, stream_id: streamId, display_name: displayName });
   } catch (error) {
     console.error('handleWatchlistUpdateName error:', error);
     return jsonResponse({ error: error.message }, 500);
@@ -211,34 +204,13 @@ async function handleWatchlistUpdateName(request, url, env) {
 }
 
 // ============================================================
-// RECORDINGS
+// RECORDING APIs
 // ============================================================
-async function getRecordings(env) {
-  try {
-    const data = await env.SUPERLIVE_STATE.get(RECORDINGS_KEY, 'json');
-    if (Array.isArray(data)) return data;
-    return [];
-  } catch (e) {
-    console.error('getRecordings error:', e);
-    return [];
-  }
-}
-
-async function saveRecordings(env, recordings) {
-  try {
-    await env.SUPERLIVE_STATE.put(RECORDINGS_KEY, JSON.stringify(recordings));
-    return true;
-  } catch (e) {
-    console.error('saveRecordings error:', e);
-    throw new Error('KV save failed: ' + e.message);
-  }
-}
-
 async function handleActiveRecordings(request, env) {
-  if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
+  if (!isAuthorized(request, env)) return unauthorizedResponse();
   try {
-    const recordings = await getRecordings(env);
-    const active = recordings.filter(r => r.status === 'recording');
+    const data = await getAllData(env);
+    const active = data.recordings.filter(r => r.status === 'recording');
     return jsonResponse({
       success: true, active_count: active.length,
       max_concurrent: 5, recordings: active,
@@ -250,7 +222,7 @@ async function handleActiveRecordings(request, env) {
 }
 
 async function handleAutoTrigger(request, url, env) {
-  if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
+  if (!isAuthorized(request, env)) return unauthorizedResponse();
   try {
     const streamId = url.pathname.split('/').pop();
     if (!streamId || !/^\d+$/.test(streamId)) {
@@ -261,22 +233,21 @@ async function handleAutoTrigger(request, url, env) {
     const streamName = body.stream_name || '';
     const source = body.source || 'auto';
 
-    const watchlist = await getWatchlist(env);
-    if (!watchlist.some(e => String(e.stream_id) === streamId)) {
-      return jsonResponse({
-        success: false, error: 'not_in_watchlist', stream_id: streamId
-      }, 404);
+    const data = await getAllData(env);
+    
+    // Check watchlist
+    if (!data.watchlist.some(e => String(e.stream_id) === streamId)) {
+      return jsonResponse({ success: false, error: 'not_in_watchlist', stream_id: streamId }, 404);
     }
 
-    const recordings = await getRecordings(env);
-    const existing = recordings.find(r => String(r.stream_id) === streamId && r.status === 'recording');
+    // Check already recording
+    const existing = data.recordings.find(r => String(r.stream_id) === streamId && r.status === 'recording');
     if (existing) {
-      return jsonResponse({
-        success: false, error: 'already_recording', stream_id: streamId
-      }, 409);
+      return jsonResponse({ success: false, error: 'already_recording', stream_id: streamId }, 409);
     }
 
-    const active = recordings.filter(r => r.status === 'recording');
+    // Check concurrency
+    const active = data.recordings.filter(r => r.status === 'recording');
     if (active.length >= 5) {
       return jsonResponse({
         success: false, error: 'concurrency_limit',
@@ -284,38 +255,34 @@ async function handleAutoTrigger(request, url, env) {
       }, 429);
     }
 
-    const recordingState = {
-      stream_id: streamId, stream_url: streamUrl,
-      stream_name: streamName || null, status: 'recording',
-      started_at: new Date().toISOString(), duration_minutes: null,
-      github_run_id: null, file_size_mb: 0, telegram_sent: false,
-      error: null, source: source
-    };
-
-    const filtered = recordings.filter(r =>
+    // Clean old recordings, add new one
+    data.recordings = data.recordings.filter(r =>
       !(String(r.stream_id) === streamId && ['finished', 'failed', 'stopped'].includes(r.status))
     );
-    filtered.push(recordingState);
-    await saveRecordings(env, filtered);
+    data.recordings.push({
+      stream_id: streamId, stream_url: streamUrl,
+      stream_name: streamName || null, status: 'recording',
+      started_at: new Date().toISOString(), source: source
+    });
+    await saveAllData(env, data);
 
+    // Trigger recording
     const triggerResult = await triggerRecordWorkflow(env, streamUrl, streamId, streamName);
-
     if (triggerResult.success) {
       const nameLine = streamName ? ('\n👤 الاسم: <b>' + escapeHtml(streamName) + '</b>') : '';
       await sendTelegramMessage(env, env.TELEGRAM_CHAT_ID,
         '🤖 <b>Auto Recording بدأ</b>\n📺 البث: <code>' + streamId + '</code>' + nameLine + '\n🔗 الرابط: <a href="' + streamUrl + '">افتح</a>',
         { parse_mode: 'HTML' }
       );
-      return jsonResponse({
-        success: true, started: true, stream_id: streamId,
-        stream_name: streamName, timestamp: new Date().toISOString()
-      });
+      return jsonResponse({ success: true, started: true, stream_id: streamId, stream_name: streamName });
     } else {
-      recordingState.status = 'failed';
-      recordingState.error = triggerResult.error;
-      const idx = filtered.findIndex(r => String(r.stream_id) === streamId && r.status === 'recording');
-      if (idx >= 0) filtered[idx] = recordingState;
-      await saveRecordings(env, filtered);
+      // Mark as failed
+      const rec = data.recordings.find(r => String(r.stream_id) === streamId && r.status === 'recording');
+      if (rec) {
+        rec.status = 'failed';
+        rec.error = triggerResult.error;
+        await saveAllData(env, data);
+      }
       return jsonResponse({ success: false, error: triggerResult.error }, 502);
     }
   } catch (error) {
@@ -325,13 +292,13 @@ async function handleAutoTrigger(request, url, env) {
 }
 
 async function handleTriggerMonitorApi(request, env) {
-  if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
+  if (!isAuthorized(request, env)) return unauthorizedResponse();
   try {
     const body = await request.json().catch(function() { return {}; });
     const source = body.source || 'api';
     const result = await triggerMonitorWorkflow(env, source);
     if (result.success) {
-      return jsonResponse({ success: true, message: 'Auto Monitor triggered', timestamp: new Date().toISOString() });
+      return jsonResponse({ success: true, message: 'Monitor triggered' });
     } else {
       return jsonResponse({ success: false, error: result.error }, 502);
     }
@@ -343,15 +310,15 @@ async function handleTriggerMonitorApi(request, env) {
 async function handleAutoMonitorCron(env) {
   try {
     console.log('[AUTO-CRON] Starting...');
-    const watchlist = await getWatchlist(env);
-    if (!watchlist || watchlist.length === 0) {
+    const data = await getAllData(env);
+    if (!data.watchlist || data.watchlist.length === 0) {
       console.log('[AUTO-CRON] Watchlist empty');
       return;
     }
-    console.log('[AUTO-CRON] Watchlist has ' + watchlist.length + ' users');
+    console.log('[AUTO-CRON] Watchlist: ' + data.watchlist.length + ' users');
     const result = await triggerMonitorWorkflow(env, 'cloudflare_cron');
     if (result.success) {
-      console.log('[AUTO-CRON] Monitor triggered successfully');
+      console.log('[AUTO-CRON] OK');
     } else {
       console.error('[AUTO-CRON] Failed: ' + result.error);
     }
@@ -360,9 +327,6 @@ async function handleAutoMonitorCron(env) {
   }
 }
 
-// ============================================================
-// LEGACY APIs
-// ============================================================
 async function handleUpdateState(request, url, env) {
   try {
     const streamId = url.pathname.split('/').pop();
@@ -370,15 +334,15 @@ async function handleUpdateState(request, url, env) {
       return jsonResponse({ error: 'Invalid stream ID' }, 400);
     }
     const body = await request.json();
-    const recordings = await getRecordings(env);
-    const idx = recordings.findIndex(r => String(r.stream_id) === streamId && r.status === 'recording');
+    const data = await getAllData(env);
+    const idx = data.recordings.findIndex(r => String(r.stream_id) === streamId && r.status === 'recording');
     if (idx >= 0) {
-      recordings[idx] = Object.assign({}, recordings[idx], body);
+      data.recordings[idx] = Object.assign({}, data.recordings[idx], body);
     } else {
-      recordings.push(Object.assign({ stream_id: streamId }, body));
+      data.recordings.push(Object.assign({ stream_id: streamId }, body));
     }
-    await saveRecordings(env, recordings);
-    return jsonResponse({ success: true, updated: streamId, status: body.status });
+    await saveAllData(env, data);
+    return jsonResponse({ success: true, updated: streamId });
   } catch (error) {
     console.error('handleUpdateState error:', error);
     return jsonResponse({ error: error.message }, 500);
@@ -391,10 +355,10 @@ async function handleDeleteRecording(request, url, env) {
     if (!streamId || !/^\d+$/.test(streamId)) {
       return jsonResponse({ error: 'Invalid stream ID' }, 400);
     }
-    const recordings = await getRecordings(env);
-    const filtered = recordings.filter(r => String(r.stream_id) !== streamId);
-    await saveRecordings(env, filtered);
-    return jsonResponse({ success: true, deleted: streamId, timestamp: new Date().toISOString() });
+    const data = await getAllData(env);
+    data.recordings = data.recordings.filter(r => String(r.stream_id) !== streamId);
+    await saveAllData(env, data);
+    return jsonResponse({ success: true, deleted: streamId });
   } catch (error) {
     console.error('handleDeleteRecording error:', error);
     return jsonResponse({ error: error.message }, 500);
@@ -403,11 +367,12 @@ async function handleDeleteRecording(request, url, env) {
 
 async function handleCleanup(env) {
   try {
-    const recordings = await getRecordings(env);
-    const active = recordings.filter(r => r.status === 'recording');
-    const deletedCount = recordings.length - active.length;
-    await saveRecordings(env, active);
-    return jsonResponse({ success: true, deleted_count: deletedCount, timestamp: new Date().toISOString() });
+    const data = await getAllData(env);
+    const active = data.recordings.filter(r => r.status === 'recording');
+    const deletedCount = data.recordings.length - active.length;
+    data.recordings = active;
+    await saveAllData(env, data);
+    return jsonResponse({ success: true, deleted_count: deletedCount });
   } catch (error) {
     return jsonResponse({ error: error.message }, 500);
   }
@@ -419,8 +384,8 @@ async function handleCheckStop(request, url, env) {
     if (!streamId || !/^\d+$/.test(streamId)) {
       return jsonResponse({ error: 'Invalid stream ID', should_stop: false }, 400);
     }
-    const recordings = await getRecordings(env);
-    const recording = recordings.find(r => String(r.stream_id) === streamId);
+    const data = await getAllData(env);
+    const recording = data.recordings.find(r => String(r.stream_id) === streamId);
     let should_stop = false;
     let status = 'not_found';
     if (recording) {
@@ -477,10 +442,8 @@ async function handleMessage(message, env) {
     }
 
     await sendTelegramMessage(env, chatId,
-      '🤖 أرسل رابط البث المباشر للبدء!\n\n' +
-      'الأوامر:\n' +
+      '🤖 أرسل رابط البث للبدء!\n' +
       '<code>/addwatch 123456</code>\n' +
-      '<code>/removewatch 123456</code>\n' +
       '<code>/watchlist</code>\n' +
       '<code>/testmonitor</code>',
       { parse_mode: 'HTML' }
@@ -488,7 +451,7 @@ async function handleMessage(message, env) {
   } catch (error) {
     console.error('handleMessage error:', error);
     try {
-      await sendTelegramMessage(env, chatId, '❌ حدث خطأ: ' + error.message, { parse_mode: 'HTML' });
+      await sendTelegramMessage(env, chatId, '❌ خطأ: ' + error.message, { parse_mode: 'HTML' });
     } catch (e) {}
   }
   return new Response('OK');
@@ -521,36 +484,32 @@ async function handleRecord(chatId, streamUrl, env) {
   const streamId = extractStreamId(streamUrl);
   if (!streamId) { await sendTelegramMessage(env, chatId, '❌ رابط غير صالح.'); return; }
 
-  const recordings = await getRecordings(env);
-  const existing = recordings.find(r => String(r.stream_id) === streamId && r.status === 'recording');
+  const data = await getAllData(env);
+  const existing = data.recordings.find(r => String(r.stream_id) === streamId && r.status === 'recording');
   if (existing) {
-    await sendTelegramMessage(env, chatId,
-      '⚠️ البث <code>' + streamId + '</code> يُسجّل حالياً.', { parse_mode: 'HTML' });
+    await sendTelegramMessage(env, chatId, '⚠️ يُسجّل حالياً.', { parse_mode: 'HTML' });
     return;
   }
 
-  const active = recordings.filter(r => r.status === 'recording');
+  const active = data.recordings.filter(r => r.status === 'recording');
   if (active.length >= 5) {
-    await sendTelegramMessage(env, chatId, '❌ الحد الأقصى (5) تم الوصول إليه.');
+    await sendTelegramMessage(env, chatId, '❌ الحد الأقصى (5).');
     return;
   }
 
   let streamName = '';
-  const watchlist = await getWatchlist(env);
-  const watchEntry = watchlist.find(e => String(e.stream_id) === streamId);
+  const watchEntry = data.watchlist.find(e => String(e.stream_id) === streamId);
   if (watchEntry && watchEntry.display_name) streamName = watchEntry.display_name;
 
-  const state = {
+  data.recordings = data.recordings.filter(r =>
+    !(String(r.stream_id) === streamId && ['finished', 'failed', 'stopped'].includes(r.status))
+  );
+  data.recordings.push({
     stream_id: streamId, stream_url: streamUrl,
     stream_name: streamName || null, status: 'recording',
     started_at: new Date().toISOString(), source: 'manual'
-  };
-
-  const filtered = recordings.filter(r =>
-    !(String(r.stream_id) === streamId && ['finished', 'failed', 'stopped'].includes(r.status))
-  );
-  filtered.push(state);
-  await saveRecordings(env, filtered);
+  });
+  await saveAllData(env, data);
 
   const triggerResult = await triggerRecordWorkflow(env, streamUrl, streamId, streamName);
   if (triggerResult.success) {
@@ -571,10 +530,10 @@ async function handleRecord(chatId, streamUrl, env) {
 }
 
 async function handleStatus(chatId, env) {
-  const recordings = await getRecordings(env);
-  const active = recordings.filter(r => r.status === 'recording');
+  const data = await getAllData(env);
+  const active = data.recordings.filter(r => r.status === 'recording');
   if (active.length === 0) {
-    await sendTelegramMessage(env, chatId, '📭 لا توجد تسجيلات', {
+    await sendTelegramMessage(env, chatId, '📭 لا تسجيلات', {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
     });
@@ -598,18 +557,18 @@ async function handleStatus(chatId, env) {
 
 async function handleStop(chatId, streamId, env) {
   if (!streamId) { await sendTelegramMessage(env, chatId, '⚠️ حدد البث'); return; }
-  const recordings = await getRecordings(env);
-  const r = recordings.find(x => String(x.stream_id) === streamId && x.status === 'recording');
+  const data = await getAllData(env);
+  const r = data.recordings.find(x => String(x.stream_id) === streamId && x.status === 'recording');
   if (!r) { await sendTelegramMessage(env, chatId, '⚠️ غير موجود', { parse_mode: 'HTML' }); return; }
   r.status = 'stopped';
   r.stopped_at = new Date().toISOString();
-  await saveRecordings(env, recordings);
-  await sendTelegramMessage(env, chatId, '🛑 تم الإيقاف: <code>' + streamId + '</code>', { parse_mode: 'HTML' });
+  await saveAllData(env, data);
+  await sendTelegramMessage(env, chatId, '🛑 تم: <code>' + streamId + '</code>', { parse_mode: 'HTML' });
 }
 
 async function showStopMenu(chatId, env) {
-  const recordings = await getRecordings(env);
-  const active = recordings.filter(r => r.status === 'recording');
+  const data = await getAllData(env);
+  const active = data.recordings.filter(r => r.status === 'recording');
   if (active.length === 0) {
     await sendTelegramMessage(env, chatId, '✅ لا تسجيلات', {
       parse_mode: 'HTML',
@@ -625,11 +584,12 @@ async function showStopMenu(chatId, env) {
 }
 
 async function handleCleanupCommand(chatId, env) {
-  const recordings = await getRecordings(env);
-  const active = recordings.filter(r => r.status === 'recording');
-  const deleted = recordings.length - active.length;
-  await saveRecordings(env, active);
-  await sendTelegramMessage(env, chatId, '🧹 تم حذف ' + deleted + ' تسجيل', {
+  const data = await getAllData(env);
+  const active = data.recordings.filter(r => r.status === 'recording');
+  const deleted = data.recordings.length - active.length;
+  data.recordings = active;
+  await saveAllData(env, data);
+  await sendTelegramMessage(env, chatId, '🧹 حذف ' + deleted + ' تسجيل', {
     parse_mode: 'HTML',
     reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
   });
@@ -641,23 +601,18 @@ async function handleAddWatch(chatId, streamId, env) {
       await sendTelegramMessage(env, chatId, '❌ مثال: <code>/addwatch 123456</code>', { parse_mode: 'HTML' });
       return;
     }
-    
-    const watchlist = await getWatchlist(env);
-    
-    if (watchlist.some(e => String(e.stream_id) === streamId)) {
+    const data = await getAllData(env);
+    if (data.watchlist.some(e => String(e.stream_id) === streamId)) {
       await sendTelegramMessage(env, chatId, '⚠️ موجود مسبقاً', { parse_mode: 'HTML' });
       return;
     }
-    
-    watchlist.push({ stream_id: streamId, added_at: new Date().toISOString(), display_name: null });
-    
+    data.watchlist.push({ stream_id: streamId, added_at: new Date().toISOString(), display_name: null });
     try {
-      await saveWatchlist(env, watchlist);
+      await saveAllData(env, data);
     } catch (e) {
-      await sendTelegramMessage(env, chatId, '❌ فشل الحفظ في التخزين: ' + e.message, { parse_mode: 'HTML' });
+      await sendTelegramMessage(env, chatId, '❌ فشل الحفظ: ' + e.message, { parse_mode: 'HTML' });
       return;
     }
-    
     await sendTelegramMessage(env, chatId, '✅ تمت إضافة <code>' + streamId + '</code>', {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [
@@ -677,14 +632,14 @@ async function handleRemoveWatch(chatId, streamId, env) {
       await sendTelegramMessage(env, chatId, '❌ مثال: <code>/removewatch 123456</code>', { parse_mode: 'HTML' });
       return;
     }
-    const watchlist = await getWatchlist(env);
-    const idx = watchlist.findIndex(e => String(e.stream_id) === streamId);
+    const data = await getAllData(env);
+    const idx = data.watchlist.findIndex(e => String(e.stream_id) === streamId);
     if (idx === -1) {
       await sendTelegramMessage(env, chatId, '⚠️ غير موجود', { parse_mode: 'HTML' });
       return;
     }
-    watchlist.splice(idx, 1);
-    await saveWatchlist(env, watchlist);
+    data.watchlist.splice(idx, 1);
+    await saveAllData(env, data);
     await sendTelegramMessage(env, chatId, '🗑️ تم حذف <code>' + streamId + '</code>', {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
@@ -697,16 +652,16 @@ async function handleRemoveWatch(chatId, streamId, env) {
 
 async function handleWatchlistCommand(chatId, env) {
   try {
-    const watchlist = await getWatchlist(env);
-    if (watchlist.length === 0) {
+    const data = await getAllData(env);
+    if (data.watchlist.length === 0) {
       await sendTelegramMessage(env, chatId, '📋 فارغة. أضف: <code>/addwatch 123456</code>', {
         parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
       });
       return;
     }
-    let msg = '📋 <b>(' + watchlist.length + '):</b>\n\n';
-    for (const e of watchlist) {
+    let msg = '📋 <b>(' + data.watchlist.length + '):</b>\n\n';
+    for (const e of data.watchlist) {
       const name = e.display_name ? (' → ' + escapeHtml(e.display_name)) : '';
       msg += '• <code>' + e.stream_id + '</code>' + name + '\n';
     }
@@ -724,7 +679,7 @@ async function handleTestMonitor(chatId, env) {
   await sendTelegramMessage(env, chatId, '🧪 جاري التشغيل...', { parse_mode: 'HTML' });
   const result = await triggerMonitorWorkflow(env, 'telegram_button');
   if (result.success) {
-    await sendTelegramMessage(env, chatId, '✅ تم التشغيل', { parse_mode: 'HTML' });
+    await sendTelegramMessage(env, chatId, '✅ تم', { parse_mode: 'HTML' });
   } else {
     await sendTelegramMessage(env, chatId, '❌ فشل: ' + result.error, { parse_mode: 'HTML' });
   }
@@ -732,9 +687,8 @@ async function handleTestMonitor(chatId, env) {
 
 async function sendHelp(chatId, env) {
   await sendTelegramMessage(env, chatId,
-    '🤖 <b>الأوامر:</b>\n\n' +
+    '🤖 <b>الأوامر:</b>\n' +
     '<code>/addwatch 123456</code>\n' +
-    '<code>/removewatch 123456</code>\n' +
     '<code>/watchlist</code>\n' +
     '<code>/testmonitor</code>',
     { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] } }
@@ -742,13 +696,12 @@ async function sendHelp(chatId, env) {
 }
 
 async function sendMainMenu(chatId, env) {
-  const watchlist = await getWatchlist(env);
-  const recordings = await getRecordings(env);
-  const active = recordings.filter(r => r.status === 'recording').length;
+  const data = await getAllData(env);
+  const active = data.recordings.filter(r => r.status === 'recording').length;
   await sendTelegramMessage(env, chatId,
-    '🎬 <b>SuperLive Recorder</b>\n\n' +
+    '🎬 <b>SuperLive Recorder</b>\n' +
     '📊 النشطة: <b>' + active + '/5</b>\n' +
-    '📋 المراقبة: <b>' + watchlist.length + '</b>',
+    '📋 المراقبة: <b>' + data.watchlist.length + '</b>',
     {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [
