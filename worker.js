@@ -1,6 +1,5 @@
-// worker.js - Version 15.0 - Unified Single Write
-// Writes ALL data in ONE KV put() per cycle
-// Saves 1000+ writes/day -> only 1 write per cycle
+// worker.js - Version 16.0 - GitHub Files Storage (No KV Limits)
+// Uses GitHub repository files as database - FREE and INSTANT
 
 export default {
   async fetch(request, env, ctx) {
@@ -56,9 +55,10 @@ export default {
 };
 
 // ============================================================
-// UNIFIED DATA STORAGE - Single key for everything
+// GITHUB FILE STORAGE - No limits, works instantly
 // ============================================================
-const DATA_KEY = 'superlive:data';
+const WATCHLIST_FILE = 'data/watchlist.json';
+const RECORDINGS_FILE = 'data/recordings.json';
 
 function isAuthorized(request, env) {
   if (!env.AUTO_API_TOKEN) return true;
@@ -84,36 +84,90 @@ function jsonResponse(data, status) {
 }
 
 // ============================================================
-// DATA LAYER - One read, one write
+// GITHUB FILE OPERATIONS
 // ============================================================
-async function getAllData(env) {
+async function githubApiRequest(env, method, path, body) {
+  const url = 'https://api.github.com/repos/' + env.GITHUB_REPO + path;
+  const headers = {
+    'Authorization': 'token ' + env.GITHUB_TOKEN,
+    'Accept': 'application/vnd.github.v3+json',
+    'User-Agent': 'SuperLive-Worker',
+    'Content-Type': 'application/json'
+  };
+  const options = { method: method, headers: headers };
+  if (body) {
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(url, options);
+  return response;
+}
+
+async function readFile(env, filePath) {
   try {
-    const data = await env.SUPERLIVE_STATE.get(DATA_KEY, 'json');
-    if (data && typeof data === 'object') {
-      return {
-        watchlist: Array.isArray(data.watchlist) ? data.watchlist : [],
-        recordings: Array.isArray(data.recordings) ? data.recordings : []
-      };
+    const response = await githubApiRequest(env, 'GET', '/contents/' + filePath);
+    if (response.status !== 200) {
+      console.error('readFile error: HTTP ' + response.status);
+      return { data: null, sha: null };
     }
-    return { watchlist: [], recordings: [] };
+    const result = await response.json();
+    const content = atob(result.content);
+    return {
+      data: JSON.parse(content),
+      sha: result.sha
+    };
   } catch (e) {
-    console.error('getAllData error:', e);
-    return { watchlist: [], recordings: [] };
+    console.error('readFile exception:', e);
+    return { data: null, sha: null };
   }
 }
 
-async function saveAllData(env, data) {
+async function writeFile(env, filePath, data, sha) {
   try {
-    await env.SUPERLIVE_STATE.put(DATA_KEY, JSON.stringify({
-      watchlist: data.watchlist,
-      recordings: data.recordings,
-      last_updated: new Date().toISOString()
-    }));
-    return true;
+    const content = btoa(unescape(encodeURIComponent(JSON.stringify(data, null, 2))));
+    const body = {
+      message: 'Update ' + filePath + ' at ' + new Date().toISOString(),
+      content: content,
+      sha: sha
+    };
+    const response = await githubApiRequest(env, 'PUT', '/contents/' + filePath, body);
+    if (response.status === 200 || response.status === 201) {
+      return { success: true };
+    } else {
+      const errorText = await response.text();
+      console.error('writeFile error: HTTP ' + response.status + ' - ' + errorText);
+      return { success: false, error: 'HTTP ' + response.status };
+    }
   } catch (e) {
-    console.error('saveAllData error:', e);
-    throw new Error('KV save failed: ' + e.message);
+    console.error('writeFile exception:', e);
+    return { success: false, error: e.message };
   }
+}
+
+// ============================================================
+// DATA LAYER - Using GitHub files
+// ============================================================
+async function getWatchlist(env) {
+  const result = await readFile(env, WATCHLIST_FILE);
+  if (result.data && Array.isArray(result.data.watchlist)) {
+    return { data: result.data.watchlist, sha: result.sha };
+  }
+  return { data: [], sha: result.sha };
+}
+
+async function saveWatchlist(env, watchlist, sha) {
+  return await writeFile(env, WATCHLIST_FILE, { watchlist: watchlist }, sha);
+}
+
+async function getRecordings(env) {
+  const result = await readFile(env, RECORDINGS_FILE);
+  if (result.data && Array.isArray(result.data.recordings)) {
+    return { data: result.data.recordings, sha: result.sha };
+  }
+  return { data: [], sha: result.sha };
+}
+
+async function saveRecordings(env, recordings, sha) {
+  return await writeFile(env, RECORDINGS_FILE, { recordings: recordings }, sha);
 }
 
 // ============================================================
@@ -122,10 +176,10 @@ async function saveAllData(env, data) {
 async function handleWatchlistList(request, env) {
   if (!isAuthorized(request, env)) return unauthorizedResponse();
   try {
-    const data = await getAllData(env);
+    const result = await getWatchlist(env);
     return jsonResponse({
-      success: true, count: data.watchlist.length,
-      watchlist: data.watchlist, timestamp: new Date().toISOString()
+      success: true, count: result.data.length,
+      watchlist: result.data, timestamp: new Date().toISOString()
     });
   } catch (error) {
     return jsonResponse({ error: error.message }, 500);
@@ -140,16 +194,20 @@ async function handleWatchlistAdd(request, env) {
     if (!streamId || !/^\d+$/.test(streamId)) {
       return jsonResponse({ error: 'Invalid stream ID' }, 400);
     }
-    const data = await getAllData(env);
-    if (data.watchlist.some(e => String(e.stream_id) === streamId)) {
+    const result = await getWatchlist(env);
+    const watchlist = result.data;
+    if (watchlist.some(e => String(e.stream_id) === streamId)) {
       return jsonResponse({ success: true, message: 'Already exists', stream_id: streamId });
     }
-    data.watchlist.push({
+    watchlist.push({
       stream_id: streamId,
       added_at: new Date().toISOString(),
       display_name: null
     });
-    await saveAllData(env, data);
+    const saveResult = await saveWatchlist(env, watchlist, result.sha);
+    if (!saveResult.success) {
+      return jsonResponse({ error: saveResult.error }, 500);
+    }
     return jsonResponse({ success: true, stream_id: streamId, timestamp: new Date().toISOString() });
   } catch (error) {
     console.error('handleWatchlistAdd error:', error);
@@ -165,13 +223,17 @@ async function handleWatchlistRemove(request, env) {
     if (!streamId || !/^\d+$/.test(streamId)) {
       return jsonResponse({ error: 'Invalid stream ID' }, 400);
     }
-    const data = await getAllData(env);
-    const idx = data.watchlist.findIndex(e => String(e.stream_id) === streamId);
+    const result = await getWatchlist(env);
+    const watchlist = result.data;
+    const idx = watchlist.findIndex(e => String(e.stream_id) === streamId);
     if (idx === -1) {
       return jsonResponse({ success: false, error: 'Not found' }, 404);
     }
-    data.watchlist.splice(idx, 1);
-    await saveAllData(env, data);
+    watchlist.splice(idx, 1);
+    const saveResult = await saveWatchlist(env, watchlist, result.sha);
+    if (!saveResult.success) {
+      return jsonResponse({ error: saveResult.error }, 500);
+    }
     return jsonResponse({ success: true, stream_id: streamId });
   } catch (error) {
     console.error('handleWatchlistRemove error:', error);
@@ -188,14 +250,18 @@ async function handleWatchlistUpdateName(request, url, env) {
     }
     const body = await request.json();
     const displayName = String(body.display_name || '').trim();
-    const data = await getAllData(env);
-    const entry = data.watchlist.find(e => String(e.stream_id) === streamId);
+    const result = await getWatchlist(env);
+    const watchlist = result.data;
+    const entry = watchlist.find(e => String(e.stream_id) === streamId);
     if (!entry) {
       return jsonResponse({ success: false, error: 'Not found' }, 404);
     }
     entry.display_name = displayName || null;
     entry.name_updated_at = new Date().toISOString();
-    await saveAllData(env, data);
+    const saveResult = await saveWatchlist(env, watchlist, result.sha);
+    if (!saveResult.success) {
+      return jsonResponse({ error: saveResult.error }, 500);
+    }
     return jsonResponse({ success: true, stream_id: streamId, display_name: displayName });
   } catch (error) {
     console.error('handleWatchlistUpdateName error:', error);
@@ -209,8 +275,8 @@ async function handleWatchlistUpdateName(request, url, env) {
 async function handleActiveRecordings(request, env) {
   if (!isAuthorized(request, env)) return unauthorizedResponse();
   try {
-    const data = await getAllData(env);
-    const active = data.recordings.filter(r => r.status === 'recording');
+    const result = await getRecordings(env);
+    const active = result.data.filter(r => r.status === 'recording');
     return jsonResponse({
       success: true, active_count: active.length,
       max_concurrent: 5, recordings: active,
@@ -233,21 +299,21 @@ async function handleAutoTrigger(request, url, env) {
     const streamName = body.stream_name || '';
     const source = body.source || 'auto';
 
-    const data = await getAllData(env);
-    
     // Check watchlist
-    if (!data.watchlist.some(e => String(e.stream_id) === streamId)) {
+    const watchlistResult = await getWatchlist(env);
+    if (!watchlistResult.data.some(e => String(e.stream_id) === streamId)) {
       return jsonResponse({ success: false, error: 'not_in_watchlist', stream_id: streamId }, 404);
     }
 
-    // Check already recording
-    const existing = data.recordings.find(r => String(r.stream_id) === streamId && r.status === 'recording');
+    // Check recordings
+    const recordingsResult = await getRecordings(env);
+    const recordings = recordingsResult.data;
+    const existing = recordings.find(r => String(r.stream_id) === streamId && r.status === 'recording');
     if (existing) {
       return jsonResponse({ success: false, error: 'already_recording', stream_id: streamId }, 409);
     }
 
-    // Check concurrency
-    const active = data.recordings.filter(r => r.status === 'recording');
+    const active = recordings.filter(r => r.status === 'recording');
     if (active.length >= 5) {
       return jsonResponse({
         success: false, error: 'concurrency_limit',
@@ -255,16 +321,19 @@ async function handleAutoTrigger(request, url, env) {
       }, 429);
     }
 
-    // Clean old recordings, add new one
-    data.recordings = data.recordings.filter(r =>
+    // Clean old, add new
+    const filtered = recordings.filter(r =>
       !(String(r.stream_id) === streamId && ['finished', 'failed', 'stopped'].includes(r.status))
     );
-    data.recordings.push({
+    filtered.push({
       stream_id: streamId, stream_url: streamUrl,
       stream_name: streamName || null, status: 'recording',
       started_at: new Date().toISOString(), source: source
     });
-    await saveAllData(env, data);
+    const saveResult = await saveRecordings(env, filtered, recordingsResult.sha);
+    if (!saveResult.success) {
+      return jsonResponse({ error: saveResult.error }, 500);
+    }
 
     // Trigger recording
     const triggerResult = await triggerRecordWorkflow(env, streamUrl, streamId, streamName);
@@ -277,11 +346,13 @@ async function handleAutoTrigger(request, url, env) {
       return jsonResponse({ success: true, started: true, stream_id: streamId, stream_name: streamName });
     } else {
       // Mark as failed
-      const rec = data.recordings.find(r => String(r.stream_id) === streamId && r.status === 'recording');
+      const rec = filtered.find(r => String(r.stream_id) === streamId && r.status === 'recording');
       if (rec) {
         rec.status = 'failed';
         rec.error = triggerResult.error;
-        await saveAllData(env, data);
+        // Re-read to get fresh sha
+        const freshResult = await getRecordings(env);
+        await saveRecordings(env, filtered, freshResult.sha);
       }
       return jsonResponse({ success: false, error: triggerResult.error }, 502);
     }
@@ -310,12 +381,12 @@ async function handleTriggerMonitorApi(request, env) {
 async function handleAutoMonitorCron(env) {
   try {
     console.log('[AUTO-CRON] Starting...');
-    const data = await getAllData(env);
-    if (!data.watchlist || data.watchlist.length === 0) {
+    const watchlistResult = await getWatchlist(env);
+    if (!watchlistResult.data || watchlistResult.data.length === 0) {
       console.log('[AUTO-CRON] Watchlist empty');
       return;
     }
-    console.log('[AUTO-CRON] Watchlist: ' + data.watchlist.length + ' users');
+    console.log('[AUTO-CRON] Watchlist: ' + watchlistResult.data.length + ' users');
     const result = await triggerMonitorWorkflow(env, 'cloudflare_cron');
     if (result.success) {
       console.log('[AUTO-CRON] OK');
@@ -334,14 +405,18 @@ async function handleUpdateState(request, url, env) {
       return jsonResponse({ error: 'Invalid stream ID' }, 400);
     }
     const body = await request.json();
-    const data = await getAllData(env);
-    const idx = data.recordings.findIndex(r => String(r.stream_id) === streamId && r.status === 'recording');
+    const result = await getRecordings(env);
+    const recordings = result.data;
+    const idx = recordings.findIndex(r => String(r.stream_id) === streamId && r.status === 'recording');
     if (idx >= 0) {
-      data.recordings[idx] = Object.assign({}, data.recordings[idx], body);
+      recordings[idx] = Object.assign({}, recordings[idx], body);
     } else {
-      data.recordings.push(Object.assign({ stream_id: streamId }, body));
+      recordings.push(Object.assign({ stream_id: streamId }, body));
     }
-    await saveAllData(env, data);
+    const saveResult = await saveRecordings(env, recordings, result.sha);
+    if (!saveResult.success) {
+      return jsonResponse({ error: saveResult.error }, 500);
+    }
     return jsonResponse({ success: true, updated: streamId });
   } catch (error) {
     console.error('handleUpdateState error:', error);
@@ -355,9 +430,13 @@ async function handleDeleteRecording(request, url, env) {
     if (!streamId || !/^\d+$/.test(streamId)) {
       return jsonResponse({ error: 'Invalid stream ID' }, 400);
     }
-    const data = await getAllData(env);
-    data.recordings = data.recordings.filter(r => String(r.stream_id) !== streamId);
-    await saveAllData(env, data);
+    const result = await getRecordings(env);
+    const recordings = result.data;
+    const filtered = recordings.filter(r => String(r.stream_id) !== streamId);
+    const saveResult = await saveRecordings(env, filtered, result.sha);
+    if (!saveResult.success) {
+      return jsonResponse({ error: saveResult.error }, 500);
+    }
     return jsonResponse({ success: true, deleted: streamId });
   } catch (error) {
     console.error('handleDeleteRecording error:', error);
@@ -367,11 +446,14 @@ async function handleDeleteRecording(request, url, env) {
 
 async function handleCleanup(env) {
   try {
-    const data = await getAllData(env);
-    const active = data.recordings.filter(r => r.status === 'recording');
-    const deletedCount = data.recordings.length - active.length;
-    data.recordings = active;
-    await saveAllData(env, data);
+    const result = await getRecordings(env);
+    const recordings = result.data;
+    const active = recordings.filter(r => r.status === 'recording');
+    const deletedCount = recordings.length - active.length;
+    const saveResult = await saveRecordings(env, active, result.sha);
+    if (!saveResult.success) {
+      return jsonResponse({ error: saveResult.error }, 500);
+    }
     return jsonResponse({ success: true, deleted_count: deletedCount });
   } catch (error) {
     return jsonResponse({ error: error.message }, 500);
@@ -384,8 +466,8 @@ async function handleCheckStop(request, url, env) {
     if (!streamId || !/^\d+$/.test(streamId)) {
       return jsonResponse({ error: 'Invalid stream ID', should_stop: false }, 400);
     }
-    const data = await getAllData(env);
-    const recording = data.recordings.find(r => String(r.stream_id) === streamId);
+    const result = await getRecordings(env);
+    const recording = result.data.find(r => String(r.stream_id) === streamId);
     let should_stop = false;
     let status = 'not_found';
     if (recording) {
@@ -484,32 +566,38 @@ async function handleRecord(chatId, streamUrl, env) {
   const streamId = extractStreamId(streamUrl);
   if (!streamId) { await sendTelegramMessage(env, chatId, '❌ رابط غير صالح.'); return; }
 
-  const data = await getAllData(env);
-  const existing = data.recordings.find(r => String(r.stream_id) === streamId && r.status === 'recording');
+  const recordingsResult = await getRecordings(env);
+  const recordings = recordingsResult.data;
+  const existing = recordings.find(r => String(r.stream_id) === streamId && r.status === 'recording');
   if (existing) {
     await sendTelegramMessage(env, chatId, '⚠️ يُسجّل حالياً.', { parse_mode: 'HTML' });
     return;
   }
 
-  const active = data.recordings.filter(r => r.status === 'recording');
+  const active = recordings.filter(r => r.status === 'recording');
   if (active.length >= 5) {
     await sendTelegramMessage(env, chatId, '❌ الحد الأقصى (5).');
     return;
   }
 
   let streamName = '';
-  const watchEntry = data.watchlist.find(e => String(e.stream_id) === streamId);
+  const watchlistResult = await getWatchlist(env);
+  const watchEntry = watchlistResult.data.find(e => String(e.stream_id) === streamId);
   if (watchEntry && watchEntry.display_name) streamName = watchEntry.display_name;
 
-  data.recordings = data.recordings.filter(r =>
+  const filtered = recordings.filter(r =>
     !(String(r.stream_id) === streamId && ['finished', 'failed', 'stopped'].includes(r.status))
   );
-  data.recordings.push({
+  filtered.push({
     stream_id: streamId, stream_url: streamUrl,
     stream_name: streamName || null, status: 'recording',
     started_at: new Date().toISOString(), source: 'manual'
   });
-  await saveAllData(env, data);
+  const saveResult = await saveRecordings(env, filtered, recordingsResult.sha);
+  if (!saveResult.success) {
+    await sendTelegramMessage(env, chatId, '❌ فشل الحفظ: ' + saveResult.error, { parse_mode: 'HTML' });
+    return;
+  }
 
   const triggerResult = await triggerRecordWorkflow(env, streamUrl, streamId, streamName);
   if (triggerResult.success) {
@@ -530,8 +618,8 @@ async function handleRecord(chatId, streamUrl, env) {
 }
 
 async function handleStatus(chatId, env) {
-  const data = await getAllData(env);
-  const active = data.recordings.filter(r => r.status === 'recording');
+  const result = await getRecordings(env);
+  const active = result.data.filter(r => r.status === 'recording');
   if (active.length === 0) {
     await sendTelegramMessage(env, chatId, '📭 لا تسجيلات', {
       parse_mode: 'HTML',
@@ -557,18 +645,23 @@ async function handleStatus(chatId, env) {
 
 async function handleStop(chatId, streamId, env) {
   if (!streamId) { await sendTelegramMessage(env, chatId, '⚠️ حدد البث'); return; }
-  const data = await getAllData(env);
-  const r = data.recordings.find(x => String(x.stream_id) === streamId && x.status === 'recording');
+  const result = await getRecordings(env);
+  const recordings = result.data;
+  const r = recordings.find(x => String(x.stream_id) === streamId && x.status === 'recording');
   if (!r) { await sendTelegramMessage(env, chatId, '⚠️ غير موجود', { parse_mode: 'HTML' }); return; }
   r.status = 'stopped';
   r.stopped_at = new Date().toISOString();
-  await saveAllData(env, data);
+  const saveResult = await saveRecordings(env, recordings, result.sha);
+  if (!saveResult.success) {
+    await sendTelegramMessage(env, chatId, '❌ فشل الحفظ', { parse_mode: 'HTML' });
+    return;
+  }
   await sendTelegramMessage(env, chatId, '🛑 تم: <code>' + streamId + '</code>', { parse_mode: 'HTML' });
 }
 
 async function showStopMenu(chatId, env) {
-  const data = await getAllData(env);
-  const active = data.recordings.filter(r => r.status === 'recording');
+  const result = await getRecordings(env);
+  const active = result.data.filter(r => r.status === 'recording');
   if (active.length === 0) {
     await sendTelegramMessage(env, chatId, '✅ لا تسجيلات', {
       parse_mode: 'HTML',
@@ -584,11 +677,15 @@ async function showStopMenu(chatId, env) {
 }
 
 async function handleCleanupCommand(chatId, env) {
-  const data = await getAllData(env);
-  const active = data.recordings.filter(r => r.status === 'recording');
-  const deleted = data.recordings.length - active.length;
-  data.recordings = active;
-  await saveAllData(env, data);
+  const result = await getRecordings(env);
+  const recordings = result.data;
+  const active = recordings.filter(r => r.status === 'recording');
+  const deleted = recordings.length - active.length;
+  const saveResult = await saveRecordings(env, active, result.sha);
+  if (!saveResult.success) {
+    await sendTelegramMessage(env, chatId, '❌ فشل الحفظ', { parse_mode: 'HTML' });
+    return;
+  }
   await sendTelegramMessage(env, chatId, '🧹 حذف ' + deleted + ' تسجيل', {
     parse_mode: 'HTML',
     reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
@@ -601,16 +698,16 @@ async function handleAddWatch(chatId, streamId, env) {
       await sendTelegramMessage(env, chatId, '❌ مثال: <code>/addwatch 123456</code>', { parse_mode: 'HTML' });
       return;
     }
-    const data = await getAllData(env);
-    if (data.watchlist.some(e => String(e.stream_id) === streamId)) {
+    const result = await getWatchlist(env);
+    const watchlist = result.data;
+    if (watchlist.some(e => String(e.stream_id) === streamId)) {
       await sendTelegramMessage(env, chatId, '⚠️ موجود مسبقاً', { parse_mode: 'HTML' });
       return;
     }
-    data.watchlist.push({ stream_id: streamId, added_at: new Date().toISOString(), display_name: null });
-    try {
-      await saveAllData(env, data);
-    } catch (e) {
-      await sendTelegramMessage(env, chatId, '❌ فشل الحفظ: ' + e.message, { parse_mode: 'HTML' });
+    watchlist.push({ stream_id: streamId, added_at: new Date().toISOString(), display_name: null });
+    const saveResult = await saveWatchlist(env, watchlist, result.sha);
+    if (!saveResult.success) {
+      await sendTelegramMessage(env, chatId, '❌ فشل الحفظ: ' + saveResult.error, { parse_mode: 'HTML' });
       return;
     }
     await sendTelegramMessage(env, chatId, '✅ تمت إضافة <code>' + streamId + '</code>', {
@@ -632,14 +729,19 @@ async function handleRemoveWatch(chatId, streamId, env) {
       await sendTelegramMessage(env, chatId, '❌ مثال: <code>/removewatch 123456</code>', { parse_mode: 'HTML' });
       return;
     }
-    const data = await getAllData(env);
-    const idx = data.watchlist.findIndex(e => String(e.stream_id) === streamId);
+    const result = await getWatchlist(env);
+    const watchlist = result.data;
+    const idx = watchlist.findIndex(e => String(e.stream_id) === streamId);
     if (idx === -1) {
       await sendTelegramMessage(env, chatId, '⚠️ غير موجود', { parse_mode: 'HTML' });
       return;
     }
-    data.watchlist.splice(idx, 1);
-    await saveAllData(env, data);
+    watchlist.splice(idx, 1);
+    const saveResult = await saveWatchlist(env, watchlist, result.sha);
+    if (!saveResult.success) {
+      await sendTelegramMessage(env, chatId, '❌ فشل الحفظ', { parse_mode: 'HTML' });
+      return;
+    }
     await sendTelegramMessage(env, chatId, '🗑️ تم حذف <code>' + streamId + '</code>', {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
@@ -652,16 +754,17 @@ async function handleRemoveWatch(chatId, streamId, env) {
 
 async function handleWatchlistCommand(chatId, env) {
   try {
-    const data = await getAllData(env);
-    if (data.watchlist.length === 0) {
+    const result = await getWatchlist(env);
+    const watchlist = result.data;
+    if (watchlist.length === 0) {
       await sendTelegramMessage(env, chatId, '📋 فارغة. أضف: <code>/addwatch 123456</code>', {
         parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
       });
       return;
     }
-    let msg = '📋 <b>(' + data.watchlist.length + '):</b>\n\n';
-    for (const e of data.watchlist) {
+    let msg = '📋 <b>(' + watchlist.length + '):</b>\n\n';
+    for (const e of watchlist) {
       const name = e.display_name ? (' → ' + escapeHtml(e.display_name)) : '';
       msg += '• <code>' + e.stream_id + '</code>' + name + '\n';
     }
@@ -696,12 +799,13 @@ async function sendHelp(chatId, env) {
 }
 
 async function sendMainMenu(chatId, env) {
-  const data = await getAllData(env);
-  const active = data.recordings.filter(r => r.status === 'recording').length;
+  const watchlistResult = await getWatchlist(env);
+  const recordingsResult = await getRecordings(env);
+  const active = recordingsResult.data.filter(r => r.status === 'recording').length;
   await sendTelegramMessage(env, chatId,
     '🎬 <b>SuperLive Recorder</b>\n' +
     '📊 النشطة: <b>' + active + '/5</b>\n' +
-    '📋 المراقبة: <b>' + data.watchlist.length + '</b>',
+    '📋 المراقبة: <b>' + watchlistResult.data.length + '</b>',
     {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [
