@@ -1,5 +1,5 @@
 // worker.js - SuperLive Recorder + Auto Monitor + Watchlist + Cron
-// Version: 12.0 - Final (No Syntax Errors)
+// Version: 10.0 - Full integration
 
 export default {
   async fetch(request, env, ctx) {
@@ -26,12 +26,6 @@ export default {
     if (url.pathname === '/api/trigger-monitor' && request.method === 'POST') {
       return handleTriggerMonitorApi(request, env);
     }
-    if (url.pathname === '/api/monitor-lock/acquire' && request.method === 'POST') {
-      return handleMonitorLockAcquire(request, env);
-    }
-    if (url.pathname === '/api/monitor-lock/release' && request.method === 'POST') {
-      return handleMonitorLockRelease(request, env);
-    }
     if (url.pathname.startsWith('/api/update-state/') && request.method === 'POST') {
       return handleUpdateState(request, url, env);
     }
@@ -51,7 +45,9 @@ export default {
       return new Response(JSON.stringify({
         status: 'ok',
         timestamp: new Date().toISOString()
-      }), { headers: { 'Content-Type': 'application/json' } });
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
 
     return new Response('Not Found', { status: 404 });
@@ -76,15 +72,36 @@ function unauthorizedResponse() {
   });
 }
 
+function escapeHtml(text) {
+  if (!text) return '';
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+async function getWatchlist(env) {
+  const { keys } = await env.SUPERLIVE_STATE.list({ prefix: 'watchlist:' });
+  const watchlist = [];
+  for (const key of keys) {
+    try {
+      const entry = await env.SUPERLIVE_STATE.get(key.name, 'json');
+      if (entry) {
+        if (!entry.stream_id) entry.stream_id = key.name.replace('watchlist:', '');
+        watchlist.push(entry);
+      }
+    } catch (e) {}
+  }
+  return watchlist;
+}
+
 async function handleWatchlistList(request, env) {
   if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
   try {
     const watchlist = await getWatchlist(env);
     return new Response(JSON.stringify({
-      success: true,
-      count: watchlist.length,
-      watchlist: watchlist,
-      timestamp: new Date().toISOString()
+      success: true, count: watchlist.length,
+      watchlist: watchlist, timestamp: new Date().toISOString()
     }), { headers: { 'Content-Type': 'application/json' } });
   } catch (error) {
     return new Response(JSON.stringify({ error: error.message }), {
@@ -111,9 +128,7 @@ async function handleWatchlistAdd(request, env) {
       }), { headers: { 'Content-Type': 'application/json' } });
     }
     await env.SUPERLIVE_STATE.put(key, JSON.stringify({
-      stream_id: streamId,
-      added_at: new Date().toISOString(),
-      display_name: null
+      stream_id: streamId, added_at: new Date().toISOString(), display_name: null
     }));
     return new Response(JSON.stringify({
       success: true, stream_id: streamId, timestamp: new Date().toISOString()
@@ -165,15 +180,15 @@ async function handleWatchlistUpdateName(request, url, env) {
     const body = await request.json();
     const displayName = String(body.display_name || '').trim();
     const key = 'watchlist:' + streamId;
-    const existing = await env.SUPERLIVE_STATE.get(key, 'json');
-    if (!existing) {
+    const entry = await env.SUPERLIVE_STATE.get(key, 'json');
+    if (!entry) {
       return new Response(JSON.stringify({
         success: false, error: 'Not found in watchlist'
       }), { status: 404, headers: { 'Content-Type': 'application/json' } });
     }
-    existing.display_name = displayName || null;
-    existing.name_updated_at = new Date().toISOString();
-    await env.SUPERLIVE_STATE.put(key, JSON.stringify(existing));
+    entry.display_name = displayName || null;
+    entry.name_updated_at = new Date().toISOString();
+    await env.SUPERLIVE_STATE.put(key, JSON.stringify(entry));
     return new Response(JSON.stringify({
       success: true, stream_id: streamId,
       display_name: displayName, timestamp: new Date().toISOString()
@@ -183,21 +198,6 @@ async function handleWatchlistUpdateName(request, url, env) {
       status: 500, headers: { 'Content-Type': 'application/json' }
     });
   }
-}
-
-async function getWatchlist(env) {
-  const { keys } = await env.SUPERLIVE_STATE.list({ prefix: 'watchlist:' });
-  const watchlist = [];
-  for (const key of keys) {
-    try {
-      const entry = await env.SUPERLIVE_STATE.get(key.name, 'json');
-      if (entry) {
-        if (!entry.stream_id) entry.stream_id = key.name.replace('watchlist:', '');
-        watchlist.push(entry);
-      }
-    } catch (e) {}
-  }
-  return watchlist;
 }
 
 async function handleActiveRecordings(request, env) {
@@ -272,8 +272,9 @@ async function handleAutoTrigger(request, url, env) {
     await env.SUPERLIVE_STATE.put(recordingKey, JSON.stringify(recordingState));
 
     const triggerResult = await triggerRecordWorkflow(env, streamUrl, streamId, streamName);
+
     if (triggerResult.success) {
-      const nameLine = streamName ? ('\n' + '👤 الاسم: <b>' + escapeHtml(streamName) + '</b>') : '';
+      const nameLine = streamName ? ('\n👤 الاسم: <b>' + escapeHtml(streamName) + '</b>') : '';
       await sendTelegramMessage(env, env.TELEGRAM_CHAT_ID,
         '🤖 <b>Auto Recording بدأ</b>\n📺 البث: <code>' + streamId + '</code>' + nameLine + '\n🔗 الرابط: <a href="' + streamUrl + '">افتح</a>',
         { parse_mode: 'HTML' }
@@ -320,46 +321,6 @@ async function handleTriggerMonitorApi(request, env) {
   }
 }
 
-async function handleMonitorLockAcquire(request, env) {
-  if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
-  try {
-    const lockKey = 'monitor:lock';
-    const existing = await env.SUPERLIVE_STATE.get(lockKey, 'json');
-    if (existing && existing.locked) {
-      const lockAge = Date.now() - new Date(existing.locked_at).getTime();
-      if (lockAge < 15 * 60 * 1000) {
-        return new Response(JSON.stringify({
-          acquired: false, reason: 'already_locked', locked_at: existing.locked_at
-        }), { headers: { 'Content-Type': 'application/json' } });
-      }
-    }
-    await env.SUPERLIVE_STATE.put(lockKey, JSON.stringify({
-      locked: true, locked_at: new Date().toISOString()
-    }));
-    return new Response(JSON.stringify({
-      acquired: true, timestamp: new Date().toISOString()
-    }), { headers: { 'Content-Type': 'application/json' } });
-  } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500, headers: { 'Content-Type': 'application/json' }
-    });
-  }
-}
-
-async function handleMonitorLockRelease(request, env) {
-  if (!isAutoApiAuthorized(request, env)) return unauthorizedResponse();
-  try {
-    await env.SUPERLIVE_STATE.delete('monitor:lock');
-    return new Response(JSON.stringify({
-      released: true, timestamp: new Date().toISOString()
-    }), { headers: { 'Content-Type': 'application/json' } });
-  } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500, headers: { 'Content-Type': 'application/json' }
-    });
-  }
-}
-
 async function handleAutoMonitorCron(env) {
   try {
     console.log('[AUTO-CRON] Starting scheduled check...');
@@ -369,19 +330,6 @@ async function handleAutoMonitorCron(env) {
       return;
     }
     console.log('[AUTO-CRON] Watchlist has ' + watchlist.length + ' users');
-    const lock = await env.SUPERLIVE_STATE.get('monitor:lock', 'json');
-    if (lock && lock.locked) {
-      const lockAge = Date.now() - new Date(lock.locked_at).getTime();
-      if (lockAge < 15 * 60 * 1000) {
-        console.log('[AUTO-CRON] Monitor lock is active, skipping');
-        return;
-      }
-    }
-    const isBusy = await isAutoMonitorBusy(env);
-    if (isBusy) {
-      console.log('[AUTO-CRON] Auto monitor is already running on GitHub, skipping');
-      return;
-    }
     const result = await triggerMonitorWorkflow(env, 'cloudflare_cron');
     if (result.success) {
       console.log('[AUTO-CRON] Auto monitor triggered successfully');
@@ -390,32 +338,6 @@ async function handleAutoMonitorCron(env) {
     }
   } catch (error) {
     console.error('[AUTO-CRON] Error:', error);
-  }
-}
-
-async function isAutoMonitorBusy(env) {
-  if (!env.GITHUB_REPO || !env.GITHUB_TOKEN) return false;
-  try {
-    const url = 'https://api.github.com/repos/' + env.GITHUB_REPO + '/actions/runs?per_page=10&status=in_progress';
-    const response = await fetch(url, {
-      headers: {
-        'Authorization': 'token ' + env.GITHUB_TOKEN,
-        'Accept': 'application/vnd.github.v3+json',
-        'User-Agent': 'SuperLive-AutoMonitor'
-      }
-    });
-    if (!response.ok) return false;
-    const data = await response.json();
-    const runs = data.workflow_runs || [];
-    for (const run of runs) {
-      const runPath = (run.path || '').toLowerCase();
-      const runName = (run.name || '').toLowerCase();
-      if (runPath.includes('automonitor') || runName.includes('auto monitor')) return true;
-    }
-    return false;
-  } catch (error) {
-    console.error('isAutoMonitorBusy error:', error);
-    return false;
   }
 }
 
@@ -510,10 +432,7 @@ async function handleCheckStop(request, url, env) {
       stream_id: streamId, status: status, should_stop: should_stop,
       timestamp: new Date().toISOString()
     }), {
-      headers: {
-        'Content-Type': 'application/json',
-        'Cache-Control': 'no-cache, no-store'
-      }
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache, no-store' }
     });
   } catch (error) {
     return new Response(JSON.stringify({ error: error.message, should_stop: false }), {
@@ -539,10 +458,10 @@ async function handleTelegramWebhook(request, env) {
 }
 
 async function handleMessage(message, env) {
-  const chatId = String(message.chat.id);
+  const chatId = message.chat.id.toString();
   const text = (message.text || '').trim();
 
-  if (chatId !== String(env.TELEGRAM_CHAT_ID)) {
+  if (chatId !== env.TELEGRAM_CHAT_ID) {
     return new Response('OK');
   }
 
@@ -598,7 +517,12 @@ async function handleMessage(message, env) {
 
     await sendTelegramMessage(env, chatId,
       '🤖 أرسل رابط البث المباشر للبدء بالتسجيل!\n' +
-      'مثال:\n<code>https://superlivetv.com/fr/livestream/123456</code>',
+      'مثال:\n<code>https://superlivetv.com/fr/livestream/123456</code>\n\n' +
+      'الأوامر:\n' +
+      '<code>/addwatch 123456</code> - إضافة للمراقبة\n' +
+      '<code>/removewatch 123456</code> - حذف من المراقبة\n' +
+      '<code>/watchlist</code> - عرض القائمة\n' +
+      '<code>/testmonitor</code> - تشغيل المراقبة',
       { parse_mode: 'HTML' }
     );
   } catch (error) {
@@ -609,10 +533,10 @@ async function handleMessage(message, env) {
 }
 
 async function handleCallbackQuery(callbackQuery, env) {
-  const chatId = String(callbackQuery.message.chat.id);
+  const chatId = callbackQuery.message.chat.id.toString();
   const data = callbackQuery.data;
 
-  if (chatId !== String(env.TELEGRAM_CHAT_ID)) {
+  if (chatId !== env.TELEGRAM_CHAT_ID) {
     await answerCallbackQuery(callbackQuery.id, env, '❌ غير مصرح');
     return new Response('OK');
   }
@@ -670,9 +594,12 @@ async function handleRecord(chatId, streamUrl, env) {
   await autoCleanup(env);
   const activeCount = await countActiveRecordings(env);
   if (activeCount >= 5) {
-    await sendTelegramMessage(env, chatId, '❌ تم الوصول للحد الأقصى (5 تسجيلات متزامنة).');
+    await sendTelegramMessage(env, chatId,
+      '❌ تم الوصول للحد الأقصى (5 تسجيلات متزامنة).\nاستخدم زر "🛑 إيقاف" لإيقاف تسجيل أولاً.'
+    );
     return;
   }
+
   let streamName = '';
   try {
     const watchEntry = await env.SUPERLIVE_STATE.get('watchlist:' + streamId, 'json');
@@ -687,11 +614,12 @@ async function handleRecord(chatId, streamUrl, env) {
     error: null, source: 'manual'
   };
   await env.SUPERLIVE_STATE.put(existingKey, JSON.stringify(recordingState));
+
   const triggerResult = await triggerRecordWorkflow(env, streamUrl, streamId, streamName);
   if (triggerResult.success) {
     const nameLine = streamName ? ('\n👤 الاسم: <b>' + escapeHtml(streamName) + '</b>') : '';
     await sendTelegramMessage(env, chatId,
-      '🔴 <b>بدأ التسجيل المستمر!</b>\n📺 البث: <code>' + streamId + '</code>' + nameLine + '\n⏱️ سيستمر حتى ينتهي البث',
+      '🔴 <b>بدأ التسجيل المستمر!</b>\n📺 البث: <code>' + streamId + '</code>' + nameLine + '\n⏱️ سيستمر حتى ينتهي البث أو تضغط "إيقاف"\n🔗 الرابط: <a href="' + streamUrl + '">افتح</a>',
       {
         parse_mode: 'HTML',
         reply_markup: {
@@ -717,10 +645,10 @@ async function handleStatus(chatId, env) {
   await autoCleanup(env);
   const { keys } = await env.SUPERLIVE_STATE.list({ prefix: 'recording:' });
   if (keys.length === 0) {
-    await sendTelegramMessage(env, chatId, '📭 <b>لا توجد تسجيلات حالياً</b>', {
-      parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
-    });
+    await sendTelegramMessage(env, chatId,
+      '📭 <b>لا توجد تسجيلات حالياً</b>\nأرسل رابط بث للبدء!',
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] } }
+    );
     return;
   }
   let message = '📊 <b>حالة التسجيلات:</b>\n';
@@ -735,6 +663,7 @@ async function handleStatus(chatId, env) {
       message += '   الحالة: <code>' + recording.status + '</code>\n';
       message += '   بدأ: ' + duration + '\n';
       if (recording.stream_name) message += '   الاسم: ' + escapeHtml(recording.stream_name) + '\n';
+      if (recording.file_size_mb > 0) message += '   الحجم: ' + recording.file_size_mb.toFixed(2) + ' MB\n';
       if (recording.error) message += '   خطأ: ' + recording.error + '\n';
       message += '\n';
     }
@@ -752,7 +681,7 @@ async function handleStatus(chatId, env) {
 
 async function handleStop(chatId, streamId, env) {
   if (!streamId) {
-    await sendTelegramMessage(env, chatId, '⚠️ يرجى تحديد البث المراد إيقافه.');
+    await sendTelegramMessage(env, chatId, '⚠️ يرجى تحديد البث المراد إيقافه.\nاستخدم زر "🛑 إيقاف" من القائمة.');
     return;
   }
   const key = 'recording:' + streamId;
@@ -762,7 +691,7 @@ async function handleStop(chatId, streamId, env) {
     return;
   }
   if (recording.status !== 'recording') {
-    await sendTelegramMessage(env, chatId, '⚠️ البث <code>' + streamId + '</code> لا يُسجّل حالياً.', { parse_mode: 'HTML' });
+    await sendTelegramMessage(env, chatId, '⚠️ البث <code>' + streamId + '</code> لا يُسجّل حالياً.\nالحالة: <code>' + recording.status + '</code>', { parse_mode: 'HTML' });
     return;
   }
   recording.status = 'stopped';
@@ -773,12 +702,7 @@ async function handleStop(chatId, streamId, env) {
     '🛑 <b>تم إرسال أمر الإيقاف!</b>\n📺 البث: <code>' + streamId + '</code>\n⏱️ مدة التسجيل: ' + duration,
     {
       parse_mode: 'HTML',
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '📊 الحالة', callback_data: 'status' }],
-          [{ text: '🔙 العودة', callback_data: 'back' }]
-        ]
-      }
+      reply_markup: { inline_keyboard: [[{ text: '📊 الحالة', callback_data: 'status' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
     }
   );
 }
@@ -792,8 +716,7 @@ async function showStopMenu(chatId, env) {
   }
   if (activeRecordings.length === 0) {
     await sendTelegramMessage(env, chatId, '✅ لا توجد تسجيلات نشطة حالياً.', {
-      parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
+      parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
     });
     return;
   }
@@ -821,53 +744,55 @@ async function handleCleanupCommand(chatId, env) {
     '🧹 <b>تم التنظيف!</b>\nتم حذف ' + deletedCount + ' تسجيل منتهي.',
     {
       parse_mode: 'HTML',
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '📊 الحالة', callback_data: 'status' }],
-          [{ text: '🔙 العودة', callback_data: 'back' }]
-        ]
-      }
+      reply_markup: { inline_keyboard: [[{ text: '📊 الحالة', callback_data: 'status' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
     }
   );
 }
 
 async function handleAddWatch(chatId, streamId, env) {
   if (!streamId || !/^\d+$/.test(streamId)) {
-    await sendTelegramMessage(env, chatId, '❌ معرف غير صالح.\nمثال: <code>/addwatch 123456</code>', { parse_mode: 'HTML' });
+    await sendTelegramMessage(env, chatId,
+      '❌ معرف غير صالح. يجب أن يكون رقماً.\nمثال: <code>/addwatch 123456</code>',
+      { parse_mode: 'HTML' }
+    );
     return;
   }
   const key = 'watchlist:' + streamId;
   const existing = await env.SUPERLIVE_STATE.get(key, 'json');
   if (existing) {
-    await sendTelegramMessage(env, chatId, '⚠️ البث <code>' + streamId + '</code> موجود مسبقاً.', { parse_mode: 'HTML' });
+    await sendTelegramMessage(env, chatId,
+      '⚠️ البث <code>' + streamId + '</code> موجود مسبقاً في قائمة المراقبة.',
+      { parse_mode: 'HTML' }
+    );
     return;
   }
   await env.SUPERLIVE_STATE.put(key, JSON.stringify({
     stream_id: streamId, added_at: new Date().toISOString(), display_name: null
   }));
   await sendTelegramMessage(env, chatId,
-    '✅ تم إضافة <code>' + streamId + '</code> إلى قائمة المراقبة.',
+    '✅ تم إضافة <code>' + streamId + '</code> إلى قائمة المراقبة.\nسيتم فحصه تلقائياً كل 3 دقائق.',
     {
       parse_mode: 'HTML',
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '📋 قائمة المراقبة', callback_data: 'watchlist' }],
-          [{ text: '🔙 العودة', callback_data: 'back' }]
-        ]
-      }
+      reply_markup: { inline_keyboard: [[{ text: '📋 قائمة المراقبة', callback_data: 'watchlist' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
     }
   );
 }
 
 async function handleRemoveWatch(chatId, streamId, env) {
   if (!streamId || !/^\d+$/.test(streamId)) {
-    await sendTelegramMessage(env, chatId, '❌ معرف غير صالح.\nمثال: <code>/removewatch 123456</code>', { parse_mode: 'HTML' });
+    await sendTelegramMessage(env, chatId,
+      '❌ معرف غير صالح. يجب أن يكون رقماً.\nمثال: <code>/removewatch 123456</code>',
+      { parse_mode: 'HTML' }
+    );
     return;
   }
   const key = 'watchlist:' + streamId;
   const existing = await env.SUPERLIVE_STATE.get(key, 'json');
   if (!existing) {
-    await sendTelegramMessage(env, chatId, '⚠️ البث <code>' + streamId + '</code> غير موجود في قائمة المراقبة.', { parse_mode: 'HTML' });
+    await sendTelegramMessage(env, chatId,
+      '⚠️ البث <code>' + streamId + '</code> غير موجود في قائمة المراقبة.',
+      { parse_mode: 'HTML' }
+    );
     return;
   }
   await env.SUPERLIVE_STATE.delete(key);
@@ -875,12 +800,7 @@ async function handleRemoveWatch(chatId, streamId, env) {
     '🗑️ تم حذف <code>' + streamId + '</code> من قائمة المراقبة.',
     {
       parse_mode: 'HTML',
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '📋 قائمة المراقبة', callback_data: 'watchlist' }],
-          [{ text: '🔙 العودة', callback_data: 'back' }]
-        ]
-      }
+      reply_markup: { inline_keyboard: [[{ text: '📋 قائمة المراقبة', callback_data: 'watchlist' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
     }
   );
 }
@@ -890,10 +810,7 @@ async function handleWatchlistCommand(chatId, env) {
   if (watchlist.length === 0) {
     await sendTelegramMessage(env, chatId,
       '📋 <b>قائمة المراقبة فارغة</b>\nأضف مستخدمين باستخدام:\n<code>/addwatch 123456</code>',
-      {
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
-      }
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] } }
     );
     return;
   }
@@ -903,14 +820,10 @@ async function handleWatchlistCommand(chatId, env) {
     const name = entry.display_name ? (' → ' + escapeHtml(entry.display_name)) : '';
     message += '• <code>' + displayId + '</code>' + name + '\n';
   }
+  message += '\nأضف: <code>/addwatch 123456</code>\nاحذف: <code>/removewatch 123456</code>';
   await sendTelegramMessage(env, chatId, message, {
     parse_mode: 'HTML',
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: '🔄 تحديث', callback_data: 'watchlist' }],
-        [{ text: '🔙 العودة', callback_data: 'back' }]
-      ]
-    }
+    reply_markup: { inline_keyboard: [[{ text: '🔄 تحديث', callback_data: 'watchlist' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
   });
 }
 
@@ -928,13 +841,13 @@ async function sendHelp(chatId, env) {
   const message = '🤖 <b>دليل الاستخدام</b>\n\n' +
     '<b>🎬 التسجيل:</b>\nأرسل رابط البث مباشرة\n\n' +
     '<b>📋 المراقبة:</b>\n' +
-    '• <code>/addwatch 123456</code>\n' +
-    '• <code>/removewatch 123456</code>\n' +
-    '• <code>/watchlist</code>\n' +
-    '• <code>/testmonitor</code>';
+    '• <code>/addwatch 123456</code> - إضافة\n' +
+    '• <code>/removewatch 123456</code> - حذف\n' +
+    '• <code>/watchlist</code> - عرض القائمة\n' +
+    '• <code>/testmonitor</code> - تشغيل يدوي\n\n' +
+    '<b>⚠️ الحدود:</b>\n• حد أقصى 5 تسجيلات\n• فحص تلقائي كل 3 دقائق';
   await sendTelegramMessage(env, chatId, message, {
-    parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: [[{ text: '🔙 القائمة الرئيسية', callback_data: 'back' }]] }
+    parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 القائمة الرئيسية', callback_data: 'back' }]] }
   });
 }
 
@@ -942,10 +855,7 @@ async function sendMainMenu(chatId, env) {
   await autoCleanup(env);
   const activeCount = await countActiveRecordings(env);
   const watchlist = await getWatchlist(env);
-  const message = '🎬 <b>SuperLive Recorder</b>\n\n' +
-    '<b>مرحباً!</b>\n' +
-    '📊 التسجيلات النشطة: <b>' + activeCount + '/5</b>\n' +
-    '📋 قائمة المراقبة: <b>' + watchlist.length + ' مستخدم</b>';
+  const message = '🎬 <b>SuperLive Recorder</b>\n\n<b>مرحباً!</b>\n📊 التسجيلات النشطة: <b>' + activeCount + '/5</b>\n📋 قائمة المراقبة: <b>' + watchlist.length + ' مستخدم</b>\n\nلبدء التسجيل، أرسل رابط البث أو استخدم الأزرار 👇';
   const buttons = [
     [{ text: '📊 الحالة', callback_data: 'status' }, { text: '🛑 إيقاف', callback_data: 'stop_menu' }],
     [{ text: '📋 قائمة المراقبة', callback_data: 'watchlist' }, { text: '🧪 تشغيل المراقبة', callback_data: 'test_monitor' }],
@@ -980,6 +890,7 @@ async function countActiveRecordings(env) {
     }
     return count;
   } catch (error) {
+    console.error('Error counting:', error);
     return 0;
   }
 }
@@ -988,7 +899,8 @@ function extractStreamUrl(text) {
   const urlRegex = /https?:\/\/[^\s]+/g;
   const urls = text.match(urlRegex);
   if (urls && urls.length > 0) {
-    return urls.find(function(url) { return url.includes('superlivetv.com'); }) || null;
+    const superLiveUrl = urls.find(function(url) { return url.includes('superlivetv.com'); });
+    return superLiveUrl || null;
   }
   return null;
 }
@@ -999,23 +911,23 @@ function extractStreamId(url) {
 }
 
 function getStatusEmoji(status) {
-  const emojis = { 'recording': '🔴', 'finished': '✅', 'failed': '❌', 'stopped': '🛑' };
+  const emojis = {
+    'recording': '🔴', 'finished': '✅', 'failed': '❌',
+    'stopped': '🛑', 'uploading': '📤', 'completed': '🎉'
+  };
   return emojis[status] || '❓';
 }
 
 function getElapsedTime(isoString) {
   const start = new Date(isoString);
   const now = new Date();
-  const diffMins = Math.floor((now - start) / 60000);
+  const diffMs = now - start;
+  const diffMins = Math.floor(diffMs / 60000);
   if (diffMins < 60) return diffMins + 'د';
   const diffHours = Math.floor(diffMins / 60);
   if (diffHours < 24) return diffHours + 'س ' + (diffMins % 60) + 'د';
-  return Math.floor(diffHours / 24) + 'ي ' + (diffHours % 24) + 'س';
-}
-
-function escapeHtml(text) {
-  if (!text) return '';
-  return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const diffDays = Math.floor(diffHours / 24);
+  return diffDays + 'ي ' + (diffHours % 24) + 'س';
 }
 
 async function sendTelegramMessage(env, chatId, text, options) {
@@ -1063,11 +975,12 @@ async function triggerGitHubDispatch(env, eventType, payload) {
   if (!env.GITHUB_REPO) return { success: false, error: 'GITHUB_REPO غير مُعد' };
   if (!env.GITHUB_TOKEN) return { success: false, error: 'GITHUB_TOKEN غير مُعد' };
   if (!env.GITHUB_TOKEN.startsWith('ghp_') && !env.GITHUB_TOKEN.startsWith('github_pat_')) {
-    return { success: false, error: 'GITHUB_TOKEN خاطئ' };
+    return { success: false, error: 'GITHUB_TOKEN خاطئ (يجب أن يبدأ بـ ghp_ أو github_pat_)' };
   }
   try {
     const repo = env.GITHUB_REPO;
     const url = 'https://api.github.com/repos/' + repo + '/dispatches';
+    const requestBody = { event_type: eventType, client_payload: payload };
     const response = await fetch(url, {
       method: 'POST',
       headers: {
@@ -1076,13 +989,15 @@ async function triggerGitHubDispatch(env, eventType, payload) {
         'Content-Type': 'application/json',
         'User-Agent': 'SuperLive-Recorder-Worker'
       },
-      body: JSON.stringify({ event_type: eventType, client_payload: payload })
+      body: JSON.stringify(requestBody)
     });
     if (response.status === 204) return { success: true };
+    const errorText = await response.text();
     let errorMessage = 'GitHub API error: ' + response.status;
     if (response.status === 401) errorMessage = 'فشل المصادقة مع GitHub';
     else if (response.status === 403) errorMessage = 'صلاحيات غير كافية';
     else if (response.status === 404) errorMessage = 'المستودع غير موجود: ' + repo;
+    else if (response.status === 422) errorMessage = 'طلب غير صالح: ' + errorText;
     return { success: false, error: errorMessage };
   } catch (error) {
     return { success: false, error: 'خطأ في الشبكة: ' + error.message };
