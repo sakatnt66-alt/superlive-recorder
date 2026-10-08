@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-SuperLive Discovery Module - Version 9.0 (Hybrid - Best of Both Worlds)
+SuperLive Discovery Module - Version 9.1 (Premium Fix)
 
-Combines:
-- v6.0's successful discovery logic (accepts links without user_id in context)
-- v6.0's Method B (direct profile page)
-- v8.1's username filtering (rejects "Super", "Nom d'utilisateur")
-- v8.1's improved premium detection
-- v8.1's video element validation
+CRITICAL FIXES in v9.1:
+1. Added 'followings', 'followers' to SYSTEM_PAGES_EXACT
+2. Premium detection now ONLY trusts API responses (not DOM text)
+   - Website has "premium" in navigation/footer on EVERY page
+   - Only API response 'is_premium' field is reliable
+3. Username cleaner removes @username from end of names
 """
 
 import asyncio
@@ -35,12 +35,17 @@ class SuperLiveDiscovery:
         "Chrome/131.0.0.0 Safari/537.36"
     )
 
-    # System pages to reject
+    # System pages to reject - FIXED: added followings, followers
     SYSTEM_PAGES_EXACT = {
         "discover", "explore", "trending", "popular", "categories",
         "search", "login", "register", "signup", "signin", "logout",
         "about", "contact", "terms", "privacy", "help", "support",
         "faq", "blog", "news", "home",
+        # ADDED: user-internal pages
+        "followings", "followers", "messages", "notifications",
+        "settings", "favorites", "history", "downloads", "uploads",
+        "wallet", "coins", "recharge", "payment", "subscription",
+        "profile-edit", "edit-profile", "account",
     }
 
     # Bad usernames to filter out
@@ -50,6 +55,7 @@ class SuperLiveDiscovery:
         "membre super", "membre", "member", "user", "guest",
         "live", "offline", "premium", "direct", "en direct",
         "undefined", "null", "none", "video", "stream",
+        "suivis",  # French for "followings"
     }
 
     def __init__(self):
@@ -60,7 +66,7 @@ class SuperLiveDiscovery:
         print(f"[Discovery] {message}", flush=True)
 
     # ============================================================
-    # URL VALIDATOR (from v6.0 - working)
+    # URL VALIDATOR
     # ============================================================
     def _is_valid_profile_url(self, url: str, user_id: str = "") -> bool:
         if not url:
@@ -105,11 +111,17 @@ class SuperLiveDiscovery:
         return False
 
     # ============================================================
-    # USERNAME CLEANER (from v8.1 - improved)
+    # USERNAME CLEANER - FIXED: removes @username from end
     # ============================================================
     def _clean_username(self, raw: str) -> Optional[str]:
         if not raw:
             return None
+
+        # FIXED: Remove @username pattern from end of name
+        # e.g., "Alisa (@alisa_xs)" -> "Alisa"
+        # e.g., "🇲🇦🦌غزلان فرنسي🦌 (@rizlani6479)" -> "🇲🇦🦌غزلان فرنسي🦌"
+        raw = re.sub(r'\s*\(@[a-zA-Z0-9_]+\)\s*$', '', raw)
+        raw = re.sub(r'\s*@[a-zA-Z0-9_]+\s*$', '', raw)
 
         lines = [line.strip() for line in raw.split("\n") if line.strip()]
         if not lines:
@@ -150,6 +162,9 @@ class SuperLiveDiscovery:
         name = valid_lines[0]
         # Remove leading numbers
         name = re.sub(r"^\d{1,3}\s*", "", name)
+        # Remove trailing @username again (just in case)
+        name = re.sub(r'\s*\(@[a-zA-Z0-9_]+\)\s*$', '', name)
+        name = re.sub(r'\s*@[a-zA-Z0-9_]+\s*$', '', name)
         name = name.strip()
 
         # Final validation
@@ -163,7 +178,7 @@ class SuperLiveDiscovery:
         return name
 
     # ============================================================
-    # PHASE 1: IDENTITY RESOLUTION (from v6.0 - working)
+    # PHASE 1: IDENTITY RESOLUTION
     # ============================================================
     async def discover_profile_id(self, user_id: str) -> Optional[Dict[str, Any]]:
         current_time = time.time()
@@ -180,7 +195,7 @@ class SuperLiveDiscovery:
         if not PLAYWRIGHT_AVAILABLE:
             return self._fallback(user_id)
 
-        # Method A: Search page (BEST - from v6.0)
+        # Method A: Search page
         result = await self._method_a_search(user_id)
         if result and result.get("profile_url") and self._is_valid_profile_url(result["profile_url"], user_id):
             if result.get("username"):
@@ -190,7 +205,7 @@ class SuperLiveDiscovery:
             self.log(f"✓ Method A: {result['profile_url']}, username={result.get('username')}")
             return result
 
-        # Method B: Direct profile page (from v6.0 - RESTORED)
+        # Method B: Direct profile page
         result = await self._method_b_direct(user_id)
         if result and result.get("profile_url") and self._is_valid_profile_url(result["profile_url"], user_id):
             if result.get("username"):
@@ -200,7 +215,7 @@ class SuperLiveDiscovery:
             self.log(f"✓ Method B: {result['profile_url']}")
             return result
 
-        # Method C: Livestream page (from v6.0)
+        # Method C: Livestream page
         result = await self._method_c_livestream(user_id)
         if result and result.get("profile_url") and self._is_valid_profile_url(result["profile_url"], user_id):
             if result.get("username"):
@@ -216,7 +231,7 @@ class SuperLiveDiscovery:
         return result
 
     # ============================================================
-    # METHOD A: Search page (from v6.0 - NOT strict)
+    # METHOD A: Search page
     # ============================================================
     async def _method_a_search(self, user_id: str) -> Optional[Dict[str, Any]]:
         try:
@@ -261,7 +276,7 @@ class SuperLiveDiscovery:
                     result["method"] = "method_a_api"
                     return result
 
-                # 2. Try DOM extraction (from v6.0 - accepts links without user_id in context)
+                # 2. Try DOM extraction
                 result = await self._search_dom_for_profile(page, user_id)
                 await browser.close()
                 if result and result.get("profile_url"):
@@ -339,21 +354,21 @@ class SuperLiveDiscovery:
         return None
 
     async def _search_dom_for_profile(self, page, user_id: str) -> Optional[Dict[str, Any]]:
-        """
-        DOM extraction from v6.0 - accepts links even without user_id in context.
-        This is the KEY difference that made v6.0 successful!
-        """
         try:
             js_code = """
             (userId) => {
                 const results = [];
                 const links = document.querySelectorAll('a[href]');
+                const systemSlugs = [
+                    'search','discover','login','register','explore','trending',
+                    'popular','followings','followers','messages','notifications',
+                    'settings','categories','home'
+                ];
                 
                 for (const link of links) {
                     const href = link.getAttribute('href');
                     if (!href) continue;
                     
-                    // Get surrounding context
                     let contextText = '';
                     let node = link;
                     for (let i = 0; i < 5; i++) {
@@ -367,11 +382,10 @@ class SuperLiveDiscovery:
                         }
                     }
                     
-                    // Match profile URLs
                     const profileMatch = href.match(/\\/profile\\/(\\d+)/);
                     const slugMatch = href.match(/\\/fr\\/([a-zA-Z0-9_]+)/);
                     
-                    if (profileMatch || (slugMatch && !['search','discover','login','register','explore','trending'].includes(slugMatch[1]))) {
+                    if (profileMatch || (slugMatch && !systemSlugs.includes(slugMatch[1]))) {
                         const hasUserId = contextText.includes(userId);
                         results.push({
                             href: href,
@@ -382,7 +396,6 @@ class SuperLiveDiscovery:
                     }
                 }
                 
-                // Sort: prefer links with user_id in context, prefer /profile/ links
                 results.sort((a, b) => {
                     if (a.hasUserId !== b.hasUserId) return a.hasUserId ? -1 : 1;
                     if (a.isProfile !== b.isProfile) return a.isProfile ? -1 : 1;
@@ -410,10 +423,10 @@ class SuperLiveDiscovery:
                     profile_id = id_match.group(1)
 
                 username = result.get("text", "").strip()
-                if not username or len(username) < 2 or len(username) > 100:
-                    username = None
-                else:
+                if username:
                     username = self._clean_username(username)
+                    if not username or len(username) < 2 or len(username) > 100:
+                        username = None
 
                 return {
                     "profile_url": href,
@@ -454,7 +467,7 @@ class SuperLiveDiscovery:
         return None
 
     # ============================================================
-    # METHOD B: Direct profile page (from v6.0 - RESTORED)
+    # METHOD B: Direct profile page
     # ============================================================
     async def _method_b_direct(self, user_id: str) -> Optional[Dict[str, Any]]:
         try:
@@ -508,7 +521,7 @@ class SuperLiveDiscovery:
             return None
 
     # ============================================================
-    # METHOD C: Livestream page (from v6.0)
+    # METHOD C: Livestream page
     # ============================================================
     async def _method_c_livestream(self, user_id: str) -> Optional[Dict[str, Any]]:
         try:
@@ -553,7 +566,6 @@ class SuperLiveDiscovery:
                     result["method"] = "method_c"
                     return result
 
-                # If no profile found, the livestream URL itself is valid
                 return {
                     "profile_url": url,
                     "profile_id": user_id,
@@ -577,15 +589,11 @@ class SuperLiveDiscovery:
         }
 
     # ============================================================
-    # PHASE 2: LIVE STATUS DETECTION (from v6.0 - trusts Phase 1)
+    # PHASE 2: LIVE STATUS DETECTION
     # ============================================================
     async def check_live_status(
         self, profile_url: str, user_id: str = "", profile_id: str = ""
     ) -> Optional[Dict[str, Any]]:
-        """
-        Phase 2 from v6.0: trusts Phase 1 URL validation.
-        Does NOT reject pages based on content.
-        """
         self.log(f"Phase 2: Checking live at {profile_url}")
 
         if not PLAYWRIGHT_AVAILABLE:
@@ -636,8 +644,11 @@ class SuperLiveDiscovery:
                 # Check DOM for live indicators
                 dom_result = await self._check_dom_live_status(page)
 
-                # Check for premium (improved from v8.1)
-                is_premium = self._check_premium(page_text, api_result)
+                # FIXED: Premium detection ONLY trusts API, not DOM text
+                # Website has "premium" in navigation/footer on EVERY page
+                is_premium = False
+                if api_result and api_result.get("is_premium"):
+                    is_premium = True
 
                 # Extract username
                 username = None
@@ -680,34 +691,6 @@ class SuperLiveDiscovery:
         except Exception as e:
             self.log(f"check_live_status error: {e}")
             return None
-
-    def _check_premium(self, page_text: str, api_result: Optional[Dict]) -> bool:
-        """Improved premium detection from v8.1"""
-        if api_result and api_result.get("is_premium"):
-            return True
-
-        page_lower = page_text.lower()
-
-        # French and English premium keywords
-        premium_keywords = [
-            # English
-            "premium member", "vip only", "pay to watch",
-            "exclusive content", "buy coins", "unlock stream",
-            "subscribe to watch", "premium stream", "vip stream",
-            # French
-            "membre premium", "contenu exclusif", "acheter des",
-            "abonnez-vous", "stream premium", "flux premium",
-            "prive", "privé", "exclusif", "exclusive",
-            "payant", "abonnement", "coins", "piezas",
-            # Common indicators
-            "premium", "vip",
-        ]
-
-        for keyword in premium_keywords:
-            if keyword in page_lower:
-                return True
-
-        return False
 
     def _check_api_live_status(self, responses: List[Dict], user_id: str) -> Optional[Dict]:
         for resp in responses:
