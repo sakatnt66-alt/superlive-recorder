@@ -21,7 +21,6 @@ API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "20"))
 
 PLAYWRIGHT_CONCURRENCY = int(os.environ.get("PLAYWRIGHT_CONCURRENCY", "2"))
 PLAYWRIGHT_WAIT_MS = int(os.environ.get("PLAYWRIGHT_WAIT_MS", "8000"))
-PLAYWRIGHT_RETRY_WAIT_MS = int(os.environ.get("PLAYWRIGHT_RETRY_WAIT_MS", "4000"))
 PAGE_TIMEOUT_MS = int(os.environ.get("PAGE_TIMEOUT_MS", "30000"))
 PLAYWRIGHT_MAX_USERS_PER_CYCLE = int(os.environ.get("PLAYWRIGHT_MAX_USERS_PER_CYCLE", "12"))
 
@@ -60,10 +59,6 @@ def log_detection(user_id: str, result: Dict[str, Any], source: str) -> None:
     log(f"reason={result.get('reason', 'unknown')}")
     if result.get("display_name"):
         log(f"display_name={result['display_name']}")
-    if result.get("is_live"):
-        log(f"is_live=True")
-    if result.get("is_premium"):
-        log(f"is_premium=True")
 
 def html_escape(text: str) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -241,151 +236,6 @@ async def update_watchlist_name(user_id: str, display_name: str):
     except Exception as e:
         log(f"Name save error for {user_id}: {e}")
 
-# ============================================================
-# SEARCH PAGE STRATEGY
-# ============================================================
-# This is the KEY FIX: we use the search page to:
-# 1. Get the CORRECT username for each user_id
-# 2. Check if the user is LIVE (has a DIRECT button)
-# 3. Navigate to the real broadcast via the DIRECT link
-#
-# This avoids ALL the problems with recommended streams
-# and wrong names on the livestream page.
-
-SEARCH_PAGE_JS = """
-(userId) => {
-    const results = [];
-    // Look for search result containers
-    const cards = document.querySelectorAll(
-        '[class*="result"], [class*="card"], [class*="user"], [class*="profile"], article, .search-result'
-    );
-
-    for (const card of cards) {
-        const text = card.innerText || '';
-        // Check if this card contains our user_id
-        if (!text.includes(userId)) continue;
-
-        // Extract name: look for elements that look like usernames
-        let displayName = '';
-
-        // Strategy 1: Look for specific selectors
-        const nameSelectors = [
-            '[class*="username"]',
-            '[class*="display-name"]',
-            '[class*="name"]',
-            'h1', 'h2', 'h3', 'h4',
-            '.title',
-            'strong', 'b',
-        ];
-
-        for (const sel of nameSelectors) {
-            try {
-                const el = card.querySelector(sel);
-                if (el && el.innerText) {
-                    const candidate = el.innerText.trim();
-                    // Reject if it's just the user_id or too short
-                    if (candidate.length >= 2 &&
-                        candidate.length <= 60 &&
-                        candidate !== userId &&
-                        !candidate.match(/^\\d+$/) &&
-                        !candidate.includes('Rechercher') &&
-                        !candidate.includes('Résultats')
-                    ) {
-                        displayName = candidate;
-                        break;
-                    }
-                }
-            } catch (e) {}
-        }
-
-        // Strategy 2: Look for the line containing the user_id
-        // The format is usually: "Name @handle" near the ID
-        if (!displayName) {
-            const lines = text.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
-            for (const line of lines) {
-                // Skip lines that are just the ID or common labels
-                if (line === userId) continue;
-                if (line.match(/^\\d+$/)) continue;
-                if (line.includes('Rechercher')) continue;
-                if (line.includes('Résultats')) continue;
-                if (line.includes('ProfilePicture')) continue;
-                if (line.startsWith('@')) continue;
-
-                // This might be the name
-                if (line.length >= 2 && line.length <= 60) {
-                    displayName = line;
-                    break;
-                }
-            }
-        }
-
-        // Check for DIRECT button/link
-        let isLive = false;
-        let directLink = '';
-
-        // Look for DIRECT button or link
-        const directSelectors = [
-            'a', 'button', '[role="button"]',
-            '[class*="direct"]', '[class*="live"]', '[class*="badge"]'
-        ];
-
-        for (const sel of directSelectors) {
-            try {
-                const elements = card.querySelectorAll(sel);
-                for (const el of elements) {
-                    const elText = (el.innerText || el.textContent || '').trim().toUpperCase();
-                    if (elText === 'DIRECT' || elText === 'LIVE' || elText === 'EN DIRECT') {
-                        isLive = true;
-                        if (el.tagName === 'A' && el.href) {
-                            directLink = el.href;
-                        }
-                        break;
-                    }
-                }
-                if (isLive) break;
-            } catch (e) {}
-        }
-
-        // Also check the card text for DIRECT/LIVE indicators
-        const upperText = text.toUpperCase();
-        if (!isLive && (upperText.includes('DIRECT') || upperText.includes('EN DIRECT'))) {
-            // Verify it's a status indicator, not just the word in some other context
-            if (upperText.includes('DIRECT') && !upperText.includes('RECHERCHER')) {
-                isLive = true;
-            }
-        }
-
-        // Check for premium indicators
-        let isPremium = false;
-        const premiumIndicators = ['premium', 'payant', 'privé', 'private', 'exclusive'];
-        const lowerText = text.toLowerCase();
-        for (const indicator of premiumIndicators) {
-            if (lowerText.includes(indicator)) {
-                isPremium = true;
-                break;
-            }
-        }
-
-        if (displayName) {
-            results.push({
-                displayName,
-                isLive,
-                isPremium,
-                directLink,
-                cardText: text.substring(0, 300)
-            });
-        }
-    }
-
-    return {
-        found: results.length > 0,
-        results,
-        pageText: (document.body ? document.body.innerText : '').substring(0, 1000),
-        pageTitle: document.title || ''
-    };
-}
-"""
-
 def normalize_display_name(value):
     if value is None:
         return None
@@ -399,43 +249,254 @@ def normalize_display_name(value):
         return None
     if re.search(r"^\d+$", s):
         return None
-    if re.search(r"^\d+[.,\s]?\d*\s*[kKmM]\b", s, re.IGNORECASE):
-        return None
-    if re.search(r"^[0-9.,\s\-+%]+$", s):
-        return None
-    # Must contain at least one letter (Arabic, Latin, emoji)
     if not re.search(r"[\u0600-\u06FFa-zA-Z\U0001F300-\U0001FAFF\u2600-\u27BF]", s):
         return None
     word_count = len(s.split())
-    if word_count > 5:
+    if word_count > 6:
         return None
     lowered = s.lower()
     blocked = {
         "live", "offline", "premium", "superlive", "super live",
         "recording", "unknown", "none", "null", "video", "stream",
-        "views", "viewers", "followers", "fans", "likes",
-        "watching", "subscribe", "follow", "following",
-        "k", "m", "b", "undefined", "super",
-        "membre", "member", "user", "guest",
-        "membre super", "super membre",
-        "direct", "en direct",
+        "direct", "en direct", "super", "membre", "member",
+        "undefined", "search", "rechercher",
     }
     if lowered in blocked:
         return None
-    if "rencontrez" in lowered or "diffusions" in lowered or "regardez" in lowered:
+    if "rencontrez" in lowered or "diffusions" in lowered:
         return None
     if "nouvelles personnes" in lowered:
+        return None
+    if "membre super" in lowered:
         return None
     if "rechercher" in lowered or "résultats" in lowered:
         return None
     return s
 
+# ============================================================
+# SEARCH PAGE — JAVASCRIPT FOR FINDING AND FILLING SEARCH INPUT
+# ============================================================
+FIND_AND_SEARCH_JS = r"""
+(userId) => {
+    // Find ALL input elements on the page
+    const allInputs = Array.from(document.querySelectorAll('input'));
+    let searchInput = null;
+
+    // Strategy 1: Find by placeholder text
+    for (const input of allInputs) {
+        const placeholder = (input.placeholder || '').toLowerCase();
+        if (placeholder.includes('rechercher') ||
+            placeholder.includes('nom') ||
+            placeholder.includes('utilisateur') ||
+            placeholder.includes('search') ||
+            placeholder.includes('id')) {
+            searchInput = input;
+            break;
+        }
+    }
+
+    // Strategy 2: Find by type
+    if (!searchInput) {
+        for (const input of allInputs) {
+            if (input.type === 'search' || input.type === 'text') {
+                searchInput = input;
+                break;
+            }
+        }
+    }
+
+    // Strategy 3: Find any input that's visible or can be made visible
+    if (!searchInput && allInputs.length > 0) {
+        searchInput = allInputs[0];
+    }
+
+    if (!searchInput) {
+        return { success: false, error: 'no_input_found', inputCount: allInputs.length };
+    }
+
+    // Make the input visible if hidden
+    try {
+        searchInput.style.display = 'block';
+        searchInput.style.visibility = 'visible';
+        searchInput.style.opacity = '1';
+        searchInput.style.position = 'relative';
+        searchInput.style.zIndex = '99999';
+
+        // Also show parent elements
+        let parent = searchInput.parentElement;
+        let depth = 0;
+        while (parent && depth < 5) {
+            parent.style.display = 'block';
+            parent.style.visibility = 'visible';
+            parent.style.opacity = '1';
+            parent = parent.parentElement;
+            depth++;
+        }
+    } catch (e) {}
+
+    // Set the value using native setter to trigger React/Vue reactivity
+    try {
+        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value'
+        ).set;
+        nativeInputValueSetter.call(searchInput, userId);
+    } catch (e) {
+        searchInput.value = userId;
+    }
+
+    // Dispatch events to trigger search
+    try {
+        searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+        searchInput.dispatchEvent(new Event('change', { bubbles: true }));
+        searchInput.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
+        }));
+        searchInput.dispatchEvent(new KeyboardEvent('keypress', {
+            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
+        }));
+        searchInput.dispatchEvent(new KeyboardEvent('keyup', {
+            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
+        }));
+    } catch (e) {}
+
+    return {
+        success: true,
+        inputType: searchInput.type,
+        inputPlaceholder: searchInput.placeholder || '',
+        inputValue: searchInput.value
+    };
+}
+"""
+
+EXTRACT_SEARCH_RESULTS_JS = r"""
+(userId) => {
+    const results = [];
+    const bodyText = document.body ? document.body.innerText : '';
+
+    // Check if user_id appears in the page at all
+    if (!bodyText.includes(userId)) {
+        return {
+            found: false,
+            reason: 'user_id_not_in_page',
+            pageTextLength: bodyText.length,
+            pageTitle: document.title || ''
+        };
+    }
+
+    // Strategy 1: Look for result cards/containers
+    const containers = document.querySelectorAll(
+        '[class*="result"], [class*="card"], [class*="user"], [class*="profile"], ' +
+        '[class*="streamer"], [class*="broadcaster"], article, li, [class*="item"]'
+    );
+
+    for (const container of containers) {
+        const text = container.innerText || '';
+        if (!text.includes(userId)) continue;
+
+        // Extract name
+        let displayName = '';
+        const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+
+        for (const line of lines) {
+            if (line === userId) continue;
+            if (/^\d+$/.test(line)) continue;
+            if (line.startsWith('@')) continue;
+            if (line.includes('Rechercher')) continue;
+            if (line.includes('Résultats')) continue;
+            if (line.includes('ProfilePicture')) continue;
+            if (line.toUpperCase() === 'DIRECT') continue;
+            if (line.toUpperCase() === 'LIVE') continue;
+            if (line.toLowerCase().includes('verified')) continue;
+
+            if (line.length >= 2 && line.length <= 50) {
+                displayName = line;
+                break;
+            }
+        }
+
+        // Check for DIRECT/LIVE indicator
+        let isLive = false;
+        const upperText = text.toUpperCase();
+        if (upperText.includes('DIRECT') || upperText.includes('EN DIRECT')) {
+            isLive = true;
+        }
+
+        // Also check for links with DIRECT text
+        const links = container.querySelectorAll('a, button');
+        let directLink = '';
+        for (const link of links) {
+            const linkText = (link.innerText || link.textContent || '').trim().toUpperCase();
+            if (linkText === 'DIRECT' || linkText === 'LIVE' || linkText === 'EN DIRECT') {
+                isLive = true;
+                if (link.tagName === 'A' && link.href) {
+                    directLink = link.href;
+                }
+            }
+        }
+
+        // Check for premium
+        let isPremium = false;
+        const lowerText = text.toLowerCase();
+        if (lowerText.includes('premium') || lowerText.includes('payant') || lowerText.includes('exclusive')) {
+            isPremium = true;
+        }
+
+        if (displayName) {
+            results.push({ displayName, isLive, isPremium, directLink });
+        }
+    }
+
+    // Strategy 2: If no containers found, try to extract from raw text
+    if (results.length === 0 && bodyText.includes(userId)) {
+        const lines = bodyText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+        let displayName = '';
+        let isLive = false;
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (line === userId || line.includes(userId)) {
+                // Look at surrounding lines for the name
+                for (let j = Math.max(0, i - 3); j <= Math.min(lines.length - 1, i + 3); j++) {
+                    const candidate = lines[j];
+                    if (candidate === userId) continue;
+                    if (/^\d+$/.test(candidate)) continue;
+                    if (candidate.startsWith('@')) continue;
+                    if (candidate.includes('Rechercher')) continue;
+                    if (candidate.includes('Résultats')) continue;
+                    if (candidate.includes('ProfilePicture')) continue;
+                    if (candidate.toUpperCase() === 'DIRECT') continue;
+                    if (candidate.toLowerCase().includes('verified')) continue;
+                    if (candidate.length >= 2 && candidate.length <= 50) {
+                        displayName = candidate;
+                        break;
+                    }
+                }
+
+                // Check nearby lines for DIRECT
+                for (let j = Math.max(0, i - 5); j <= Math.min(lines.length - 1, i + 5); j++) {
+                    if (lines[j].toUpperCase().includes('DIRECT')) {
+                        isLive = true;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+
+        if (displayName) {
+            results.push({ displayName, isLive, isPremium: false, directLink: '' });
+        }
+    }
+
+    return {
+        found: results.length > 0,
+        results,
+        pageTitle: document.title || ''
+    };
+}
+"""
 
 async def search_user(context, user_id: str, semaphore: asyncio.Semaphore) -> Dict[str, Any]:
-    """
-    Search for a user on the search page and extract their name + live status.
-    This is the reliable way to get the correct name and live status.
-    """
     async with semaphore:
         page = await context.new_page()
         result = {
@@ -448,79 +509,60 @@ async def search_user(context, user_id: str, semaphore: asyncio.Semaphore) -> Di
         }
 
         try:
-            # Go to search page
-            await page.goto(SEARCH_URL, timeout=PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
-            await page.wait_for_timeout(2000)
+            # Navigate to search page
+            await page.goto(SEARCH_URL, timeout=PAGE_TIMEOUT_MS, wait_until="networkidle")
+            await page.wait_for_timeout(3000)
 
-            # Find the search input and type the user_id
-            search_input = None
-            search_selectors = [
-                'input[type="search"]',
-                'input[type="text"]',
-                'input[placeholder*="Rechercher"]',
-                'input[placeholder*="nom"]',
-                'input[placeholder*="utilisateur"]',
-                'input[placeholder*="ID"]',
-                'input[name="search"]',
-                'input[name="q"]',
-                '#search',
-                '.search-input',
-            ]
+            # Use JavaScript to find and fill the search input
+            # This bypasses the "element is not visible" error
+            fill_result = await page.evaluate(FIND_AND_SEARCH_JS, user_id)
 
-            for sel in search_selectors:
-                try:
-                    el = await page.query_selector(sel)
-                    if el:
-                        search_input = el
-                        break
-                except Exception:
-                    continue
+            if not fill_result.get("success"):
+                # Try alternative: direct URL with query param
+                alt_url = f"{SEARCH_URL}?q={user_id}"
+                await page.goto(alt_url, timeout=PAGE_TIMEOUT_MS, wait_until="networkidle")
+                await page.wait_for_timeout(3000)
 
-            if not search_input:
-                # Try to find ANY visible text input
-                try:
-                    inputs = await page.query_selector_all('input[type="text"], input[type="search"]')
-                    for inp in inputs:
-                        if await inp.is_visible():
-                            search_input = inp
-                            break
-                except Exception:
-                    pass
+                # Try again
+                fill_result = await page.evaluate(FIND_AND_SEARCH_JS, user_id)
+                if not fill_result.get("success"):
+                    # Try another URL format
+                    alt_url2 = f"{SEARCH_URL}?search={user_id}"
+                    await page.goto(alt_url2, timeout=PAGE_TIMEOUT_MS, wait_until="networkidle")
+                    await page.wait_for_timeout(3000)
+                    fill_result = await page.evaluate(FIND_AND_SEARCH_JS, user_id)
 
-            if not search_input:
-                result["error"] = "search_input_not_found"
+            if not fill_result.get("success"):
+                result["error"] = f"cannot_fill_search: {fill_result.get('error', 'unknown')}"
                 await page.close()
                 return result
 
-            # Type the user_id and press Enter
-            await search_input.click()
-            await search_input.fill("")
-            await search_input.type(user_id, delay=50)
-            await page.wait_for_timeout(500)
-            await page.keyboard.press("Enter")
+            log(f"Search input filled for {user_id}: "
+                f"type={fill_result.get('inputType')}, "
+                f"placeholder={fill_result.get('inputPlaceholder', '')[:30]}")
 
-            # Wait for results to load
+            # Wait for search results to load
             await page.wait_for_timeout(PLAYWRIGHT_WAIT_MS)
 
-            # Extract results
+            # Also press Enter via keyboard as backup
             try:
-                search_result = await page.evaluate(SEARCH_PAGE_JS, user_id)
-            except Exception as e:
-                result["error"] = f"evaluate_error: {str(e)[:100]}"
-                await page.close()
-                return result
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(3000)
+            except Exception:
+                pass
+
+            # Extract results
+            search_result = await page.evaluate(EXTRACT_SEARCH_RESULTS_JS, user_id)
 
             if search_result.get("found") and search_result.get("results"):
-                # Take the first matching result
                 first_result = search_result["results"][0]
                 raw_name = first_result.get("displayName", "")
                 normalized = normalize_display_name(raw_name)
+
                 if normalized:
                     result["display_name"] = normalized
-                else:
-                    # Keep raw name if normalization fails but it looks valid
-                    if raw_name and len(raw_name) >= 2 and len(raw_name) <= 50:
-                        result["display_name"] = raw_name
+                elif raw_name and len(raw_name) >= 2:
+                    result["display_name"] = raw_name
 
                 result["is_live"] = bool(first_result.get("isLive", False))
                 result["is_premium"] = bool(first_result.get("isPremium", False))
@@ -531,13 +573,9 @@ async def search_user(context, user_id: str, semaphore: asyncio.Semaphore) -> Di
                     f"is_live={result['is_live']}, "
                     f"is_premium={result['is_premium']}")
             else:
-                # User not found in search results
-                log(f"Search: user {user_id} not found in results")
-                page_text = search_result.get("pageText", "")
-                if user_id not in page_text:
-                    result["error"] = "user_not_found_in_page"
-                else:
-                    result["error"] = "no_name_extracted"
+                reason = search_result.get("reason", "no_results")
+                result["error"] = f"search_no_results: {reason}"
+                log(f"Search: no results for {user_id} ({reason})")
 
         except Exception as e:
             result["error"] = str(e)[:200]
@@ -547,167 +585,15 @@ async def search_user(context, user_id: str, semaphore: asyncio.Semaphore) -> Di
         return result
 
 
-async def verify_live_on_stream_page(page, user_id: str) -> Dict[str, Any]:
-    """
-    After navigating to the livestream page (via DIRECT link),
-    verify that the video is actually playing and belongs to this user.
-    """
-    result = {
-        "has_active_video": False,
-        "video_belongs_to_user": False,
-        "is_premium": False,
-        "error": None,
-    }
-
-    VERIFY_JS = r"""
-    (userId) => {
-        const videos = Array.from(document.querySelectorAll('video'));
-        let srcObjectCount = 0;
-        let belongsToUser = false;
-        let isPremium = false;
-        let mainVideoActive = false;
-
-        const domContainsTargetId = (element) => {
-            if (!userId || !element) return false;
-            let node = element;
-            let depth = 0;
-            while (node && depth < 8) {
-                try {
-                    const values = [
-                        node.id,
-                        node.className,
-                        node.getAttribute && node.getAttribute("data-stream-id"),
-                        node.getAttribute && node.getAttribute("data-id"),
-                        node.getAttribute && node.getAttribute("data-livestream-id"),
-                        node.getAttribute && node.getAttribute("data-channel-id"),
-                        node.getAttribute && node.getAttribute("data-video-id"),
-                        node.getAttribute && node.getAttribute("href"),
-                    ];
-                    if (values.some(value => value != null && String(value).includes(userId))) {
-                        return true;
-                    }
-                    if (node.querySelector) {
-                        const descendants = node.querySelectorAll(
-                            '[href], [data-stream-id], [data-livestream-id], [data-video-id]'
-                        );
-                        for (const descendant of descendants) {
-                            const descendantValues = [
-                                descendant.getAttribute && descendant.getAttribute("href"),
-                                descendant.getAttribute && descendant.getAttribute("data-stream-id"),
-                                descendant.getAttribute && descendant.getAttribute("data-livestream-id"),
-                                descendant.getAttribute && descendant.getAttribute("data-video-id"),
-                            ];
-                            if (descendantValues.some(value => value != null && String(value).includes(userId))) {
-                                return true;
-                            }
-                        }
-                    }
-                } catch (e) {}
-                node = node.parentElement;
-                depth++;
-            }
-            return false;
-        };
-
-        // Find the main (largest) video
-        let mainVideo = null;
-        let mainVideoArea = 0;
-        for (const video of videos) {
-            const rect = video.getBoundingClientRect();
-            const area = rect.width * rect.height;
-            if (area > mainVideoArea) {
-                mainVideoArea = area;
-                mainVideo = video;
-            }
-        }
-        if (!mainVideo && videos.length > 0) {
-            mainVideo = videos[0];
-        }
-
-        for (const video of videos) {
-            if (video.srcObject) {
-                srcObjectCount++;
-            }
-            const rect = video.getBoundingClientRect();
-            const visible = rect.width > 50 && rect.height > 50;
-            if (video.srcObject && video.readyState >= 2 && visible) {
-                if (domContainsTargetId(video)) {
-                    belongsToUser = true;
-                }
-            }
-        }
-
-        if (mainVideo) {
-            const mainHasSrcObject = !!mainVideo.srcObject;
-            const mainRect = mainVideo.getBoundingClientRect();
-            const mainIsVisible = mainRect.width > 100 && mainRect.height > 100;
-            const mainIsReady = mainVideo.readyState >= 2;
-            const mainBelongs = domContainsTargetId(mainVideo);
-
-            if (mainHasSrcObject && mainIsVisible && mainIsReady && mainBelongs) {
-                mainVideoActive = true;
-            }
-        }
-
-        // Check for premium indicators on the page
-        try {
-            const bodyText = (document.body ? document.body.innerText : '').toLowerCase();
-            if (bodyText.includes('premium') || bodyText.includes('payant') || bodyText.includes('exclusive')) {
-                // Only count if it's near the video area
-                if (mainVideo) {
-                    let container = mainVideo.parentElement;
-                    let depth = 0;
-                    while (container && depth < 5) {
-                        const containerText = (container.innerText || '').toLowerCase();
-                        if (containerText.includes('premium') || containerText.includes('payant')) {
-                            isPremium = true;
-                            break;
-                        }
-                        container = container.parentElement;
-                        depth++;
-                    }
-                }
-            }
-        } catch (e) {}
-
-        return {
-            videoCount: videos.length,
-            srcObjectCount,
-            belongsToUser,
-            mainVideoActive,
-            isPremium
-        };
-    }
-    """
-
-    try:
-        await page.wait_for_timeout(3000)
-        verify_result = await page.evaluate(VERIFY_JS, user_id)
-
-        result["has_active_video"] = bool(verify_result.get("mainVideoActive", False))
-        result["video_belongs_to_user"] = bool(verify_result.get("belongsToUser", False))
-        result["is_premium"] = bool(verify_result.get("isPremium", False))
-
-    except Exception as e:
-        result["error"] = str(e)[:200]
-
-    return result
-
-
 async def classify_user_via_search(context, user_id: str, semaphore: asyncio.Semaphore) -> Dict[str, Any]:
-    """
-    New strategy: use search page to get name + live status,
-    then verify on the stream page if needed.
-    """
-    # Step 1: Search for the user
     search_result = await search_user(context, user_id, semaphore)
 
     if search_result.get("error"):
         return {
             "status": UNKNOWN,
-            "reason": f"search_error:{search_result['error']}",
+            "reason": f"search_error:{search_result['error'][:80]}",
             "stream_url": BASE_LIVE_URL.format(user_id=user_id),
-            "display_name": None,
+            "display_name": search_result.get("display_name"),
             "video_info": {},
         }
 
@@ -715,86 +601,32 @@ async def classify_user_via_search(context, user_id: str, semaphore: asyncio.Sem
     is_live = search_result.get("is_live", False)
     is_premium = search_result.get("is_premium", False)
 
-    # Step 2: Determine status based on search results
     if not is_live:
-        # User is not broadcasting
         return {
             "status": OFFLINE,
             "reason": "search:no_direct_button",
             "stream_url": BASE_LIVE_URL.format(user_id=user_id),
             "display_name": display_name,
-            "video_info": {
-                "search_live": False,
-                "search_premium": is_premium,
-            },
+            "video_info": {},
         }
 
     if is_premium:
-        # User is broadcasting but it's premium
         return {
             "status": LIVE_PREMIUM,
             "reason": "search:premium_detected",
             "stream_url": BASE_LIVE_URL.format(user_id=user_id),
             "display_name": display_name,
-            "video_info": {
-                "search_live": True,
-                "search_premium": True,
-            },
+            "video_info": {},
         }
 
-    # Step 3: User is live and not premium — verify on stream page
-    # Open the livestream page to verify the video
-    verify_page = await context.new_page()
-    try:
-        stream_url = BASE_LIVE_URL.format(user_id=user_id)
-
-        # Navigate to the stream page
-        if search_result.get("direct_link"):
-            await verify_page.goto(search_result["direct_link"], timeout=PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
-        else:
-            await verify_page.goto(stream_url, timeout=PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
-
-        # Verify the video is actually playing
-        verify_result = await verify_live_on_stream_page(verify_page, user_id)
-
-        await verify_page.close()
-
-        if verify_result.get("has_active_video") and verify_result.get("video_belongs_to_user"):
-            if verify_result.get("is_premium"):
-                return {
-                    "status": LIVE_PREMIUM,
-                    "reason": "verified:premium_on_stream_page",
-                    "stream_url": stream_url,
-                    "display_name": display_name,
-                    "video_info": verify_result,
-                }
-            return {
-                "status": LIVE_NORMAL,
-                "reason": "verified:video_active_and_belongs",
-                "stream_url": stream_url,
-                "display_name": display_name,
-                "video_info": verify_result,
-            }
-        else:
-            # Search said live but verification failed — trust verification
-            return {
-                "status": OFFLINE,
-                "reason": "verified:no_active_video",
-                "stream_url": stream_url,
-                "display_name": display_name,
-                "video_info": verify_result,
-            }
-
-    except Exception as e:
-        await verify_page.close()
-        # If stream page fails but search said live, trust search
-        return {
-            "status": LIVE_NORMAL if is_live else UNKNOWN,
-            "reason": f"stream_page_error:{str(e)[:100]}",
-            "stream_url": BASE_LIVE_URL.format(user_id=user_id),
-            "display_name": display_name,
-            "video_info": {"error": str(e)[:100]},
-        }
+    # User is live and not premium
+    return {
+        "status": LIVE_NORMAL,
+        "reason": "search:direct_button_found",
+        "stream_url": BASE_LIVE_URL.format(user_id=user_id),
+        "display_name": display_name,
+        "video_info": {"search_live": True},
+    }
 
 
 async def classify_many_users(user_ids: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -804,7 +636,7 @@ async def classify_many_users(user_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        log("Playwright is not installed. Skipping browser detection.")
+        log("Playwright is not installed.")
         for user_id in user_ids:
             results[user_id] = {
                 "status": UNKNOWN, "reason": "playwright_not_installed",
@@ -816,7 +648,8 @@ async def classify_many_users(user_ids: List[str]) -> Dict[str, Dict[str, Any]]:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=[
                 "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
+                "--disable-background-timer-throttling",
+                "--disable-renderer-backgrounding",
             ])
             context = await browser.new_context(
                 user_agent=USER_AGENT,
@@ -826,15 +659,15 @@ async def classify_many_users(user_ids: List[str]) -> Dict[str, Dict[str, Any]]:
             semaphore = asyncio.Semaphore(PLAYWRIGHT_CONCURRENCY)
             tasks = [classify_user_via_search(context, uid, semaphore) for uid in user_ids]
             gathered = await asyncio.gather(*tasks, return_exceptions=True)
-            for user_id, result in zip(user_ids, gathered):
-                if isinstance(result, Exception):
+            for user_id, res in zip(user_ids, gathered):
+                if isinstance(res, Exception):
                     results[user_id] = {
-                        "status": UNKNOWN, "reason": str(result)[:120],
+                        "status": UNKNOWN, "reason": str(res)[:120],
                         "stream_url": BASE_LIVE_URL.format(user_id=user_id),
                         "display_name": None,
                     }
                 else:
-                    results[user_id] = result
+                    results[user_id] = res
             await context.close()
             await browser.close()
     except Exception as e:
@@ -882,7 +715,7 @@ async def async_main() -> int:
         stats["total_watchlist"] = len(watchlist)
 
         if not watchlist:
-            log("Watchlist is empty. Nothing to do.")
+            log("Watchlist is empty.")
             log("Monitor completed")
             return 0
 
