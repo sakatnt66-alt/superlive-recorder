@@ -9,21 +9,6 @@
       "source": "auto"
     },
     {
-      "stream_id": "12259737",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
-    },
-    {
-      "stream_id": "12259737",
-      "stream_url": "https://superlivetv.com/fr/profile/53312122?isFromSearch=true",
-      "stream_name": "دلع 🔥البنات🔥 سارة🥂 و",
-      "status": "recording",
-      "started_at": "2026-10-08T21:25:27.385Z",
-      "source": "auto",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
-    },
-    {
       "stream_id": "21421785",
       "stream_url": "https://superlivetv.com/fr/profile/19868298?isFromSearch=true",
       "stream_name": "نجلاء💎🎀",
