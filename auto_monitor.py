@@ -1,12 +1,30 @@
+"""
+auto_monitor.py - Auto Monitoring System with Discovery Layer
+دمج SuperLiveDiscovery لاكتشاف الـ Profile والبث الصحيح بدقة عالية
+
+Architecture:
+  Phase 1: Discovery (user_id → profile_id)
+  Phase 2: Live Status Check (profile_id → stream info)
+  Phase 3: Stream Validation (user_id + profile_id verification)
+  Phase 4: Trigger Recording (if validation passed)
+"""
+
 import asyncio
 import json
 import os
-import re
 import sys
 import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
+
+# Import the Discovery Layer
+try:
+    from superlive_discovery import SuperLiveDiscovery
+    DISCOVERY_AVAILABLE = True
+except ImportError as e:
+    print(f"[FATAL] superlive_discovery.py not found: {e}")
+    DISCOVERY_AVAILABLE = False
 
 WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
 AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "")
@@ -14,16 +32,16 @@ AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SEND_REPORT = os.environ.get("SEND_REPORT", "1") not in ("0", "false", "False")
-# CRITICAL: Disabled by default to save KV writes (free plan: 1000 writes/day)
+# Disabled by default to save KV writes (free plan: 1000 writes/day)
 UPDATE_WATCHLIST_NAMES = os.environ.get("UPDATE_WATCHLIST_NAMES", "0") not in ("0", "false", "False")
 
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "5"))
 API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "20"))
 
-PLAYWRIGHT_CONCURRENCY = int(os.environ.get("PLAYWRIGHT_CONCURRENCY", "2"))
-PAGE_WAIT_MS = int(os.environ.get("PAGE_WAIT_MS", "10000"))
-PAGE_TIMEOUT_MS = int(os.environ.get("PAGE_TIMEOUT_MS", "30000"))
-PLAYWRIGHT_MAX_USERS_PER_CYCLE = int(os.environ.get("PLAYWRIGHT_MAX_USERS_PER_CYCLE", "12"))
+# Discovery settings
+DISCOVERY_CONCURRENCY = int(os.environ.get("DISCOVERY_CONCURRENCY", "2"))
+DISCOVERY_MAX_USERS_PER_CYCLE = int(os.environ.get("DISCOVERY_MAX_USERS_PER_CYCLE", "12"))
+VALIDATION_MIN_CHECKS = int(os.environ.get("VALIDATION_MIN_CHECKS", "2"))
 
 BASE_LIVE_URL = "https://superlivetv.com/fr/livestream/{user_id}"
 
@@ -37,39 +55,53 @@ LIVE_NORMAL = "LIVE_NORMAL"
 LIVE_PREMIUM = "LIVE_PREMIUM"
 OFFLINE = "OFFLINE"
 UNKNOWN = "UNKNOWN"
+DISCOVERY_FAILED = "DISCOVERY_FAILED"
+VALIDATION_FAILED = "VALIDATION_FAILED"
 
 
 def log(message: str) -> None:
     print(f"[AUTO] {message}", flush=True)
 
 
-def log_detection(user_id: str, result: Dict[str, Any], source: str) -> None:
-    status = result.get("status", UNKNOWN)
-    if status == LIVE_PREMIUM:
-        action = "SKIP_PREMIUM"
-    elif status == OFFLINE:
-        action = "SKIP_OFFLINE"
-    elif status == LIVE_NORMAL:
-        action = "CANDIDATE"
-    else:
-        action = "SKIP_UNCERTAIN"
-
+def log_discovery(user_id: str, result: Dict[str, Any]) -> None:
+    """Log detailed discovery results"""
     log(f"username={user_id}")
-    log(f"source={source}")
+    log(f"source=discovery_layer")
+
+    profile_id = result.get('profile_id')
+    if profile_id:
+        log(f"profile_id={profile_id}")
+
+    username = result.get('username')
+    if username:
+        log(f"username_discovered={username}")
+
+    phase = result.get('phase', 'unknown')
+    log(f"phase={phase}")
+
+    status = result.get('status', UNKNOWN)
     log(f"status={status}")
+
+    action = result.get('action', 'SKIP')
     log(f"action={action}")
-    log(f"reason={result.get('reason', 'unknown')}")
-    if result.get("display_name"):
-        log(f"display_name={result['display_name']}")
-    vi = result.get("video_info") or {}
-    if vi:
+
+    reason = result.get('reason', 'unknown')
+    log(f"reason={reason}")
+
+    validation = result.get('validation', {})
+    if validation:
         log(
-            f"video_state="
-            f"sameTargetDom={vi.get('sameTargetDom', False)},"
-            f"candidates={vi.get('candidates_count', 0)},"
-            f"premium={vi.get('premium', False)},"
-            f"visibleArea={vi.get('visibleArea', 0)}"
+            f"validation="
+            f"passed={validation.get('validation_passed', False)},"
+            f"checks={validation.get('checks_passed', 0)}/{validation.get('total_checks', 0)},"
+            f"metadata_match={validation.get('metadata_match', False)},"
+            f"dom_user={validation.get('dom_has_user_id', False)},"
+            f"dom_profile={validation.get('dom_has_profile_id', False)}"
         )
+
+    stream_url = result.get('stream_url')
+    if stream_url:
+        log(f"stream_url={stream_url}")
 
 
 def html_escape(text: str) -> str:
@@ -134,23 +166,34 @@ def build_report(elapsed_seconds: float, stats: Dict[str, Any]) -> str:
     lines.append(f"• قيد التسجيل مسبقاً: {stats['already_recording']}")
     lines.append(f"• تم فحصه الآن: {stats['checked_now']}")
     lines.append("")
-    lines.append("📈 نتائج الفحص:")
+    lines.append("📈 نتائج الفحص (عبر Discovery Layer):")
     lines.append(f"• 🟢 بث عادي: {stats['live_normal']}")
     lines.append(f"• 🟡 بث مدفوع (تم التجاهل): {stats['live_premium']}")
     lines.append(f"• ⚪ غير متصل: {stats['offline']}")
+    if stats.get("discovery_failed", 0) > 0:
+        lines.append(f"• ⚠️ فشل الاكتشاف: {stats['discovery_failed']}")
+    if stats.get("validation_failed", 0) > 0:
+        lines.append(f"• ❌ فشل التحقق: {stats['validation_failed']}")
     if stats.get("unknown", 0) > 0:
         lines.append(f"• ❓ غير مؤكد: {stats['unknown']}")
+
     names = stats.get("names", {})
+    profile_map = stats.get("profile_map", {})
     if names:
         lines.append("")
-        lines.append("👤 الأسماء:")
+        lines.append("👤 الأسماء والمعرفات:")
         for user_id, display_name in names.items():
-            lines.append(f"• {user_id} → {html_escape(display_name)}")
+            profile_id = profile_map.get(user_id, "N/A")
+            lines.append(f"• {user_id} [P:{profile_id}] → {html_escape(display_name)}")
+
     lines.append("")
     lines.append(f"🔴 تم تشغيل {stats['started_recordings']} تسجيل(ات) جديد(ة).")
     return "\n".join(lines)
 
 
+# ============================================================
+# WORKER API CLIENT
+# ============================================================
 def api_request_sync(path: str, method: str = "GET", payload: Optional[dict] = None):
     url = f"{WORKER_URL}{path}"
     headers = {
@@ -230,12 +273,21 @@ async def load_active_recordings() -> Dict[str, Any]:
 
 
 async def trigger_auto_recording(
-    user_id: str, stream_url: str, stream_name: str = ""
+    user_id: str,
+    stream_url: str,
+    stream_name: str = "",
+    profile_id: str = "",
 ):
+    """
+    Trigger the recording workflow with extended payload.
+    Now includes profile_id for proper tracking.
+    """
     payload = {
         "stream_url": stream_url,
         "source": "auto",
         "stream_name": stream_name,
+        "profile_id": profile_id,
+        "user_id": user_id,
     }
     status, data = await api_request(
         f"/api/auto-trigger/{user_id}", "POST", payload
@@ -264,560 +316,266 @@ async def update_watchlist_name(user_id: str, display_name: str):
         log(f"Name save error for {user_id}: {e}")
 
 
-def normalize_display_name(value):
-    if value is None:
-        return None
-    s = str(value).strip()
-    s = s.replace("&amp;", "&")
-    s = re.sub(r"<[^>]+>", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    if len(s) < 2 or len(s) > 50:
-        return None
-    if s.isdigit():
-        return None
-    if re.search(r"^\d+$", s):
-        return None
-    if re.search(r"\d+[.,\s]?\d*\s*[kKmM]\b", s, re.IGNORECASE):
-        return None
-    if re.search(r"^[0-9.,\s\-+%]+$", s):
-        return None
-    if not re.search(
-        r"[\u0600-\u06FFa-zA-Z\U0001F300-\U0001FAFF\u2600-\u27BF]", s
-    ):
-        return None
-    word_count = len(s.split())
-    if word_count > 5:
-        return None
-    lowered = s.lower()
-    blocked = {
-        "live", "offline", "premium", "superlive", "super live",
-        "recording", "unknown", "none", "null", "video", "stream",
-        "views", "viewers", "followers", "fans", "likes",
-        "watching", "subscribe", "follow", "following",
-        "k", "m", "b", "undefined", "super",
-        "membre", "member", "user", "guest",
-        "membre super", "super membre",
-        "direct", "en direct",
-    }
-    if lowered in blocked:
-        return None
-    if "rencontrez" in lowered or "diffusions" in lowered or "regardez" in lowered:
-        return None
-    if "nouvelles personnes" in lowered:
-        return None
-    if "rechercher" in lowered or "résultats" in lowered:
-        return None
-    if "membre superlive" in lowered:
-        return None
-    return s
-
-
-def check_json_for_premium(json_bodies: List[str], user_id: str) -> bool:
-    for body in json_bodies:
-        if user_id not in body:
-            continue
-        if re.search(
-            r'"(?:isPremium|is_premium|premium)"\s*:\s*true', body, re.IGNORECASE
-        ):
-            return True
-        if re.search(
-            r'"(?:type|access|streamType|accessType|mode)"\s*:\s*"?premium',
-            body,
-            re.IGNORECASE,
-        ):
-            return True
-        if re.search(r'"(?:isPaywall|paywall)"\s*:\s*true', body, re.IGNORECASE):
-            return True
-        try:
-            obj = json.loads(body)
-            if _check_obj_for_premium(obj, user_id):
-                return True
-        except Exception:
-            pass
-    return False
-
-
-def _check_obj_for_premium(obj, user_id, depth=0):
-    if depth > 6:
-        return False
-    if isinstance(obj, dict):
-        is_user_obj = False
-        for key, value in obj.items():
-            if isinstance(value, (str, int, float)) and str(value) == str(user_id):
-                is_user_obj = True
-                break
-        for key, value in obj.items():
-            key_lower = str(key).lower()
-            if key_lower in (
-                "ispremium", "is_premium", "premium", "ispaywall", "paywall",
-            ):
-                if value is True or str(value).lower() == "true":
-                    return True
-            if key_lower in ("type", "access", "streamtype", "accesstype", "mode"):
-                if str(value).lower() in (
-                    "premium", "paid", "private", "paywall", "subscription",
-                ):
-                    return True
-            if key_lower in ("locked", "isprivate", "is_private", "private"):
-                if (value is True or str(value).lower() == "true") and is_user_obj:
-                    return True
-        for value in obj.values():
-            if _check_obj_for_premium(value, user_id, depth + 1):
-                return True
-    elif isinstance(obj, list):
-        for item in obj[:50]:
-            if _check_obj_for_premium(item, user_id, depth + 1):
-                return True
-    return False
-
-
-def extract_name_from_json(json_bodies: List[str], user_id: str) -> Optional[str]:
-    for body in json_bodies:
-        if user_id not in body:
-            continue
-        try:
-            obj = json.loads(body)
-            name = _find_username_in_obj(obj, user_id, depth=0)
-            if name:
-                normalized = normalize_display_name(name)
-                if normalized:
-                    return normalized
-        except Exception:
-            continue
-    return None
-
-
-def _find_username_in_obj(obj, user_id, depth=0):
-    if depth > 8:
-        return None
-    if isinstance(obj, dict):
-        has_user_id = False
-        for key, value in obj.items():
-            if isinstance(value, (str, int, float)) and str(value) == str(user_id):
-                key_lower = str(key).lower()
-                if any(
-                    token in key_lower
-                    for token in ("id", "user", "stream", "channel", "broadcaster")
-                ):
-                    has_user_id = True
-                    break
-        if has_user_id:
-            for key in (
-                "username", "nickname", "display_name", "name",
-                "streamer_name", "broadcaster_name", "user_name",
-            ):
-                if key in obj:
-                    val = obj[key]
-                    if isinstance(val, str) and val.strip():
-                        return val.strip()
-        for value in obj.values():
-            result = _find_username_in_obj(value, user_id, depth + 1)
-            if result:
-                return result
-    elif isinstance(obj, list):
-        for item in obj[:100]:
-            result = _find_username_in_obj(item, user_id, depth + 1)
-            if result:
-                return result
-    return None
-
-
-def classify_final(video_info: Dict[str, Any], json_bodies: List[str], user_id: str) -> str:
-    same_target_dom = bool(video_info.get("sameTargetDom", False))
-    premium = bool(video_info.get("premium", False))
-    stream_ended = bool(video_info.get("streamEnded", False))
-    candidates_count = int(video_info.get("candidates_count", 0))
-
-    premium_from_json = check_json_for_premium(json_bodies, user_id)
-    is_premium = premium or premium_from_json
-
-    if stream_ended and not same_target_dom:
-        return OFFLINE
-
-    if same_target_dom:
-        if is_premium:
-            return LIVE_PREMIUM
-        return LIVE_NORMAL
-
-    if candidates_count > 0 and not same_target_dom:
-        return OFFLINE
-
-    if not same_target_dom and not stream_ended:
-        return OFFLINE
-
-    return UNKNOWN
-
-
-PAGE_CHECK_JS = r"""
-(userId) => {
-    const result = {
-        found: false,
-        sameTargetDom: false,
-        premium: false,
-        candidates_count: 0,
-        visibleArea: 0,
-        displayName: null,
-        streamEnded: false,
-        error: null,
-    };
-
-    try {
-        const videos = Array.from(document.querySelectorAll("video"));
-        const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
-        const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
-        const targetId = userId ? String(userId) : null;
-
-        const bodyText = document.body ? document.body.innerText : '';
-        if (
-            bodyText.includes("Le direct s'est termin") ||
-            bodyText.includes("Stream ended") ||
-            bodyText.includes("diffusion est terminée")
-        ) {
-            result.streamEnded = true;
-        }
-
-        try {
-            const premiumSections = document.querySelectorAll(
-                '[class*="premium"], [class*="paywall"], [class*="lock"], [class*="subscribe"], [class*="unlock"]'
-            );
-            if (premiumSections.length > 0) {
-                result.premium = true;
-            }
-        } catch (e) {}
-
-        const domContainsTargetId = (element) => {
-            if (!targetId || !element) return false;
-            let node = element;
-            let depth = 0;
-            while (node && depth < 8) {
-                try {
-                    const values = [
-                        node.id,
-                        node.className,
-                        node.getAttribute && node.getAttribute("data-stream-id"),
-                        node.getAttribute && node.getAttribute("data-id"),
-                        node.getAttribute && node.getAttribute("data-livestream-id"),
-                        node.getAttribute && node.getAttribute("data-channel-id"),
-                        node.getAttribute && node.getAttribute("data-video-id"),
-                        node.getAttribute && node.getAttribute("href"),
-                    ];
-                    if (values.some(value => value != null && String(value).includes(targetId))) {
-                        return true;
-                    }
-                    if (node.querySelector) {
-                        const descendants = node.querySelectorAll(
-                            '[href], [data-stream-id], [data-livestream-id], [data-video-id]'
-                        );
-                        for (const descendant of descendants) {
-                            const descendantValues = [
-                                descendant.getAttribute && descendant.getAttribute("href"),
-                                descendant.getAttribute && descendant.getAttribute("data-stream-id"),
-                                descendant.getAttribute && descendant.getAttribute("data-livestream-id"),
-                                descendant.getAttribute && descendant.getAttribute("data-video-id"),
-                            ];
-                            if (descendantValues.some(value => value != null && String(value).includes(targetId))) {
-                                return true;
-                            }
-                        }
-                    }
-                } catch (e) {}
-                node = node.parentElement;
-                depth++;
-            }
-            return false;
-        };
-
-        const candidates = [];
-        for (let index = 0; index < videos.length; index++) {
-            const video = videos[index];
-            try {
-                const stream = video.srcObject;
-                if (!stream) continue;
-
-                const videoTrack = stream.getVideoTracks().find(t => t.readyState === "live");
-                if (!videoTrack) continue;
-                if (video.videoWidth <= 0 || video.videoHeight <= 0) continue;
-                if (video.readyState < 2) continue;
-
-                const style = getComputedStyle(video);
-                if (
-                    style.display === "none" ||
-                    style.visibility === "hidden" ||
-                    style.opacity === "0"
-                ) {
-                    continue;
-                }
-
-                const rect = video.getBoundingClientRect();
-                const left = Math.max(0, rect.left);
-                const top = Math.max(0, rect.top);
-                const right = Math.min(viewportWidth, rect.right);
-                const bottom = Math.min(viewportHeight, rect.bottom);
-                const visibleWidth = Math.max(0, right - left);
-                const visibleHeight = Math.max(0, bottom - top);
-                const visibleArea = visibleWidth * visibleHeight;
-                const layoutArea = Math.max(0, rect.width) * Math.max(0, rect.height);
-
-                const sameTargetDom = domContainsTargetId(video);
-
-                let identityScore = 0;
-                if (sameTargetDom) identityScore += 1000000;
-
-                const score = identityScore
-                    + Math.min(visibleArea, 1000000) / 100
-                    + Math.min(layoutArea, 1000000) / 10000;
-
-                candidates.push({
-                    index,
-                    video,
-                    videoTrack,
-                    rect,
-                    visibleArea,
-                    layoutArea,
-                    sameTargetDom,
-                    score,
-                });
-            } catch (e) {}
-        }
-
-        result.candidates_count = candidates.length;
-
-        if (!candidates.length) {
-            return result;
-        }
-
-        candidates.sort((a, b) => b.score - a.score);
-        const best = candidates[0];
-
-        result.found = true;
-        result.sameTargetDom = best.sameTargetDom;
-        result.visibleArea = best.visibleArea;
-
-        try {
-            let container = best.video.parentElement;
-            let nameSearchDepth = 0;
-            while (container && nameSearchDepth < 5) {
-                const nameElements = container.querySelectorAll(
-                    '[class*="name"], [class*="username"], [class*="nickname"], [class*="profile"], [class*="title"], h1, h2, h3, h4'
-                );
-                for (const el of nameElements) {
-                    const text = (el.innerText || '').trim();
-                    if (text.length >= 2 && text.length <= 50) {
-                        const wordCount = text.split(/\s+/).length;
-                        if (wordCount <= 5) {
-                            result.displayName = text;
-                            break;
-                        }
-                    }
-                }
-                if (result.displayName) break;
-                container = container.parentElement;
-                nameSearchDepth++;
-            }
-
-            if (!result.displayName) {
-                const ogTitle = document.querySelector('meta[property="og:title"]');
-                if (ogTitle && ogTitle.content) {
-                    result.displayName = ogTitle.content;
-                } else if (document.title) {
-                    result.displayName = document.title;
-                }
-            }
-        } catch (e) {}
-
-    } catch (e) {
-        result.error = String(e);
-    }
-
-    return result;
-}
-"""
-
-
-async def check_user_on_stream_page(
-    context, user_id: str, semaphore: asyncio.Semaphore
+# ============================================================
+# DISCOVERY LAYER INTEGRATION
+# ============================================================
+async def process_user_with_discovery(
+    discovery: "SuperLiveDiscovery",
+    user_id: str,
+    stored_names: Dict[str, str],
+    semaphore: asyncio.Semaphore,
 ) -> Dict[str, Any]:
+    """
+    Process a single user through the complete Discovery pipeline:
+    
+    Phase 1: Discover profile_id from user_id
+    Phase 2: Check live status using profile_id
+    Phase 3: Validate stream ownership
+    Phase 4: Return classification result
+    
+    Returns a dict with:
+      - status: LIVE_NORMAL | LIVE_PREMIUM | OFFLINE | UNKNOWN | DISCOVERY_FAILED | VALIDATION_FAILED
+      - profile_id: discovered profile ID
+      - stream_url: validated stream URL (if live)
+      - display_name: discovered username
+      - reason: explanation of the result
+      - validation: validation details
+    """
     async with semaphore:
-        page = await context.new_page()
-        url = BASE_LIVE_URL.format(user_id=user_id)
-        json_bodies: List[str] = []
-        json_count = 0
-
         result = {
-            "sameTargetDom": False,
-            "premium": False,
-            "candidates_count": 0,
-            "visibleArea": 0,
-            "displayName": None,
-            "streamEnded": False,
-            "error": None,
+            "user_id": user_id,
+            "profile_id": None,
+            "stream_url": None,
+            "display_name": stored_names.get(user_id),
+            "username": None,
+            "status": UNKNOWN,
+            "reason": "",
+            "action": "SKIP",
+            "phase": "none",
+            "validation": {},
         }
 
-        async def on_response(response):
-            nonlocal json_count
-            if json_count >= 30:
-                return
-            try:
-                content_type = (response.headers or {}).get("content-type", "")
-                if "json" not in content_type.lower():
-                    return
-                response_url = response.url or ""
-                body = await response.text()
-                if not body:
-                    return
-                if user_id in body or user_id in response_url:
-                    json_count += 1
-                    json_bodies.append(body[:200000])
-            except Exception:
-                pass
+        if not DISCOVERY_AVAILABLE:
+            result["status"] = DISCOVERY_FAILED
+            result["reason"] = "discovery_module_not_available"
+            result["action"] = "SKIP_DISCOVERY_FAILED"
+            result["phase"] = "init"
+            return result
 
-        page.on("response", on_response)
-
+        # ============================================================
+        # PHASE 1: Discovery (user_id → profile_id)
+        # ============================================================
         try:
-            await page.goto(url, timeout=PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
-            await page.wait_for_timeout(PAGE_WAIT_MS)
+            log(f"[Phase 1] Discovering profile for user_id: {user_id}")
+            profile_info = await discovery.discover_profile_id(user_id)
 
-            try:
-                check_result = await page.evaluate(PAGE_CHECK_JS, user_id)
-                if isinstance(check_result, dict):
-                    result.update(check_result)
-            except Exception as e:
-                result["error"] = f"check_evaluate: {str(e)[:100]}"
+            if not profile_info or not profile_info.get("profile_id"):
+                result["status"] = DISCOVERY_FAILED
+                result["reason"] = "profile_id_not_discovered"
+                result["action"] = "SKIP_DISCOVERY_FAILED"
+                result["phase"] = "phase_1"
+                log(f"[Phase 1] ✗ Failed for user_id: {user_id}")
+                return result
+
+            profile_id = str(profile_info["profile_id"])
+            result["profile_id"] = profile_id
+            result["phase"] = "phase_1_done"
+
+            # Update display_name if discovered
+            discovered_username = profile_info.get("username")
+            if discovered_username:
+                result["username"] = discovered_username
+                if not result["display_name"]:
+                    result["display_name"] = discovered_username
+
+            # Check if API already indicates not live
+            if not profile_info.get("is_live"):
+                result["status"] = OFFLINE
+                result["reason"] = "api_reports_offline"
+                result["action"] = "SKIP_OFFLINE"
+                result["phase"] = "phase_1_offline"
+                log(f"[Phase 1] ✓ User offline (profile_id: {profile_id})")
+                return result
+
+            log(f"[Phase 1] ✓ Profile discovered: {profile_id}")
 
         except Exception as e:
-            result["error"] = f"page_goto: {str(e)[:100]}"
+            result["status"] = DISCOVERY_FAILED
+            result["reason"] = f"phase_1_error:{str(e)[:80]}"
+            result["action"] = "SKIP_DISCOVERY_FAILED"
+            result["phase"] = "phase_1_error"
+            log(f"[Phase 1] ✗ Error for {user_id}: {e}")
+            return result
 
-        await page.close()
+        # ============================================================
+        # PHASE 2: Live Status Check (profile_id → stream info)
+        # ============================================================
+        try:
+            log(f"[Phase 2] Checking live status for profile_id: {profile_id}")
+            live_status = await discovery.check_live_status(profile_id)
 
-        result["json_bodies"] = json_bodies
+            if not live_status or not live_status.get("is_live"):
+                result["status"] = OFFLINE
+                result["reason"] = "live_status_check_failed"
+                result["action"] = "SKIP_OFFLINE"
+                result["phase"] = "phase_2_offline"
+                log(f"[Phase 2] ✗ User not live (profile_id: {profile_id})")
+                return result
+
+            stream_url = live_status.get("stream_url")
+            stream_id = live_status.get("stream_id")
+
+            if not stream_url:
+                result["status"] = UNKNOWN
+                result["reason"] = "stream_url_not_found"
+                result["action"] = "SKIP_UNCERTAIN"
+                result["phase"] = "phase_2_no_url"
+                log(f"[Phase 2] ✗ Stream URL not found for profile_id: {profile_id}")
+                return result
+
+            result["stream_url"] = stream_url
+            result["phase"] = "phase_2_done"
+
+            # Check for premium status
+            stream_info = live_status.get("stream_info", {})
+            if isinstance(stream_info, dict):
+                is_premium = False
+                for key in ["is_premium", "isPremium", "premium", "paywall"]:
+                    if stream_info.get(key):
+                        is_premium = True
+                        break
+                if is_premium:
+                    result["status"] = LIVE_PREMIUM
+                    result["reason"] = "premium_stream"
+                    result["action"] = "SKIP_PREMIUM"
+                    result["phase"] = "phase_2_premium"
+                    log(f"[Phase 2] ✓ Premium stream detected for {profile_id}")
+                    return result
+
+            log(f"[Phase 2] ✓ Live stream confirmed: {stream_url}")
+
+        except Exception as e:
+            result["status"] = UNKNOWN
+            result["reason"] = f"phase_2_error:{str(e)[:80]}"
+            result["action"] = "SKIP_UNCERTAIN"
+            result["phase"] = "phase_2_error"
+            log(f"[Phase 2] ✗ Error for {user_id}: {e}")
+            return result
+
+        # ============================================================
+        # PHASE 3: Stream Validation (ownership verification)
+        # ============================================================
+        try:
+            log(f"[Phase 3] Validating stream ownership for user_id: {user_id}")
+            validation_result = await discovery.validate_stream(
+                user_id, profile_id, stream_url
+            )
+
+            result["validation"] = validation_result
+            result["phase"] = "phase_3_done"
+
+            if not validation_result.get("validation_passed"):
+                result["status"] = VALIDATION_FAILED
+                result["reason"] = (
+                    f"validation_failed:"
+                    f"{validation_result.get('checks_passed', 0)}/"
+                    f"{validation_result.get('total_checks', 0)}_checks_passed"
+                )
+                result["action"] = "SKIP_VALIDATION_FAILED"
+                log(
+                    f"[Phase 3] ✗ Validation failed for {user_id} "
+                    f"(profile_id: {profile_id})"
+                )
+                return result
+
+            # Check if the actual stream URL from validation differs
+            actual_stream_url = validation_result.get("actual_stream_url")
+            if actual_stream_url and actual_stream_url != stream_url:
+                result["stream_url"] = actual_stream_url
+                log(f"[Phase 3] ✓ Stream URL updated to actual URL")
+
+            log(
+                f"[Phase 3] ✓ Stream validated: "
+                f"{validation_result.get('checks_passed', 0)}/"
+                f"{validation_result.get('total_checks', 0)} checks passed"
+            )
+
+        except Exception as e:
+            result["status"] = VALIDATION_FAILED
+            result["reason"] = f"phase_3_error:{str(e)[:80]}"
+            result["action"] = "SKIP_VALIDATION_FAILED"
+            result["phase"] = "phase_3_error"
+            log(f"[Phase 3] ✗ Error for {user_id}: {e}")
+            return result
+
+        # ============================================================
+        # PHASE 4: Final classification - LIVE_NORMAL
+        # ============================================================
+        result["status"] = LIVE_NORMAL
+        result["reason"] = "all_phases_passed"
+        result["action"] = "CANDIDATE"
+        result["phase"] = "phase_4_complete"
+        log(f"[Phase 4] ✓ User {user_id} is ready for recording")
+
         return result
 
 
-async def classify_user(context, user_id: str, semaphore: asyncio.Semaphore) -> Dict[str, Any]:
-    check_result = await check_user_on_stream_page(context, user_id, semaphore)
-
-    json_bodies = check_result.pop("json_bodies", [])
-
-    video_info = {
-        "sameTargetDom": check_result.get("sameTargetDom", False),
-        "candidates_count": check_result.get("candidates_count", 0),
-        "visibleArea": check_result.get("visibleArea", 0),
-        "premium": check_result.get("premium", False),
-        "streamEnded": check_result.get("streamEnded", False),
-    }
-
-    display_name = None
-
-    json_name = extract_name_from_json(json_bodies, user_id)
-    if json_name:
-        display_name = json_name
-
-    if not display_name:
-        raw_name = check_result.get("displayName")
-        if raw_name:
-            normalized = normalize_display_name(raw_name)
-            if normalized:
-                display_name = normalized
-
-    premium_from_json = check_json_for_premium(json_bodies, user_id)
-    if premium_from_json:
-        video_info["premium"] = True
-
-    if check_result.get("error"):
-        return {
-            "status": UNKNOWN,
-            "reason": f"error:{check_result['error'][:80]}",
-            "stream_url": BASE_LIVE_URL.format(user_id=user_id),
-            "display_name": display_name,
-            "video_info": video_info,
-        }
-
-    final_status = classify_final(video_info, json_bodies, user_id)
-
-    return {
-        "status": final_status,
-        "reason": (
-            f"sameTargetDom={video_info.get('sameTargetDom')},"
-            f"premium={video_info.get('premium')},"
-            f"ended={video_info.get('streamEnded')},"
-            f"candidates={video_info.get('candidates_count')}"
-        ),
-        "stream_url": BASE_LIVE_URL.format(user_id=user_id),
-        "display_name": display_name,
-        "video_info": video_info,
-    }
-
-
-async def classify_many_users(
-    user_ids: List[str], stored_names: Dict[str, str] = None
+async def process_many_users_with_discovery(
+    discovery: "SuperLiveDiscovery",
+    user_ids: List[str],
+    stored_names: Dict[str, str],
 ) -> Dict[str, Dict[str, Any]]:
+    """
+    Process multiple users through the Discovery pipeline.
+    Uses a semaphore to control concurrency.
+    """
     results = {}
     if not user_ids:
         return results
-    if stored_names is None:
-        stored_names = {}
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        log("Playwright is not installed. Skipping browser detection.")
+
+    if not DISCOVERY_AVAILABLE:
+        log("Discovery module not available. Skipping all users.")
         for user_id in user_ids:
             results[user_id] = {
-                "status": UNKNOWN,
-                "reason": "playwright_not_installed",
-                "stream_url": BASE_LIVE_URL.format(user_id=user_id),
+                "user_id": user_id,
+                "status": DISCOVERY_FAILED,
+                "reason": "discovery_module_not_available",
+                "action": "SKIP_DISCOVERY_FAILED",
+                "phase": "init",
                 "display_name": stored_names.get(user_id),
-                "video_info": {},
             }
         return results
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-background-timer-throttling",
-                    "--disable-renderer-backgrounding",
-                ],
-            )
-            context = await browser.new_context(
-                user_agent=USER_AGENT,
-                viewport={"width": 1280, "height": 800},
-                locale="fr-FR",
-            )
-            semaphore = asyncio.Semaphore(PLAYWRIGHT_CONCURRENCY)
-            tasks = [classify_user(context, uid, semaphore) for uid in user_ids]
-            gathered = await asyncio.gather(*tasks, return_exceptions=True)
-            for user_id, result in zip(user_ids, gathered):
-                if isinstance(result, Exception):
-                    results[user_id] = {
-                        "status": UNKNOWN,
-                        "reason": str(result)[:120],
-                        "stream_url": BASE_LIVE_URL.format(user_id=user_id),
-                        "display_name": stored_names.get(user_id),
-                        "video_info": {},
-                    }
-                else:
-                    if not result.get("display_name") and stored_names.get(user_id):
-                        result["display_name"] = stored_names[user_id]
-                    results[user_id] = result
-            await context.close()
-            await browser.close()
-    except Exception as e:
-        log(f"Playwright global error: {e}")
-        for user_id in user_ids:
-            if user_id not in results:
-                results[user_id] = {
-                    "status": UNKNOWN,
-                    "reason": "playwright_global_error",
-                    "stream_url": BASE_LIVE_URL.format(user_id=user_id),
-                    "display_name": stored_names.get(user_id),
-                    "video_info": {},
-                }
+
+    semaphore = asyncio.Semaphore(DISCOVERY_CONCURRENCY)
+    tasks = [
+        process_user_with_discovery(discovery, uid, stored_names, semaphore)
+        for uid in user_ids
+    ]
+
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for user_id, result in zip(user_ids, gathered):
+        if isinstance(result, Exception):
+            results[user_id] = {
+                "user_id": user_id,
+                "status": DISCOVERY_FAILED,
+                "reason": f"exception:{str(result)[:100]}",
+                "action": "SKIP_DISCOVERY_FAILED",
+                "phase": "exception",
+                "display_name": stored_names.get(user_id),
+            }
+        else:
+            # Fallback to stored name if discovery didn't find one
+            if not result.get("display_name"):
+                result["display_name"] = stored_names.get(user_id)
+            results[user_id] = result
+
     return results
 
 
+# ============================================================
+# MAIN MONITOR LOOP
+# ============================================================
 async def async_main() -> int:
     monitor_start_time = time.monotonic()
     stats = {
@@ -828,11 +586,14 @@ async def async_main() -> int:
         "live_premium": 0,
         "offline": 0,
         "unknown": 0,
+        "discovery_failed": 0,
+        "validation_failed": 0,
         "started_recordings": 0,
         "names": {},
+        "profile_map": {},
     }
 
-    log("Starting monitor")
+    log("Starting monitor (with Discovery Layer)")
 
     if not WORKER_URL:
         log("FATAL: WORKER_URL is not set")
@@ -841,8 +602,13 @@ async def async_main() -> int:
         log("FATAL: AUTO_API_TOKEN is not set")
         return 1
 
-    # NOTE: No KV lock used. Concurrency handled by GitHub Actions
-    # concurrency group to save KV writes (free plan: 1000 writes/day).
+    if not DISCOVERY_AVAILABLE:
+        log("FATAL: superlive_discovery.py not found in project")
+        return 1
+
+    # Initialize Discovery Layer (single instance with cache)
+    discovery = SuperLiveDiscovery()
+    log("Discovery Layer initialized")
 
     try:
         try:
@@ -899,17 +665,24 @@ async def async_main() -> int:
             log("Monitor completed")
             return 0
 
-        selected = users_to_check[:PLAYWRIGHT_MAX_USERS_PER_CYCLE]
+        selected = users_to_check[:DISCOVERY_MAX_USERS_PER_CYCLE]
         stats["checked_now"] = len(selected)
 
-        log(f"Running stream-page detection for {len(selected)} users")
-        results = await classify_many_users(selected, stored_names)
+        log(
+            f"Running Discovery Layer for {len(selected)} users "
+            f"(concurrency: {DISCOVERY_CONCURRENCY})"
+        )
 
+        results = await process_many_users_with_discovery(
+            discovery, selected, stored_names
+        )
+
+        # Log all results
         for user_id, result in results.items():
-            log_detection(user_id, result, "stream_page")
+            log_discovery(user_id, result)
 
-        for user_id in users_to_check:
-            result = results.get(user_id, {})
+        # Aggregate stats
+        for user_id, result in results.items():
             status = result.get("status", UNKNOWN)
             if status == LIVE_NORMAL:
                 stats["live_normal"] += 1
@@ -917,18 +690,26 @@ async def async_main() -> int:
                 stats["live_premium"] += 1
             elif status == OFFLINE:
                 stats["offline"] += 1
+            elif status == DISCOVERY_FAILED:
+                stats["discovery_failed"] += 1
+            elif status == VALIDATION_FAILED:
+                stats["validation_failed"] += 1
             else:
                 stats["unknown"] += 1
 
-            discovered_name = result.get("display_name")
+            # Track profile mapping
+            if result.get("profile_id"):
+                stats["profile_map"][user_id] = result["profile_id"]
+
+            # Track names
+            discovered_name = result.get("display_name") or result.get("username")
             final_name = discovered_name or stored_names.get(user_id)
             if final_name:
                 stats["names"][user_id] = final_name
-            # Only update watchlist names if explicitly enabled
-            # Disabled by default to save KV writes (free plan limit)
             if UPDATE_WATCHLIST_NAMES and discovered_name:
                 await update_watchlist_name(user_id, discovered_name)
 
+        # Refresh active recordings before triggering
         try:
             active = await load_active_recordings()
         except Exception as e:
@@ -952,48 +733,65 @@ async def async_main() -> int:
             log("Monitor completed")
             return 0
 
+        # Trigger recordings for validated streams
         for user_id in watchlist:
             result = results.get(user_id)
             if not result:
                 continue
+
+            # Only record LIVE_NORMAL (validation passed)
             status = result.get("status", UNKNOWN)
             if status != LIVE_NORMAL:
                 continue
+
             if user_id in active["active_ids"]:
                 log(f"username={user_id}")
                 log("status=LIVE_NORMAL")
                 log("action=SKIP")
                 log("reason=already_recording")
                 continue
+
             if slots_available <= 0:
                 log(f"username={user_id}")
                 log("status=LIVE_NORMAL")
                 log("action=WAIT_NEXT_CYCLE")
                 log("reason=no_slot_available")
                 break
+
             stream_url = result.get("stream_url") or BASE_LIVE_URL.format(
                 user_id=user_id
             )
             stream_name = (
-                result.get("display_name") or stats["names"].get(user_id, "")
+                result.get("display_name")
+                or result.get("username")
+                or stats["names"].get(user_id, "")
             )
+            profile_id = result.get("profile_id", "")
+
             log(f"username={user_id}")
+            log(f"profile_id={profile_id}")
             log("status=LIVE_NORMAL")
+            log("validation=PASSED")
             log("Recording state: NOT_RECORDING")
             log(
                 f"Slots: {active['active_count']}/{active['max_concurrent']}"
             )
             if stream_name:
                 log(f"display_name={stream_name}")
+            log(f"stream_url={stream_url}")
             log("Action: START_RECORDING")
+
             ok, reason = await trigger_auto_recording(
-                user_id, stream_url, stream_name
+                user_id, stream_url, stream_name, profile_id
             )
+
             if ok:
                 log(f"username={user_id}")
+                log(f"profile_id={profile_id}")
                 log("trigger=SUCCESS")
                 log("workflow=record.yml")
                 log("recording_engine=existing_record_once.py")
+                log("validation=PASSED")
                 stats["started_recordings"] += 1
                 slots_available -= 1
                 active["active_ids"].add(user_id)
