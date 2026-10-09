@@ -61,15 +61,6 @@
       "stopped_at": "2026-10-09T01:37:04.023Z"
     },
     {
-      "stream_id": "33018909",
-      "stream_url": "https://superlivetv.com/fr/livestream/152595990",
-      "stream_name": "🇲🇦🦌غزلان فرنسي🦌",
-      "status": "stopped",
-      "started_at": "2026-10-09T01:41:25.683Z",
-      "source": "auto",
-      "stopped_at": "2026-10-09T01:43:33.959Z"
-    },
-    {
       "stream_id": "52344625",
       "stream_url": "https://superlivetv.com/fr/livestream/152595994",
       "stream_name": "البسكوته💃$كيرفي$💘",
@@ -86,6 +77,14 @@
       "started_at": "2026-10-09T01:41:30.060Z",
       "source": "auto",
       "stopped_at": "2026-10-09T01:43:30.073Z"
+    },
+    {
+      "stream_id": "33018909",
+      "stream_url": "https://superlivetv.com/fr/livestream/152596709",
+      "stream_name": "🇲🇦🦌غزلان فرنسي🦌",
+      "status": "recording",
+      "started_at": "2026-10-09T01:51:36.673Z",
+      "source": "auto"
     }
   ]
 }
