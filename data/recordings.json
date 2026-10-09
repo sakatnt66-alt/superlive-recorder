@@ -57,6 +57,14 @@
       "status": "recording",
       "started_at": "2026-10-09T15:36:50.340Z",
       "source": "auto"
+    },
+    {
+      "stream_id": "54846395",
+      "stream_url": "https://superlivetv.com/fr/livestream/152635858",
+      "stream_name": "برنسيسه 👑",
+      "status": "recording",
+      "started_at": "2026-10-09T15:36:52.491Z",
+      "source": "auto"
     }
   ]
 }
