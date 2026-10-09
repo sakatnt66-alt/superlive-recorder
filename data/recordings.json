@@ -72,15 +72,6 @@
       "stopped_at": "2026-10-09T15:13:24.123Z"
     },
     {
-      "stream_id": "54846395",
-      "stream_url": "https://superlivetv.com/fr/livestream/152633931",
-      "stream_name": "برنسيسه 👑",
-      "status": "stopped",
-      "started_at": "2026-10-09T14:55:15.534Z",
-      "source": "auto",
-      "stopped_at": "2026-10-09T15:13:22.041Z"
-    },
-    {
       "stream_id": "65826144",
       "stream_url": "https://superlivetv.com/fr/livestream/152634626",
       "stream_name": "🪬🍬💞الفرسه الورديه💞🍬🪬",
@@ -95,11 +86,6 @@
       "status": "recording",
       "started_at": "2026-10-09T15:13:55.617Z",
       "source": "auto"
-    },
-    {
-      "stream_id": "54846395",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
