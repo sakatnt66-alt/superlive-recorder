@@ -49,16 +49,6 @@
       "source": "auto",
       "state": "failed",
       "error": "Live video was not detected; last selector error=Error: No visible live video target found"
-    },
-    {
-      "stream_id": "24353293",
-      "stream_url": "https://superlivetv.com/fr/livestream/152635012",
-      "stream_name": "Alisa",
-      "status": "recording",
-      "started_at": "2026-10-09T15:36:50.340Z",
-      "source": "auto",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
