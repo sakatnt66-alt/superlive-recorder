@@ -80,16 +80,6 @@
       "source": "auto",
       "state": "failed",
       "error": "Live video was not detected; last selector error=Error: No visible live video target found"
-    },
-    {
-      "stream_id": "44656536",
-      "stream_url": "https://superlivetv.com/fr/livestream/152634579",
-      "stream_name": "جوجو Jawhra👑جوهرة💅",
-      "status": "recording",
-      "started_at": "2026-10-09T15:13:55.617Z",
-      "source": "auto",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
