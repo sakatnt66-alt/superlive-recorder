@@ -21,15 +21,6 @@
       "stopped_at": "2026-10-08T21:47:37.096Z"
     },
     {
-      "stream_id": "21421785",
-      "stream_url": "https://superlivetv.com/fr/profile/19868298?isFromSearch=true",
-      "stream_name": "نجلاء💎🎀",
-      "status": "stopped",
-      "started_at": "2026-10-08T21:37:02.817Z",
-      "source": "auto",
-      "stopped_at": "2026-10-08T21:39:08.593Z"
-    },
-    {
       "stream_id": "54125807",
       "stream_url": "https://superlivetv.com/fr/livestream/152590804",
       "stream_name": "الملكة كيوته",
@@ -79,6 +70,14 @@
       "state": "failed",
       "error": "Live video was not detected; last selector error=Error: No visible live video target found",
       "stopped_at": "2026-10-09T13:54:34.272Z"
+    },
+    {
+      "stream_id": "21421785",
+      "stream_url": "https://superlivetv.com/fr/livestream/152631022",
+      "stream_name": "نجلاء💎🎀",
+      "status": "recording",
+      "started_at": "2026-10-09T14:06:14.778Z",
+      "source": "auto"
     }
   ]
 }
