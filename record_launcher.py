@@ -8,9 +8,10 @@ import asyncio
 import json
 import os
 import sys
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
-import aiohttp
 
 # Import Discovery for pre-flight checks
 from superlive_discovery import SuperLiveDiscovery
@@ -21,39 +22,46 @@ AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-async def send_telegram_message(text: str, parse_mode: str = "HTML"):
+def send_telegram_message(text: str, parse_mode: str = "HTML"):
     """Send message to Telegram"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
+    payload = json.dumps({
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": parse_mode
-    }
+    }).encode('utf-8')
+    
+    req = urllib.request.Request(url, data=payload, headers={
+        'Content-Type': 'application/json'
+    })
     
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload) as response:
-                if response.status != 200:
-                    print(f"[TELEGRAM] Failed to send message: {response.status}")
+        with urllib.request.urlopen(req, timeout=30) as response:
+            if response.status != 200:
+                print(f"[TELEGRAM] Failed to send message: {response.status}")
     except Exception as e:
         print(f"[TELEGRAM] Error sending message: {e}")
 
-async def update_worker_state(stream_id: str, state: dict):
+def update_worker_state(stream_id: str, state: dict):
     """Update recording state in Cloudflare Worker"""
     if not WORKER_API_URL or not AUTO_API_TOKEN:
         return
     
     url = f"{WORKER_API_URL}/api/update-state/{stream_id}"
-    headers = {"X-Auto-Token": AUTO_API_TOKEN}
+    payload = json.dumps(state).encode('utf-8')
+    
+    req = urllib.request.Request(url, data=payload, headers={
+        'X-Auto-Token': AUTO_API_TOKEN,
+        'Content-Type': 'application/json'
+    })
     
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=state, headers=headers) as response:
-                if response.status != 200:
-                    print(f"[WORKER] Failed to update state: {response.status}")
+        with urllib.request.urlopen(req, timeout=30) as response:
+            if response.status != 200:
+                print(f"[WORKER] Failed to update state: {response.status}")
     except Exception as e:
         print(f"[WORKER] Error updating state: {e}")
 
@@ -194,10 +202,10 @@ async def main():
         else:
             msg = f"❌ <b>فشل التحقق</b>\n👤 المستخدم: <code>{stream_id}</code>\n\n⚠️ {error}"
         
-        await send_telegram_message(msg)
+        send_telegram_message(msg)
         
         # Update worker state
-        await update_worker_state(stream_id, {
+        update_worker_state(stream_id, {
             "status": "failed",
             "error": error,
             "failed_at": datetime.now(timezone.utc).isoformat()
@@ -217,7 +225,7 @@ async def main():
     print(f"\n[PRE-FLIGHT] ✓ All checks passed - proceeding with recording")
     
     # Update worker state with username
-    await update_worker_state(stream_id, {
+    update_worker_state(stream_id, {
         "stream_name": stream_name,
         "status": "recording",
         "source": recording_source
@@ -231,7 +239,7 @@ async def main():
         f"🆔 ID: <code>{stream_id}</code>\n"
         f"🕒 الوقت: {datetime.now().strftime('%H:%M:%S')}"
     )
-    await send_telegram_message(start_msg)
+    send_telegram_message(start_msg)
     
     # Call the original record_once.py
     print("\n" + "=" * 70)
@@ -249,9 +257,9 @@ async def main():
             f"🆔 ID: <code>{stream_id}</code>\n\n"
             f"⚠️ {str(e)}"
         )
-        await send_telegram_message(error_msg)
+        send_telegram_message(error_msg)
         
-        await update_worker_state(stream_id, {
+        update_worker_state(stream_id, {
             "status": "failed",
             "error": str(e),
             "failed_at": datetime.now(timezone.utc).isoformat()
