@@ -61,15 +61,6 @@
       "stopped_at": "2026-10-09T01:24:25.547Z"
     },
     {
-      "stream_id": "152593057",
-      "stream_url": "https://superlivetv.com/fr/livestream/152593057",
-      "stream_name": null,
-      "status": "stopped",
-      "started_at": "2026-10-09T01:02:28.235Z",
-      "source": "manual",
-      "stopped_at": "2026-10-09T01:24:21.678Z"
-    },
-    {
       "stream_id": "33018909",
       "stream_url": "https://superlivetv.com/fr/livestream/152593996",
       "stream_name": "🇲🇦🦌غزلان فرنسي🦌",
@@ -92,11 +83,6 @@
       "status": "recording",
       "started_at": "2026-10-09T01:28:18.414Z",
       "source": "auto"
-    },
-    {
-      "stream_id": "152593057",
-      "state": "failed",
-      "error": "Unable to split Matroska without packet loss or oversized parts"
     }
   ]
 }
