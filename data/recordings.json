@@ -46,7 +46,9 @@
       "stream_name": "نجلاء💎🎀",
       "status": "recording",
       "started_at": "2026-10-09T15:52:11.227Z",
-      "source": "auto"
+      "source": "auto",
+      "state": "failed",
+      "error": "Page is blank (Stream Offline or Blocked)"
     },
     {
       "stream_id": "24353293",
