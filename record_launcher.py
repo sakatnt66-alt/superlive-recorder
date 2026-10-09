@@ -13,7 +13,6 @@ import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Import Discovery for pre-flight checks
 from superlive_discovery import SuperLiveDiscovery
 
 # Configuration
@@ -65,6 +64,128 @@ def update_worker_state(stream_id: str, state: dict):
     except Exception as e:
         print(f"[WORKER] Error updating state: {e}")
 
+async def verify_stream_is_accessible(stream_url: str) -> dict:
+    """
+    Smart verification: check if video is ACTUALLY playing.
+    If video plays = stream is accessible (LIVE_NORMAL), regardless of VIP badges on page.
+    Returns: {accessible: bool, video_found: bool, video_playing: bool, error: str}
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return {"accessible": False, "error": "Playwright not available"}
+    
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            )
+            context = await browser.new_context(
+                viewport={'width': 1280, 'height': 720},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                locale='fr-FR'
+            )
+            page = await context.new_page()
+            
+            try:
+                await page.goto(stream_url, wait_until='networkidle', timeout=45000)
+            except Exception as e:
+                print(f"[VERIFY] Navigation error: {e}")
+                await browser.close()
+                return {"accessible": False, "error": f"Navigation failed: {e}"}
+            
+            # Wait for video elements
+            await page.wait_for_timeout(5000)
+            
+            # Check all video elements
+            videos = await page.query_selector_all('video')
+            print(f"[VERIFY] Found {len(videos)} video element(s)")
+            
+            if not videos:
+                await browser.close()
+                return {"accessible": False, "video_found": False, "error": "No video elements"}
+            
+            video_playing = False
+            accessible_video = None
+            
+            for idx, video in enumerate(videos):
+                try:
+                    dims = await video.bounding_box()
+                    if not dims:
+                        continue
+                    
+                    ready_state = await video.evaluate('v => v.readyState')
+                    paused = await video.evaluate('v => v.paused')
+                    src = await video.evaluate('v => v.src || v.currentSrc || ""')
+                    width = int(dims['width'])
+                    height = int(dims['height'])
+                    
+                    # Filter out small/promo videos (gifts, ads, previews)
+                    if width < 300 or height < 300:
+                        print(f"[VERIFY] Video {idx}: too small ({width}x{height}) - skipping")
+                        continue
+                    
+                    # Check if video is ready and playing
+                    is_playing = ready_state >= 3 and not paused
+                    
+                    # Try to play if paused
+                    if not is_playing:
+                        try:
+                            can_play = await video.evaluate('''v => {
+                                return new Promise(resolve => {
+                                    v.muted = true;
+                                    v.play().then(() => resolve(true)).catch(() => resolve(false));
+                                    setTimeout(() => resolve(false), 3000);
+                                });
+                            }''')
+                            if can_play:
+                                await page.wait_for_timeout(2000)
+                                ready_state = await video.evaluate('v => v.readyState')
+                                paused = await video.evaluate('v => v.paused')
+                                is_playing = ready_state >= 3 and not paused
+                        except Exception as e:
+                            print(f"[VERIFY] Video {idx}: play() failed - {e}")
+                    
+                    print(f"[VERIFY] Video {idx}: {width}x{height}, readyState={ready_state}, paused={paused}, playing={is_playing}")
+                    
+                    if is_playing:
+                        video_playing = True
+                        accessible_video = {
+                            "index": idx,
+                            "width": width,
+                            "height": height,
+                            "ready_state": ready_state
+                        }
+                        break
+                except Exception as e:
+                    print(f"[VERIFY] Video {idx}: error - {e}")
+                    continue
+            
+            await browser.close()
+            
+            if video_playing and accessible_video:
+                return {
+                    "accessible": True,
+                    "video_found": True,
+                    "video_playing": True,
+                    "video_info": accessible_video,
+                    "error": None
+                }
+            else:
+                return {
+                    "accessible": False,
+                    "video_found": True,
+                    "video_playing": False,
+                    "error": "No playable video found"
+                }
+    
+    except Exception as e:
+        print(f"[VERIFY] Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"accessible": False, "error": str(e)}
+
 async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
     """
     Pre-flight validation before recording.
@@ -83,7 +204,6 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
         if is_livestream_url:
             print(f"[PRE-FLIGHT] URL is a livestream URL - checking directly")
             
-            # Try direct check first
             live_result = await discovery.check_live_status(
                 profile_url=stream_url,
                 user_id=stream_id,
@@ -94,14 +214,49 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
             if live_result:
                 is_live = live_result.get("is_live", False)
                 is_premium = live_result.get("is_premium", False)
-                detected_stream_id = live_result.get("stream_id")
                 username = live_result.get("username")
                 
-                print(f"[PRE-FLIGHT] Direct check result: is_live={is_live}, is_premium={is_premium}")
+                print(f"[PRE-FLIGHT] Discovery says: is_live={is_live}, is_premium={is_premium}")
                 
-                # If LIVE_NORMAL, success!
+                # ============================================================
+                # SMART OVERRIDE: If Discovery says PREMIUM but video is playing,
+                # it's a false positive (VIP badges on page, but stream is free)
+                # ============================================================
+                if is_live and is_premium:
+                    print(f"[PRE-FLIGHT] ⚠️ Discovery flagged PREMIUM - verifying video accessibility...")
+                    
+                    verification = await verify_stream_is_accessible(stream_url)
+                    
+                    if verification.get("accessible"):
+                        print(f"[PRE-FLIGHT] ✓ SMART OVERRIDE: Video is actually playing!")
+                        print(f"[PRE-FLIGHT]   → Video info: {verification.get('video_info')}")
+                        print(f"[PRE-FLIGHT]   → Treating as LIVE_NORMAL (not Premium)")
+                        
+                        # Try to get username via discovery fallback
+                        if not username:
+                            profile_result = await discovery.discover_profile_id(stream_id)
+                            if profile_result:
+                                username = profile_result.get("username")
+                        
+                        return {
+                            "success": True,
+                            "status": "LIVE_NORMAL",
+                            "username": username or f"user_{stream_id}",
+                            "error": None
+                        }
+                    else:
+                        print(f"[PRE-FLIGHT] ✗ Video verification failed: {verification.get('error')}")
+                        # Premium is real - video can't play
+                        return {
+                            "success": False,
+                            "status": "LIVE_PREMIUM",
+                            "username": username,
+                            "error": "Stream is Premium (paywalled) - video cannot play"
+                        }
+                
+                # LIVE_NORMAL without Premium flag
                 if is_live and not is_premium:
-                    print(f"[PRE-FLIGHT] ✓ Stream validated via direct check: LIVE_NORMAL, username={username}")
+                    print(f"[PRE-FLIGHT] ✓ Stream validated: LIVE_NORMAL, username={username}")
                     return {
                         "success": True,
                         "status": "LIVE_NORMAL",
@@ -109,24 +264,32 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                         "error": None
                     }
                 
-                # If PREMIUM, fail early
-                if is_premium:
+                # Not live
+                if not is_live:
+                    # Double-check with verification
+                    print(f"[PRE-FLIGHT] Discovery says offline - double-checking...")
+                    verification = await verify_stream_is_accessible(stream_url)
+                    if verification.get("accessible"):
+                        print(f"[PRE-FLIGHT] ✓ SMART OVERRIDE: Video is playing despite offline flag!")
+                        return {
+                            "success": True,
+                            "status": "LIVE_NORMAL",
+                            "username": username or f"user_{stream_id}",
+                            "error": None
+                        }
+                    
                     return {
                         "success": False,
-                        "status": "LIVE_PREMIUM",
+                        "status": "OFFLINE",
                         "username": username,
-                        "error": "Stream is Premium (paywalled)"
+                        "error": "User is offline"
                     }
-                
-                # If not live, continue to discovery flow as fallback
-                print(f"[PRE-FLIGHT] Direct check shows offline - trying discovery flow")
         
         # ============================================================
-        # FALLBACK: Discovery flow
+        # FALLBACK: Discovery flow for non-livestream URLs
         # ============================================================
         print(f"[PRE-FLIGHT] Using discovery flow")
         
-        # Phase 1: Resolve identity
         profile_result = await discovery.discover_profile_id(stream_id)
         
         if not profile_result:
@@ -149,7 +312,6 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                 "error": "No profile URL found"
             }
         
-        # Phase 2: Check live state
         live_result = await discovery.check_live_status(
             profile_url=profile_url,
             user_id=stream_id,
@@ -167,19 +329,27 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
         
         is_live = live_result.get("is_live", False)
         is_premium = live_result.get("is_premium", False)
-        detected_stream_id = live_result.get("stream_id")
         final_username = live_result.get("username") or username
         
-        # Verify stream ID matches
-        if detected_stream_id and str(detected_stream_id) != str(stream_id):
+        # Smart override for false PREMIUM detection
+        if is_live and is_premium:
+            print(f"[PRE-FLIGHT] ⚠️ Verifying PREMIUM flag via direct stream access...")
+            verification = await verify_stream_is_accessible(stream_url)
+            if verification.get("accessible"):
+                print(f"[PRE-FLIGHT] ✓ SMART OVERRIDE: False Premium flag corrected")
+                return {
+                    "success": True,
+                    "status": "LIVE_NORMAL",
+                    "username": final_username or f"user_{stream_id}",
+                    "error": None
+                }
             return {
                 "success": False,
-                "status": "MISMATCH",
+                "status": "LIVE_PREMIUM",
                 "username": final_username,
-                "error": f"Stream ID mismatch: expected {stream_id}, got {detected_stream_id}"
+                "error": "Stream is Premium (paywalled)"
             }
         
-        # Check states
         if is_premium:
             return {
                 "success": False,
@@ -196,7 +366,6 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                 "error": "User is offline"
             }
         
-        # Success - LIVE_NORMAL
         print(f"[PRE-FLIGHT] ✓ Stream validated: LIVE_NORMAL, username={final_username}")
         return {
             "success": True,
@@ -218,7 +387,6 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
 
 async def main():
     """Main entry point"""
-    # Get environment variables
     stream_url = os.environ.get("RECORD_URL")
     stream_id = os.environ.get("STREAM_ID")
     stream_name = os.environ.get("STREAM_NAME", "")
@@ -237,7 +405,6 @@ async def main():
     print(f"Source: {recording_source}")
     print("=" * 70)
     
-    # Pre-flight check
     print("\n" + "=" * 70)
     print("PRE-FLIGHT VALIDATION")
     print("=" * 70)
@@ -249,7 +416,6 @@ async def main():
         username = validation["username"] or "Unknown"
         error = validation["error"]
         
-        # Send appropriate error message
         if status == "LIVE_PREMIUM":
             msg = f"💎 <b>بث Premium</b>\n👤 المستخدم: <code>{stream_id}</code>\n👤 الاسم: <b>{username}</b>\n\n⚠️ هذا البث مدفوع ولا يمكن تسجيله."
         elif status == "OFFLINE":
@@ -261,7 +427,6 @@ async def main():
         
         send_telegram_message(msg)
         
-        # Update worker state
         update_worker_state(stream_id, {
             "status": "failed",
             "error": error,
@@ -271,24 +436,20 @@ async def main():
         print(f"\n[PRE-FLIGHT] ✗ Validation failed: {status} - {error}")
         sys.exit(1)
     
-    # Validation succeeded
     detected_username = validation["username"]
     if detected_username and not stream_name:
         stream_name = detected_username
         print(f"[PRE-FLIGHT] ✓ Using detected username: {stream_name}")
-        # Update environment variable for record_once.py
         os.environ["STREAM_NAME"] = stream_name
     
     print(f"\n[PRE-FLIGHT] ✓ All checks passed - proceeding with recording")
     
-    # Update worker state with username
     update_worker_state(stream_id, {
         "stream_name": stream_name,
         "status": "recording",
         "source": recording_source
     })
     
-    # Send start message
     source_emoji = "✋" if recording_source == "manual" else "🤖"
     start_msg = (
         f"{source_emoji} <b>بدأ التسجيل</b>\n"
@@ -298,7 +459,6 @@ async def main():
     )
     send_telegram_message(start_msg)
     
-    # Call the original record_once.py
     print("\n" + "=" * 70)
     print("CALLING ORIGINAL record_once.py")
     print("=" * 70)
