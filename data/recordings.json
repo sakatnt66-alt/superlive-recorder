@@ -81,9 +81,10 @@
       "stream_id": "52344625",
       "stream_url": "https://superlivetv.com/fr/livestream/152595994",
       "stream_name": "البسكوته💃$كيرفي$💘",
-      "status": "recording",
+      "status": "stopped",
       "started_at": "2026-10-09T01:41:27.873Z",
-      "source": "auto"
+      "source": "auto",
+      "stopped_at": "2026-10-09T01:43:31.926Z"
     },
     {
       "stream_id": "72741120",
