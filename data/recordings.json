@@ -77,7 +77,9 @@
       "stream_name": "🪬🍬💞الفرسه الورديه💞🍬🪬",
       "status": "recording",
       "started_at": "2026-10-09T15:13:53.500Z",
-      "source": "auto"
+      "source": "auto",
+      "state": "failed",
+      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     },
     {
       "stream_id": "44656536",
