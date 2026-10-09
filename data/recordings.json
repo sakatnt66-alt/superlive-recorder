@@ -75,16 +75,6 @@
       "status": "recording",
       "started_at": "2026-10-09T01:02:28.235Z",
       "source": "manual"
-    },
-    {
-      "stream_id": "61055822",
-      "stream_url": "https://superlivetv.com/fr/livestream/152592720",
-      "stream_name": "الملكه",
-      "status": "recording",
-      "started_at": "2026-10-09T01:05:04.889Z",
-      "source": "auto",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
