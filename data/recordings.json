@@ -46,7 +46,9 @@
       "stream_name": "نجلاء💎🎀",
       "status": "recording",
       "started_at": "2026-10-09T14:33:56.504Z",
-      "source": "auto"
+      "source": "auto",
+      "state": "failed",
+      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
