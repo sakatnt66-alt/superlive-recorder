@@ -95,6 +95,11 @@
       "started_at": "2026-10-09T01:41:30.060Z",
       "source": "auto",
       "stopped_at": "2026-10-09T01:43:30.073Z"
+    },
+    {
+      "stream_id": "65826144",
+      "state": "failed",
+      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
