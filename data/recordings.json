@@ -44,11 +44,12 @@
       "stream_id": "21421785",
       "stream_url": "https://superlivetv.com/fr/livestream/152631022",
       "stream_name": "نجلاء💎🎀",
-      "status": "recording",
+      "status": "stopped",
       "started_at": "2026-10-09T14:06:14.778Z",
       "source": "auto",
       "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
+      "error": "Live video was not detected; last selector error=Error: No visible live video target found",
+      "stopped_at": "2026-10-09T14:26:42.858Z"
     },
     {
       "stream_id": "65826144",
