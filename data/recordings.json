@@ -41,17 +41,6 @@
       "stopped_at": "2026-10-09T01:43:31.926Z"
     },
     {
-      "stream_id": "21421785",
-      "stream_url": "https://superlivetv.com/fr/livestream/152631022",
-      "stream_name": "نجلاء💎🎀",
-      "status": "stopped",
-      "started_at": "2026-10-09T14:33:56.504Z",
-      "source": "auto",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found",
-      "stopped_at": "2026-10-09T15:13:28.363Z"
-    },
-    {
       "stream_id": "61055822",
       "stream_url": "https://superlivetv.com/fr/livestream/152633831",
       "stream_name": "الملكه",
@@ -72,6 +61,14 @@
       "state": "failed",
       "error": "Live video was not detected; last selector error=Error: No visible live video target found",
       "stopped_at": "2026-10-09T15:18:36.219Z"
+    },
+    {
+      "stream_id": "21421785",
+      "stream_url": "https://superlivetv.com/fr/livestream/152631022",
+      "stream_name": "نجلاء💎🎀",
+      "status": "recording",
+      "started_at": "2026-10-09T15:21:10.586Z",
+      "source": "auto"
     }
   ]
 }
