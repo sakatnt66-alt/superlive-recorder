@@ -73,19 +73,6 @@
       "started_at": "2026-10-08T23:28:24.887Z",
       "source": "auto",
       "stopped_at": "2026-10-09T00:01:45.438Z"
-    },
-    {
-      "stream_id": "54125807",
-      "stream_url": "https://superlivetv.com/fr/livestream/54125807",
-      "stream_name": "الملكة كيوته",
-      "status": "stopped",
-      "started_at": "2026-10-08T23:48:48.171Z",
-      "source": "auto",
-      "stopped_at": "2026-10-09T00:01:43.395Z"
-    },
-    {
-      "stream_id": "54125807",
-      "state": "completed"
     }
   ]
 }
