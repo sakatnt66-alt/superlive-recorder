@@ -47,6 +47,14 @@
       "status": "recording",
       "started_at": "2026-10-09T15:52:11.227Z",
       "source": "auto"
+    },
+    {
+      "stream_id": "24353293",
+      "stream_url": "https://superlivetv.com/fr/livestream/152635012",
+      "stream_name": "Alisa",
+      "status": "recording",
+      "started_at": "2026-10-09T15:52:13.358Z",
+      "source": "auto"
     }
   ]
 }
