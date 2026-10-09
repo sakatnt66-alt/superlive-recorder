@@ -49,16 +49,6 @@
       "source": "auto",
       "state": "failed",
       "error": "Live video was not detected; last selector error=Error: No visible live video target found"
-    },
-    {
-      "stream_id": "65826144",
-      "stream_url": "https://superlivetv.com/fr/livestream/152629307",
-      "stream_name": "🪬🍬💞الفرسه الورديه💞🍬🪬",
-      "status": "recording",
-      "started_at": "2026-10-09T14:06:20.576Z",
-      "source": "auto",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
