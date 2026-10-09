@@ -57,14 +57,6 @@
       "source": "auto",
       "state": "failed",
       "error": "Page is blank (Stream Offline or Blocked)"
-    },
-    {
-      "stream_id": "72741120",
-      "stream_url": "https://superlivetv.com/fr/livestream/152635653",
-      "stream_name": "ميساء💝💝",
-      "status": "recording",
-      "started_at": "2026-10-09T15:52:17.041Z",
-      "source": "auto"
     }
   ]
 }
