@@ -41,17 +41,6 @@
       "stopped_at": "2026-10-09T15:13:24.123Z"
     },
     {
-      "stream_id": "65826144",
-      "stream_url": "https://superlivetv.com/fr/livestream/152634626",
-      "stream_name": "🪬🍬💞الفرسه الورديه💞🍬🪬",
-      "status": "stopped",
-      "started_at": "2026-10-09T15:13:53.500Z",
-      "source": "auto",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found",
-      "stopped_at": "2026-10-09T15:18:36.219Z"
-    },
-    {
       "stream_id": "21421785",
       "stream_url": "https://superlivetv.com/fr/livestream/152631022",
       "stream_name": "نجلاء💎🎀",
@@ -60,6 +49,14 @@
       "source": "auto",
       "state": "failed",
       "error": "Live video was not detected; last selector error=Error: No visible live video target found"
+    },
+    {
+      "stream_id": "65826144",
+      "stream_url": "https://superlivetv.com/fr/livestream/152635102",
+      "stream_name": "🪬🍬💞الفرسه الورديه💞🍬🪬",
+      "status": "recording",
+      "started_at": "2026-10-09T15:29:16.075Z",
+      "source": "auto"
     }
   ]
 }
