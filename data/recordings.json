@@ -75,14 +75,6 @@
       "status": "recording",
       "started_at": "2026-10-09T01:02:28.235Z",
       "source": "manual"
-    },
-    {
-      "stream_id": "33018909",
-      "stream_url": "https://superlivetv.com/fr/livestream/152593996",
-      "stream_name": "🇲🇦🦌غزلان فرنسي🦌",
-      "status": "recording",
-      "started_at": "2026-10-09T01:12:54.236Z",
-      "source": "auto"
     }
   ]
 }
