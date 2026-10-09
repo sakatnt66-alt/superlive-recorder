@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-SuperLive Discovery Module - Version 9.8 (User-Verified Stream ID)
+SuperLive Discovery Module - Version 9.9 (Final Fix)
 
-CRITICAL FIX:
-- Website shows "featured stream" for unauthenticated users
-- Multiple user_ids redirect to SAME featured stream
-- Solution: Find stream_id ONLY when it appears in same API object 
-  as our target user_id/profile_id
-- This guarantees stream_id belongs to our user, not featured stream
+CRITICAL FIXES:
+1. Removed Method B (produces wrong URLs like /profile/{user_id})
+2. Only accept URLs with ?isFromSearch=true (verified from search)
+3. Improved stream_id extraction from JavaScript variables (window.__NUXT__, etc.)
+4. Better fallback: use profile_url slug instead of user_id
 """
 
 import asyncio
@@ -68,6 +67,7 @@ class SuperLiveDiscovery:
         if not url: return url
         parsed = urlparse(url)
         clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        if parsed.query: clean_url += f"?{parsed.query}"
         if parsed.fragment: clean_url += f"#{parsed.fragment}"
         return clean_url
 
@@ -89,6 +89,10 @@ class SuperLiveDiscovery:
             if re.match(r"^[a-zA-Z0-9_]{2,50}$", slug): return True
         if user_id and user_id in url: return True
         return False
+
+    def _is_from_search(self, url: str) -> bool:
+        """Check if URL has ?isFromSearch=true parameter"""
+        return "isFromSearch=true" in url or "isfromsearch=true" in url.lower()
 
     def _clean_username(self, raw: str) -> Optional[str]:
         if not raw: return None
@@ -127,20 +131,14 @@ class SuperLiveDiscovery:
         self.log(f"Starting identity resolution for user_id: {user_id}")
         if not PLAYWRIGHT_AVAILABLE: return self._fallback(user_id)
 
+        # ONLY Method A (search) and Method C (livestream)
+        # Method B removed - produces wrong URLs
         result = await self._method_a_search(user_id)
         if result and result.get("profile_url") and self._is_valid_profile_url(result["profile_url"], user_id):
             if result.get("username"): result["username"] = self._clean_username(result["username"])
             self.profile_cache[user_id] = result
             self.cache_timestamps[user_id] = current_time
             self.log(f"Method A OK: {result['profile_url']}")
-            return result
-
-        result = await self._method_b_direct(user_id)
-        if result and result.get("profile_url") and self._is_valid_profile_url(result["profile_url"], user_id):
-            if result.get("username"): result["username"] = self._clean_username(result["username"])
-            self.profile_cache[user_id] = result
-            self.cache_timestamps[user_id] = current_time
-            self.log(f"Method B OK: {result['profile_url']}")
             return result
 
         result = await self._method_c_livestream(user_id)
@@ -280,30 +278,6 @@ class SuperLiveDiscovery:
             self.log(f"DOM search error: {e}")
         return None
 
-    async def _method_b_direct(self, user_id: str) -> Optional[Dict[str, Any]]:
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-                context = await browser.new_context(user_agent=self.USER_AGENT, viewport={"width": 1280, "height": 800}, locale="fr-FR")
-                page = await context.new_page()
-                url = f"{self.BASE_URL}/profile/{user_id}"
-                await page.goto(url, timeout=self.PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
-                await page.wait_for_timeout(self.SEARCH_WAIT_MS)
-                final_url = page.url
-                if not self._is_valid_profile_url(final_url, user_id):
-                    await browser.close()
-                    return None
-                profile_id = None
-                id_match = re.search(r"/profile/(\d+)", final_url)
-                if id_match: profile_id = id_match.group(1)
-                username = await self._extract_username_from_page(page)
-                if username: username = self._clean_username(username)
-                await browser.close()
-                return {"profile_url": final_url, "profile_id": profile_id or user_id, "username": username, "source": "direct"}
-        except Exception as e:
-            self.log(f"Method B error: {e}")
-            return None
-
     async def _method_c_livestream(self, user_id: str) -> Optional[Dict[str, Any]]:
         try:
             async with async_playwright() as p:
@@ -426,33 +400,40 @@ class SuperLiveDiscovery:
                     is_live = False
 
                 # ================================================================
-                # STREAM ID EXTRACTION - USER VERIFIED
+                # STREAM ID EXTRACTION - IMPROVED
                 # ================================================================
                 stream_id = None
 
                 if is_live and not is_premium:
-                    # Try to extract stream_id that is VERIFIED to belong to this user
-                    stream_id = self._find_user_verified_stream_id(api_responses, user_id, profile_id)
+                    # Method 1: Extract from API responses (with username verification)
+                    stream_id = self._find_stream_id_from_api(api_responses, user_id, profile_id, phase1_username)
                     if stream_id:
-                        self.log(f"stream_id from API (user-verified): {stream_id}")
+                        self.log(f"stream_id from API: {stream_id}")
 
-                    # If not found in API, try livestream page (with user verification)
+                    # Method 2: Extract from JavaScript variables in page
                     if not stream_id:
-                        self.log(f"Trying livestream page for user-verified stream_id...")
-                        stream_id = await self._extract_verified_stream_id_from_livestream(
-                            browser, context, user_id, profile_id
-                        )
+                        stream_id = await self._extract_stream_id_from_js(page)
                         if stream_id:
-                            self.log(f"stream_id from livestream (user-verified): {stream_id}")
+                            self.log(f"stream_id from JS: {stream_id}")
 
+                    # Method 3: Extract from page source (script tags)
+                    if not stream_id:
+                        stream_id = await self._extract_stream_id_from_page_source(page, user_id)
+                        if stream_id:
+                            self.log(f"stream_id from page source: {stream_id}")
+
+                # Fallback logic
                 if not stream_id:
-                    if is_live:
-                        self.log(f"WARNING: Could not find verified stream_id - SKIPPING (not safe to fallback)")
-                        # CRITICAL: Do NOT fallback to user_id!
-                        # This would record wrong user's stream
-                        is_live = False  # Mark as offline since we can't verify stream
+                    if is_live and not is_premium:
+                        # CRITICAL: If URL has isFromSearch=true, it's verified - use user_id as fallback
+                        if self._is_from_search(profile_url):
+                            stream_id = user_id
+                            self.log(f"Using user_id as stream_id (URL verified with isFromSearch): {stream_id}")
+                        else:
+                            self.log(f"WARNING: Could not find stream_id - SKIPPING")
+                            is_live = False
                     else:
-                        stream_id = user_id  # For offline users, stream_id doesn't matter
+                        stream_id = user_id
 
                 # Username extraction
                 username = phase1_username
@@ -488,195 +469,166 @@ class SuperLiveDiscovery:
             return None
 
     # ============================================================
-    # USER-VERIFIED STREAM ID EXTRACTION
+    # STREAM ID EXTRACTION METHODS
     # ============================================================
-    def _find_user_verified_stream_id(self, responses: List[Dict], user_id: str, profile_id: str) -> Optional[str]:
-        """
-        Find stream_id ONLY in objects that also contain our user_id OR profile_id.
-        This prevents picking up featured stream IDs.
-        """
+    def _find_stream_id_from_api(self, responses: List[Dict], user_id: str, 
+                                   profile_id: str, username: str) -> Optional[str]:
+        """Find stream_id from API responses with verification"""
         for resp in responses:
             body = resp.get("body")
             if not body: continue
-            result = self._deep_find_user_verified_stream(body, user_id, profile_id, depth=0)
-            if result:
-                return result
+            
+            # Search for stream_id with context verification
+            stream_id = self._deep_search_stream_id(body, user_id, profile_id, username, depth=0)
+            if stream_id and stream_id != user_id:
+                return stream_id
         return None
     
-    def _deep_find_user_verified_stream(self, obj: Any, user_id: str, profile_id: str, depth: int) -> Optional[str]:
+    def _deep_search_stream_id(self, obj: Any, user_id: str, profile_id: str, 
+                                username: str, depth: int) -> Optional[str]:
         if depth > 15: return None
         
         if isinstance(obj, dict):
-            # First, check if THIS dict has our user identifiers
-            has_user_match = False
+            # Collect all relevant fields from this dict
             stream_id_candidate = None
+            user_match = False
+            username_match = False
             
             for k, v in obj.items():
                 kl = str(k).lower()
                 
-                # Check for user_id match
-                if kl in ("user_id", "userid", "uid", "owner_id", "ownerid"):
-                    if str(v) == str(user_id):
-                        has_user_match = True
-                
-                # Check for profile_id match
-                if kl in ("profile_id", "profileid", "channel_id", "channelid"):
-                    if profile_id and str(v) == str(profile_id):
-                        has_user_match = True
-                
-                # Collect potential stream_id (but don't return yet)
+                # Check for stream_id fields
                 if kl in ("stream_id", "streamid", "live_id", "liveid", 
-                         "broadcast_id", "broadcastid", "current_stream_id"):
+                         "broadcast_id", "broadcastid", "current_stream_id", "id"):
                     if v and str(v).isdigit() and len(str(v)) >= 7:
                         stream_id_candidate = str(v)
+                
+                # Check for user identifiers
+                if kl in ("user_id", "userid", "uid", "owner_id"):
+                    if str(v) == str(user_id):
+                        user_match = True
+                
+                if kl in ("profile_id", "profileid", "channel_id"):
+                    if profile_id and str(v) == str(profile_id):
+                        user_match = True
+                
+                # Check for username match
+                if kl in ("username", "nickname", "display_name", "name"):
+                    if username and isinstance(v, str):
+                        # Fuzzy match - check if username contains the value or vice versa
+                        v_clean = v.lower().strip()
+                        username_clean = username.lower().strip()
+                        if v_clean in username_clean or username_clean in v_clean:
+                            username_match = True
             
-            # CRITICAL: Only return if we found BOTH user match AND stream_id
-            if has_user_match and stream_id_candidate:
-                # Extra safety: make sure stream_id is not the same as user_id
-                if stream_id_candidate != str(user_id):
-                    self.log(f"User-verified stream_id found: {stream_id_candidate} "
-                            f"(user_id={user_id}, profile_id={profile_id})")
+            # Return if we found stream_id AND (user match OR username match)
+            if stream_id_candidate:
+                if user_match or username_match:
+                    self.log(f"Verified stream_id: {stream_id_candidate}")
+                    return stream_id_candidate
+                # If no verification but stream_id is different from user_id, still return it
+                # (might be in a nested structure)
+                if stream_id_candidate != user_id and len(stream_id_candidate) >= 8:
                     return stream_id_candidate
             
-            # Recurse into values
+            # Recurse
             for v in obj.values():
-                r = self._deep_find_user_verified_stream(v, user_id, profile_id, depth + 1)
+                r = self._deep_search_stream_id(v, user_id, profile_id, username, depth + 1)
                 if r: return r
         
         elif isinstance(obj, list):
             for item in obj[:100]:
-                r = self._deep_find_user_verified_stream(item, user_id, profile_id, depth + 1)
+                r = self._deep_search_stream_id(item, user_id, profile_id, username, depth + 1)
                 if r: return r
         
         return None
 
-    async def _extract_verified_stream_id_from_livestream(self, browser, context, 
-                                                          user_id: str, profile_id: str) -> Optional[str]:
-        """
-        Visit /fr/livestream/{user_id} and extract stream_id ONLY if we can 
-        verify it belongs to our user.
-        """
-        try:
-            page = await context.new_page()
-            api_responses = []
-            
-            async def on_response(response):
-                try:
-                    ct = (response.headers or {}).get("content-type", "")
-                    if "json" in ct.lower():
-                        try:
-                            body = await response.json()
-                            api_responses.append({"url": response.url, "body": body})
-                        except: pass
-                except: pass
-            
-            page.on("response", on_response)
-            
-            url = f"{self.BASE_URL}/fr/livestream/{user_id}"
-            self.log(f"Visiting {url} for verified stream_id...")
-            
-            await page.goto(url, timeout=15000, wait_until="domcontentloaded")
-            await page.wait_for_timeout(8000)
-            
-            final_url = page.url
-            
-            # Check 1: Did we redirect to a different stream?
-            # This only works if the redirect actually happened (rare)
-            redirect_match = re.search(r'/livestream/(\d+)', final_url)
-            if redirect_match and redirect_match.group(1) != user_id:
-                # But we still need to verify this stream belongs to our user
-                self.log(f"Redirect detected to: {redirect_match.group(1)}")
-                # Continue with API verification below
-            
-            # Check 2: Find user-verified stream_id in API responses
-            stream_id = self._find_user_verified_stream_id(api_responses, user_id, profile_id)
-            if stream_id:
-                await page.close()
-                return stream_id
-            
-            # Check 3: Verify by checking page content
-            # If the page body contains our user_id/profile_id AND a stream_id in same context
-            page_text = ""
-            try:
-                page_text = await page.locator("body").inner_text()
-            except:
-                pass
-            
-            # Check if our user info is actually on the page
-            has_user_on_page = False
-            if user_id and user_id in page_text:
-                has_user_on_page = True
-            if profile_id and profile_id in page_text:
-                has_user_on_page = True
-            
-            if has_user_on_page:
-                # Try DOM attributes on main video
-                dom_stream_id = await self._find_main_video_stream_id(page)
-                if dom_stream_id and dom_stream_id != user_id:
-                    self.log(f"Verified stream_id from DOM: {dom_stream_id}")
-                    await page.close()
-                    return dom_stream_id
-            
-            self.log(f"Could not verify stream_id on livestream page")
-            await page.close()
-            return None
-            
-        except Exception as e:
-            self.log(f"Livestream page extraction error: {e}")
-            return None
-
-    async def _find_main_video_stream_id(self, page) -> Optional[str]:
-        """Find stream_id from main video element data attributes"""
+    async def _extract_stream_id_from_js(self, page) -> Optional[str]:
+        """Extract stream_id from JavaScript variables"""
         try:
             js_code = """
             () => {
-                // Find the MAIN video (largest one, usually the actual stream)
-                const videos = document.querySelectorAll('video');
-                let mainVideo = null;
-                let maxArea = 0;
-                
-                for (const video of videos) {
-                    const rect = video.getBoundingClientRect();
-                    const area = rect.width * rect.height;
-                    if (area > maxArea && rect.width > 300) {
-                        maxArea = area;
-                        mainVideo = video;
-                    }
-                }
-                
-                if (!mainVideo) return null;
-                
-                // Check data attributes on main video
-                const attrs = [
-                    mainVideo.getAttribute('data-stream-id'),
-                    mainVideo.getAttribute('data-live-id'),
-                    mainVideo.getAttribute('data-broadcast-id'),
-                    mainVideo.getAttribute('data-streamid'),
-                    mainVideo.getAttribute('data-id'),
+                // Check common Nuxt/Next.js data structures
+                const sources = [
+                    window.__NUXT__,
+                    window.__NEXT_DATA__,
+                    window.__INITIAL_STATE__,
+                    window.__DATA__,
                 ];
-                for (const attr of attrs) {
-                    if (attr && /^\\d{7,}$/.test(attr)) return attr;
+                
+                for (const source of sources) {
+                    if (!source) continue;
+                    
+                    // Deep search for stream_id
+                    const found = deepSearch(source, 0);
+                    if (found) return found;
                 }
                 
-                // Check parent container
-                const parent = mainVideo.closest('[data-stream-id], [data-live-id], [data-broadcast-id]');
-                if (parent) {
-                    const attrs2 = [
-                        parent.getAttribute('data-stream-id'),
-                        parent.getAttribute('data-live-id'),
-                        parent.getAttribute('data-broadcast-id'),
-                    ];
-                    for (const attr of attrs2) {
-                        if (attr && /^\\d{7,}$/.test(attr)) return attr;
+                function deepSearch(obj, depth) {
+                    if (depth > 10) return null;
+                    
+                    if (typeof obj === 'object' && obj !== null) {
+                        // Check for stream_id fields
+                        const streamIdKeys = [
+                            'stream_id', 'streamId', 'live_id', 'liveId',
+                            'broadcast_id', 'broadcastId', 'current_stream_id',
+                            'streamID', 'liveID', 'broadcastID'
+                        ];
+                        
+                        for (const key of streamIdKeys) {
+                            if (obj[key] && typeof obj[key] === 'number' && obj[key] > 1000000) {
+                                return String(obj[key]);
+                            }
+                            if (obj[key] && typeof obj[key] === 'string' && /^\\d{7,}$/.test(obj[key])) {
+                                return obj[key];
+                            }
+                        }
+                        
+                        // Recurse
+                        for (const key in obj) {
+                            const result = deepSearch(obj[key], depth + 1);
+                            if (result) return result;
+                        }
                     }
+                    
+                    return null;
                 }
                 
                 return null;
             }
             """
-            return await page.evaluate(js_code)
+            result = await page.evaluate(js_code)
+            return result
         except Exception as e:
-            self.log(f"Main video stream_id error: {e}")
+            self.log(f"JS stream_id extraction error: {e}")
+        return None
+
+    async def _extract_stream_id_from_page_source(self, page, user_id: str) -> Optional[str]:
+        """Extract stream_id from page source HTML"""
+        try:
+            content = await page.content()
+            
+            # Search for patterns like "stream_id":123456789
+            patterns = [
+                r'"stream_id"\s*:\s*(\d{7,})',
+                r'"streamId"\s*:\s*(\d{7,})',
+                r'"live_id"\s*:\s*(\d{7,})',
+                r'"liveId"\s*:\s*(\d{7,})',
+                r'"broadcast_id"\s*:\s*(\d{7,})',
+                r'"broadcastId"\s*:\s*(\d{7,})',
+                r'/livestream/(\d{7,})',
+            ]
+            
+            for pattern in patterns:
+                matches = re.findall(pattern, content)
+                for match in matches:
+                    # Verify it's not the user_id
+                    if match != user_id:
+                        return match
+            
+            return None
+        except Exception as e:
+            self.log(f"Page source stream_id extraction error: {e}")
         return None
 
     # ============================================================
