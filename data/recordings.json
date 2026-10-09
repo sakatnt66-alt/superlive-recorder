@@ -83,7 +83,9 @@
       "stream_name": "الملكه",
       "status": "recording",
       "started_at": "2026-10-09T00:46:14.077Z",
-      "source": "auto"
+      "source": "auto",
+      "state": "failed",
+      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     },
     {
       "stream_id": "99919557",
