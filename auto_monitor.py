@@ -1,21 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-auto_monitor.py - Version 5.3 (Use Real Stream ID)
-
-CRITICAL FIX in v5.3:
-- Use REAL stream_id from Phase 2 (extracted from API or video URL)
-- NOT user_id from watchlist
-- user_id != stream_id on this website!
-- record_once.py needs: /fr/livestream/{stream_id}
-"""
-
-import asyncio
-import json
-import os
-import sys
-import time
-import urllib.error
-import urllib.request
+import asyncio, json, os, sys, time, urllib.error, urllib.request
 from typing import Any, Dict, List, Optional
 
 try:
@@ -33,90 +17,46 @@ UPDATE_WATCHLIST_NAMES = os.environ.get("UPDATE_WATCHLIST_NAMES", "0") not in ("
 
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "5"))
 API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "20"))
-DISCOVERY_CONCURRENCY = int(os.environ.get("DISCOVERY_CONCURRENCY", "2"))
+DISCOVERY_CONCURRENCY = int(os.environ.get("DISCOVERY_CONCURRENCY", "4")) # تم الزيادة من 2 إلى 4 لتسريع الفحص بأمان
 
-# Base URL uses {stream_id} NOT {user_id}!
 BASE_LIVE_URL = "https://superlivetv.com/fr/livestream/{stream_id}"
-
-LIVE_NORMAL = "LIVE_NORMAL"
-LIVE_PREMIUM = "LIVE_PREMIUM"
-OFFLINE = "OFFLINE"
-UNKNOWN = "UNKNOWN"
-DISCOVERY_FAILED = "DISCOVERY_FAILED"
-
+LIVE_NORMAL, LIVE_PREMIUM, OFFLINE, UNKNOWN, DISCOVERY_FAILED = "LIVE_NORMAL", "LIVE_PREMIUM", "OFFLINE", "UNKNOWN", "DISCOVERY_FAILED"
 
 def log(msg): print(f"[AUTO] {msg}", flush=True)
-
-
-def log_result(uid, r):
-    log(f"username={uid}")
-    log(f"source=discovery_layer")
-    if r.get("profile_url"): log(f"profile_url={r['profile_url']}")
-    if r.get("profile_id"): log(f"profile_id={r['profile_id']}")
-    if r.get("stream_id"): log(f"stream_id={r['stream_id']}")
-    if r.get("display_name"): log(f"display_name={r['display_name']}")
-    log(f"phase={r.get('phase', 'unknown')}")
-    log(f"status={r.get('status', UNKNOWN)}")
-    log(f"action={r.get('action', 'SKIP')}")
-    log(f"reason={r.get('reason', 'unknown')}")
-
-
 def html_escape(t): return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
 
 def split_text(t, limit=3900):
     chunks, current = [], ""
     for line in t.split("\n"):
-        if len(current) + len(line) + 1 > limit:
-            chunks.append(current); current = line
-        else:
-            current = f"{current}\n{line}" if current else line
+        if len(current) + len(line) + 1 > limit: chunks.append(current); current = line
+        else: current = f"{current}\n{line}" if current else line
     if current: chunks.append(current)
     return chunks or [""]
-
 
 def send_report(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False
     for chunk in split_text(text):
         try:
-            req = urllib.request.Request(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            req = urllib.request.Request(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 data=json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "HTML"}).encode(),
-                method="POST",
-                headers={"Content-Type": "application/json"}
-            )
+                method="POST", headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=20) as r: r.read()
         except: pass
     return True
 
-
 def build_report(elapsed, stats):
-    lines = [f"✅ انتهى الفحص في {elapsed:.1f} ثانية.", "",
-             f"📊 ({stats['total_watchlist']}):",
-             f"• قيد التسجيل: {stats['already_recording']}",
-             f"• تم فحصه: {stats['checked_now']}", "",
-             "📈 النتائج:",
-             f"• 🟢 عادي: {stats['live_normal']}",
-             f"• 🟡 مدفوع: {stats['live_premium']}",
-             f"• ⚪ غير متصل: {stats['offline']}",
-             f"• ⚠️ فشل اكتشاف: {stats.get('discovery_failed', 0)}",
-             "",
-             f"🔴 تم تشغيل {stats['started_recordings']} تسجيل."]
-    names = stats.get("names", {})
-    if names:
-        lines.append(""); lines.append("👤 الأسماء:")
-        for uid, name in names.items():
-            sid = stats.get("stream_id_map", {}).get(uid, "?")
-            lines.append(f"• {uid} [S:{sid}] -> {html_escape(name)}")
+    lines = [f"✅ انتهى الفحص في {elapsed:.1f} ثانية.", "", f"📊 ({stats['total_watchlist']}):", f"• قيد التسجيل: {stats['already_recording']}", f"• تم فحصه: {stats['checked_now']}", "", "📈 النتائج:", f"• 🟢 عادي: {stats['live_normal']}", f"• 🟡 مدفوع: {stats['live_premium']}", f"• ⚪ غير متصل: {stats['offline']}", f"• ⚠️ فشل اكتشاف: {stats.get('discovery_failed', 0)}", "", f"🔴 تم تشغيل {stats['started_recordings']} تسجيل."]
+    if stats.get("names"):
+        lines.extend(["", "👤 الأسماء:"])
+        for uid, name in stats["names"].items():
+            lines.append(f"• {uid} [S:{stats.get('stream_id_map', {}).get(uid, '?')}] -> {html_escape(name)}")
     return "\n".join(lines)
-
 
 def api_sync(path, method="GET", payload=None):
     url = f"{WORKER_URL}{path}"
     headers = {"User-Agent": "AutoMonitor/1.0", "Content-Type": "application/json", "Accept": "application/json"}
     if AUTO_API_TOKEN: headers["X-Auto-Token"] = AUTO_API_TOKEN
-    data = json.dumps(payload).encode() if payload else None
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    req = urllib.request.Request(url, data=json.dumps(payload).encode() if payload else None, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=API_TIMEOUT) as r:
             body = r.read().decode()
@@ -126,24 +66,19 @@ def api_sync(path, method="GET", payload=None):
     except Exception as e:
         return 0, {"error": str(e)}
 
-
 async def api(path, method="GET", payload=None):
     return await asyncio.to_thread(api_sync, path, method, payload)
-
 
 async def load_watchlist():
     status, data = await api("/api/watchlist", "GET")
     if status != 200: raise RuntimeError(f"Watchlist error: {status}")
-    items = data.get("watchlist", [])
-    users = []
-    names = {}
-    for it in items:
+    users, names = [], {}
+    for it in data.get("watchlist", []):
         uid = str(it.get("stream_id") or "").strip()
         if uid and uid.isdigit():
             users.append(uid)
             if it.get("display_name"): names[uid] = str(it["display_name"])
     return users, names
-
 
 async def load_active_recordings():
     status, data = await api("/api/active-recordings", "GET")
@@ -151,31 +86,16 @@ async def load_active_recordings():
     ids = {str(r.get("stream_id")) for r in data.get("recordings", []) if r.get("status") == "recording"}
     return {"active_count": len(ids), "max_concurrent": MAX_CONCURRENT, "active_ids": ids}
 
-
-async def trigger_recording(uid, url, name="", stream_id="", profile_id=""):
-    status, data = await api(f"/api/auto-trigger/{uid}", "POST",
-                             {"stream_url": url, "source": "auto", "stream_name": name,
-                              "stream_id": stream_id, "profile_id": profile_id, "user_id": uid})
-    if status == 200 and data.get("started"): return True, "started"
-    return False, data.get("error", f"http_{status}")
-
-
-async def update_name(uid, name):
-    try: await api(f"/api/watchlist/name/{uid}", "POST", {"display_name": name})
-    except: pass
-
+async def trigger_recording(uid, url, name="", sid=""):
+    status, data = await api(f"/api/auto-trigger/{uid}", "POST", {"stream_url": url, "source": "auto", "stream_name": name, "stream_id": sid, "user_id": uid})
+    return (True, "started") if status == 200 and data.get("started") else (False, data.get("error", f"http_{status}"))
 
 async def process_user(discovery, uid, names, sem):
     async with sem:
-        r = {"user_id": uid, "profile_url": None, "profile_id": None,
-             "stream_id": None,  # NEW: real stream_id
-             "display_name": names.get(uid), "stream_url": None,
-             "status": UNKNOWN, "reason": "", "action": "SKIP", "phase": "none"}
-
+        r = {"user_id": uid, "profile_url": None, "profile_id": None, "stream_id": None, "display_name": names.get(uid), "stream_url": None, "status": UNKNOWN, "reason": "", "action": "SKIP", "phase": "none"}
         if not DISCOVERY_AVAILABLE:
             r.update({"status": DISCOVERY_FAILED, "reason": "no_discovery", "phase": "init"})
             return r
-
         try:
             log(f"[Phase 1] Resolving {uid}")
             info = await discovery.discover_profile_id(uid)
@@ -193,45 +113,27 @@ async def process_user(discovery, uid, names, sem):
 
         try:
             log(f"[Phase 2] Check live at {r['profile_url']}")
-            live = await discovery.check_live_status(
-                r["profile_url"],
-                uid,
-                r.get("profile_id", ""),
-                r.get("display_name")
-            )
+            live = await discovery.check_live_status(r["profile_url"], uid, r.get("profile_id", ""), r.get("display_name"))
             if not live:
                 r.update({"status": UNKNOWN, "reason": "check_failed", "phase": "p2_failed"})
                 return r
-
-            # Extract real stream_id from Phase 2
-            r["stream_id"] = live.get("stream_id") or uid
-            log(f"[Phase 2] stream_id={r['stream_id']} (user_id={uid})")
-
+            
             if live.get("username") and not r.get("display_name"): r["display_name"] = live["username"]
+            
             if not live.get("is_live"):
-                r.update({"status": OFFLINE, "reason": "no_live", "action": "SKIP_OFFLINE", "phase": "p2_offline"})
+                r.update({"status": OFFLINE, "reason": "no_live", "action": "SKIP_OFFLINE", "phase": "p2_offline", "stream_id": uid})
                 return r
+            
             if live.get("is_premium"):
-                r.update({"status": LIVE_PREMIUM, "reason": "premium", "action": "SKIP_PREMIUM", "phase": "p2_premium"})
+                r.update({"status": LIVE_PREMIUM, "reason": "premium", "action": "SKIP_PREMIUM", "phase": "p2_premium", "stream_id": live.get("stream_id") or uid})
                 return r
-            r.update({"status": LIVE_NORMAL, "reason": "live", "action": "CANDIDATE",
-                      "stream_url": live.get("stream_url") or r["profile_url"], "phase": "p2_live"})
-            log(f"[Phase 2] LIVE OK")
+            
+            r.update({"status": LIVE_NORMAL, "reason": "live", "action": "CANDIDATE", "stream_url": live.get("stream_url") or r["profile_url"], "stream_id": live.get("stream_id") or uid, "phase": "p2_live"})
+            log(f"[Phase 2] LIVE OK, stream_id={r['stream_id']}")
         except Exception as e:
             r.update({"status": UNKNOWN, "reason": f"p2:{str(e)[:60]}", "phase": "p2_error"})
             return r
-
-        try:
-            validation = await discovery.validate_stream(uid, r.get("profile_id", uid), r.get("stream_url", ""))
-            if not validation.get("validation_passed"):
-                r.update({"status": UNKNOWN, "reason": "validation_failed", "phase": "p3_failed"})
-                return r
-            r["phase"] = "phase_3_done"
-        except Exception as e:
-            log(f"[Phase 3] Error (continuing): {e}")
-
         return r
-
 
 async def process_all(discovery, uids, names):
     if not uids: return {}
@@ -247,20 +149,14 @@ async def process_all(discovery, uids, names):
             results[uid] = res
     return results
 
-
 async def main_async():
     t0 = time.monotonic()
-    stats = {"total_watchlist": 0, "already_recording": 0, "checked_now": 0,
-             "live_normal": 0, "live_premium": 0, "offline": 0, "unknown": 0,
-             "discovery_failed": 0, "started_recordings": 0,
-             "names": {}, "stream_id_map": {}}  # NEW: track stream_ids
-
-    log("Starting Auto Monitor v5.3 (Use Real Stream ID)")
-    if not DISCOVERY_AVAILABLE: log("FATAL: no discovery module"); return 1
-    if not WORKER_URL: log("FATAL: no WORKER_URL"); return 1
+    stats = {"total_watchlist": 0, "already_recording": 0, "checked_now": 0, "live_normal": 0, "live_premium": 0, "offline": 0, "unknown": 0, "discovery_failed": 0, "started_recordings": 0, "names": {}, "stream_id_map": {}}
+    log("Starting Auto Monitor (Optimized for Speed)")
+    if not DISCOVERY_AVAILABLE or not WORKER_URL:
+        log("FATAL: Missing dependencies"); return 1
 
     discovery = SuperLiveDiscovery()
-
     try:
         watchlist, names = await load_watchlist()
         stats["total_watchlist"] = len(watchlist)
@@ -282,22 +178,19 @@ async def main_async():
             log("All recording"); return 0
 
         stats["checked_now"] = len(users_to_check)
-        log(f"Discovery for {len(users_to_check)} users")
+        log(f"Discovery for {len(users_to_check)} users (Concurrency: {DISCOVERY_CONCURRENCY})")
 
         results = await process_all(discovery, users_to_check, names)
         for uid, r in results.items():
-            log_result(uid, r)
             s = r.get("status")
             if s == LIVE_NORMAL: stats["live_normal"] += 1
             elif s == LIVE_PREMIUM: stats["live_premium"] += 1
             elif s == OFFLINE: stats["offline"] += 1
             elif s == DISCOVERY_FAILED: stats["discovery_failed"] += 1
             else: stats["unknown"] += 1
-            # Track stream_id for reporting
+            
             if r.get("stream_id"): stats["stream_id_map"][uid] = r["stream_id"]
-            name = r.get("display_name")
-            if name: stats["names"][uid] = name
-            if UPDATE_WATCHLIST_NAMES and name: await update_name(uid, name)
+            if r.get("display_name"): stats["names"][uid] = r["display_name"]
 
         active = await load_active_recordings()
         slots = active["max_concurrent"] - active["active_count"]
@@ -308,23 +201,18 @@ async def main_async():
             r = results.get(uid)
             if not r or r.get("status") != LIVE_NORMAL: continue
             if uid in active["active_ids"] or slots <= 0: continue
-
-            # ================================================================
-            # CRITICAL: Use REAL stream_id, NOT user_id
-            # record_once.py needs: /fr/livestream/{stream_id}
-            # stream_id is extracted from API or video URL in Phase 2
-            # ================================================================
-            stream_id = r.get("stream_id") or uid
-            url = BASE_LIVE_URL.format(stream_id=stream_id)
-
+            
+            url = r.get("stream_url") or BASE_LIVE_URL.format(stream_id=r.get("stream_id", uid))
             name = r.get("display_name") or stats["names"].get(uid, "")
-            log(f"START_RECORDING {uid} (stream_id={stream_id}) -> {url}")
-            ok, reason = await trigger_recording(uid, url, name, stream_id, r.get("profile_id", ""))
+            log(f"START_RECORDING {uid} (stream_id={r.get('stream_id')}) -> {url}")
+            
+            ok, reason = await trigger_recording(uid, url, name, r.get("stream_id", ""))
             if ok:
                 stats["started_recordings"] += 1
                 slots -= 1
                 active["active_ids"].add(uid)
-            elif reason == "concurrency_limit": break
+            elif reason == "concurrency_limit":
+                break
 
         if SEND_REPORT: send_report(build_report(time.monotonic() - t0, stats))
         log("Monitor completed")
@@ -333,10 +221,8 @@ async def main_async():
         log(f"FATAL: {e}")
         return 1
 
-
 def main():
     try: return asyncio.run(main_async())
     except: return 1
-
 
 if __name__ == "__main__": sys.exit(main())
