@@ -73,9 +73,10 @@
       "stream_id": "33018909",
       "stream_url": "https://superlivetv.com/fr/livestream/152592539",
       "stream_name": "🇲🇦🦌غزلان فرنسي🦌",
-      "status": "recording",
+      "status": "stopped",
       "started_at": "2026-10-09T00:46:09.704Z",
-      "source": "auto"
+      "source": "auto",
+      "stopped_at": "2026-10-09T00:52:11.355Z"
     }
   ]
 }
