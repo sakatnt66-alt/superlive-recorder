@@ -83,9 +83,10 @@
       "stream_id": "65826144",
       "stream_url": "https://superlivetv.com/fr/livestream/152593057",
       "stream_name": "🪬🍬💞الفرسه الورديه💞🍬🪬",
-      "status": "recording",
+      "status": "stopped",
       "started_at": "2026-10-09T01:31:35.592Z",
-      "source": "auto"
+      "source": "auto",
+      "stopped_at": "2026-10-09T01:37:07.874Z"
     },
     {
       "stream_id": "33018909",
