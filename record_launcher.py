@@ -95,10 +95,8 @@ async def verify_stream_is_accessible(stream_url: str) -> dict:
                 await browser.close()
                 return {"accessible": False, "error": f"Navigation failed: {e}"}
             
-            # Wait for video elements
             await page.wait_for_timeout(5000)
             
-            # Check all video elements
             videos = await page.query_selector_all('video')
             print(f"[VERIFY] Found {len(videos)} video element(s)")
             
@@ -117,19 +115,15 @@ async def verify_stream_is_accessible(stream_url: str) -> dict:
                     
                     ready_state = await video.evaluate('v => v.readyState')
                     paused = await video.evaluate('v => v.paused')
-                    src = await video.evaluate('v => v.src || v.currentSrc || ""')
                     width = int(dims['width'])
                     height = int(dims['height'])
                     
-                    # Filter out small/promo videos (gifts, ads, previews)
                     if width < 300 or height < 300:
                         print(f"[VERIFY] Video {idx}: too small ({width}x{height}) - skipping")
                         continue
                     
-                    # Check if video is ready and playing
                     is_playing = ready_state >= 3 and not paused
                     
-                    # Try to play if paused
                     if not is_playing:
                         try:
                             can_play = await video.evaluate('''v => {
@@ -197,6 +191,22 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
         discovery = SuperLiveDiscovery()
         
         # ============================================================
+        # ALWAYS: Resolve identity first to get username/profile_id
+        # ============================================================
+        print(f"[PRE-FLIGHT] Resolving identity for {stream_id}...")
+        profile_result = await discovery.discover_profile_id(stream_id)
+        
+        discovered_username = None
+        discovered_profile_id = ""
+        
+        if profile_result:
+            discovered_username = profile_result.get("username")
+            discovered_profile_id = profile_result.get("profile_id", "")
+            print(f"[PRE-FLIGHT] Identity resolved: username={discovered_username}, profile_id={discovered_profile_id}")
+        else:
+            print(f"[PRE-FLIGHT] ⚠️ Identity resolution failed - will continue with stream_id as username")
+        
+        # ============================================================
         # SMART PATH: If URL is already a livestream URL, check it directly
         # ============================================================
         is_livestream_url = '/livestream/' in stream_url
@@ -204,19 +214,20 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
         if is_livestream_url:
             print(f"[PRE-FLIGHT] URL is a livestream URL - checking directly")
             
+            # Pass discovered username to check_live_status
             live_result = await discovery.check_live_status(
                 profile_url=stream_url,
                 user_id=stream_id,
-                profile_id="",
-                phase1_username=None
+                profile_id=discovered_profile_id,
+                phase1_username=discovered_username
             )
             
             if live_result:
                 is_live = live_result.get("is_live", False)
                 is_premium = live_result.get("is_premium", False)
-                username = live_result.get("username")
-                
-                print(f"[PRE-FLIGHT] Discovery says: is_live={is_live}, is_premium={is_premium}")
+                # Use username from live_result, or fallback to discovered, or user_id
+                username = live_result.get("username") or discovered_username
+                print(f"[PRE-FLIGHT] Discovery says: is_live={is_live}, is_premium={is_premium}, username={username}")
                 
                 # ============================================================
                 # SMART OVERRIDE: If Discovery says PREMIUM but video is playing,
@@ -232,21 +243,14 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                         print(f"[PRE-FLIGHT]   → Video info: {verification.get('video_info')}")
                         print(f"[PRE-FLIGHT]   → Treating as LIVE_NORMAL (not Premium)")
                         
-                        # Try to get username via discovery fallback
-                        if not username:
-                            profile_result = await discovery.discover_profile_id(stream_id)
-                            if profile_result:
-                                username = profile_result.get("username")
-                        
                         return {
                             "success": True,
                             "status": "LIVE_NORMAL",
-                            "username": username or f"user_{stream_id}",
+                            "username": username or stream_id,
                             "error": None
                         }
                     else:
                         print(f"[PRE-FLIGHT] ✗ Video verification failed: {verification.get('error')}")
-                        # Premium is real - video can't play
                         return {
                             "success": False,
                             "status": "LIVE_PREMIUM",
@@ -254,7 +258,6 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                             "error": "Stream is Premium (paywalled) - video cannot play"
                         }
                 
-                # LIVE_NORMAL without Premium flag
                 if is_live and not is_premium:
                     print(f"[PRE-FLIGHT] ✓ Stream validated: LIVE_NORMAL, username={username}")
                     return {
@@ -264,9 +267,7 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                         "error": None
                     }
                 
-                # Not live
                 if not is_live:
-                    # Double-check with verification
                     print(f"[PRE-FLIGHT] Discovery says offline - double-checking...")
                     verification = await verify_stream_is_accessible(stream_url)
                     if verification.get("accessible"):
@@ -274,7 +275,7 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                         return {
                             "success": True,
                             "status": "LIVE_NORMAL",
-                            "username": username or f"user_{stream_id}",
+                            "username": username or stream_id,
                             "error": None
                         }
                     
@@ -289,8 +290,6 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
         # FALLBACK: Discovery flow for non-livestream URLs
         # ============================================================
         print(f"[PRE-FLIGHT] Using discovery flow")
-        
-        profile_result = await discovery.discover_profile_id(stream_id)
         
         if not profile_result:
             return {
@@ -340,7 +339,7 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                 return {
                     "success": True,
                     "status": "LIVE_NORMAL",
-                    "username": final_username or f"user_{stream_id}",
+                    "username": final_username or stream_id,
                     "error": None
                 }
             return {
