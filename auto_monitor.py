@@ -110,40 +110,50 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict) -> dict:
     print(f"[AUTO] [Phase 1] Resolving {user_id}")
     
     try:
-        result = await discovery.resolve_user_identity(user_id)
+        # Phase 1: Discover profile
+        profile_result = await discovery.discover_profile_id(user_id)
         
-        if not result:
+        if not profile_result:
             print(f"[AUTO] ✗ Failed to resolve {user_id}")
             return None
         
-        profile_url = result.get("profile_url")
+        profile_url = profile_result.get("profile_url")
         if not profile_url:
             print(f"[AUTO] ✗ No profile URL for {user_id}")
             return None
         
+        username = profile_result.get("username", "")
+        profile_id = profile_result.get("profile_id", "")
+        
         print(f"[AUTO] [Phase 1] OK: {profile_url}")
         print(f"[AUTO] [Phase 2] Check live at {profile_url}")
         
-        live_state = await discovery.check_live_state(profile_url)
+        # Phase 2: Check live status
+        live_result = await discovery.check_live_status(
+            profile_url=profile_url,
+            user_id=user_id,
+            profile_id=profile_id,
+            phase1_username=username
+        )
         
-        if not live_state:
+        if not live_result:
             print(f"[AUTO] ✗ Failed to check live state for {user_id}")
             return None
         
-        is_live = live_state.get("is_live", False)
-        is_premium = live_state.get("premium", False)
-        detected_stream_id = live_state.get("stream_id")
-        username = result.get("username") or result.get("display_name") or user_id
+        is_live = live_result.get("is_live", False)
+        is_premium = live_result.get("is_premium", False)
+        stream_id = live_result.get("stream_id", user_id)
+        final_username = live_result.get("username") or username or user_id
         
         # Log results
         print(f"[AUTO] username={user_id}")
         print(f"[AUTO] source=discovery_layer")
         print(f"[AUTO] profile_url={profile_url}")
         
-        if detected_stream_id:
-            print(f"[AUTO] profile_id={detected_stream_id}")
+        if profile_id:
+            print(f"[AUTO] profile_id={profile_id}")
         
-        print(f"[AUTO] stream_id={user_id}")
+        print(f"[AUTO] stream_id={stream_id}")
         
         if is_premium:
             print(f"[AUTO] phase=p2_premium")
@@ -165,9 +175,9 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict) -> dict:
         print(f"[AUTO] action=TRIGGER_RECORDING")
         
         return {
-            "stream_id": user_id,
-            "stream_url": f"https://superlivetv.com/fr/livestream/{user_id}",
-            "stream_name": username
+            "stream_id": stream_id,
+            "stream_url": f"https://superlivetv.com/fr/livestream/{stream_id}",
+            "stream_name": final_username
         }
         
     except Exception as e:
