@@ -92,6 +92,11 @@
       "status": "recording",
       "started_at": "2026-10-09T01:28:18.414Z",
       "source": "auto"
+    },
+    {
+      "stream_id": "152593057",
+      "state": "failed",
+      "error": "Unable to split Matroska without packet loss or oversized parts"
     }
   ]
 }
