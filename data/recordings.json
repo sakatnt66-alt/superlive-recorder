@@ -50,15 +50,6 @@
       "stopped_at": "2026-10-09T00:26:11.027Z"
     },
     {
-      "stream_id": "61325170",
-      "stream_url": "https://superlivetv.com/fr/livestream/152590804",
-      "stream_name": "💜البندري🖤💎🎠🎠🎠",
-      "status": "stopped",
-      "started_at": "2026-10-09T00:07:09.780Z",
-      "source": "auto",
-      "stopped_at": "2026-10-09T00:26:08.958Z"
-    },
-    {
       "stream_id": "52344625",
       "stream_url": "https://superlivetv.com/fr/livestream/152593870",
       "stream_name": "البسكوته💃$كيرفي$💘",
@@ -92,6 +83,14 @@
       "stream_name": "ميساء💝💝",
       "status": "recording",
       "started_at": "2026-10-09T01:28:16.015Z",
+      "source": "auto"
+    },
+    {
+      "stream_id": "61325170",
+      "stream_url": "https://superlivetv.com/fr/livestream/152595308",
+      "stream_name": "💜البندري🖤💎🎠🎠🎠",
+      "status": "recording",
+      "started_at": "2026-10-09T01:28:18.414Z",
       "source": "auto"
     }
   ]
