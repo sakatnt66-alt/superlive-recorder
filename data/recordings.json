@@ -57,16 +57,6 @@
       "status": "recording",
       "started_at": "2026-10-09T15:29:16.075Z",
       "source": "auto"
-    },
-    {
-      "stream_id": "72741120",
-      "stream_url": "https://superlivetv.com/fr/livestream/152635653",
-      "stream_name": "ميساء💝💝",
-      "status": "recording",
-      "started_at": "2026-10-09T15:29:18.072Z",
-      "source": "auto",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
