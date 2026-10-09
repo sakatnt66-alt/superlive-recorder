@@ -1,17 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-SuperLive Discovery Module - Version 10.0 (Smart Video + Premium Detection)
+SuperLive Discovery Module - Version 10.1 (Strict Video + No Text Guessing)
 
-CRITICAL FIXES in v10.0:
-1. Smart video detection: filters out gift animations, ads, promo videos
-   - Rejects videos with src containing /gifts/, /ads/, /promo/
-   - Rejects paused videos (real live streams are playing)
-   - Rejects square aspect ratio videos (gifts are often square)
-2. Comprehensive premium detection:
-   - DOM overlay (lock icon covering video)
-   - Text indicators (premium, private, coins, VIP)
-   - Large centered paywall modal
-3. Iframe support: searches for videos inside iframes
+CRITICAL FIXES in v10.1:
+1. Video Retry Logic: If 0 videos found, wait 5s and retry up to 3 times.
+2. NO TEXT GUESSING: Removed all text-based "prive"/"premium" detection. 
+   It caused massive false positives from footers and recommended streams.
+3. Premium is now ONLY detected via:
+   - DOM overlay (lock icon physically covering the video area)
+   - Explicit API flags (is_premium: true)
+4. Stricter OFFLINE rule: No valid video + No explicit API stream URL = OFFLINE.
 """
 
 import asyncio
@@ -32,7 +30,7 @@ class SuperLiveDiscovery:
     BASE_URL = "https://superlivetv.com"
     PAGE_TIMEOUT_MS = 30000
     SEARCH_WAIT_MS = 8000
-    VERIFY_WAIT_MS = 10000
+    VERIFY_WAIT_MS = 15000  # Increased to 15s to allow video to load
 
     USER_AGENT = (
         "Mozilla/5.0 (X11; Linux x86_64) "
@@ -61,11 +59,9 @@ class SuperLiveDiscovery:
         "suivis", "page introuvable", "page not found", "404",
     }
 
-    # Keywords that indicate a video is NOT a live stream
     NON_STREAM_KEYWORDS = [
-        "gifts", "gift", "misc", "ads", "ad/", "promo",
-        "banner", "animation", "effect", "sticker", "emote",
-        "reward", "bonus", "intro", "outro", "thumbnail"
+        "gift", "misc", "ad/", "promo", "banner", "animation", 
+        "effect", "sticker", "emote", "reward", "bonus", "intro", "outro"
     ]
 
     def __init__(self):
@@ -136,89 +132,54 @@ class SuperLiveDiscovery:
         return name
 
     # ============================================================
-    # SMART VIDEO DETECTION - Filter out gifts/ads/promo
+    # SMART VIDEO DETECTION
     # ============================================================
     def _is_live_stream_video(self, dims: dict, src: str = "") -> Tuple[bool, str]:
-        """
-        Determine if a video element is a REAL live stream or just a gift/ad/promo.
-        
-        Real live streams:
-        - Portrait aspect ratio (9:16) like 720x1280 or 540x960
-        - src is blob: or from live CDN (not /gifts/, /ads/, /promo/)
-        - Not paused (real live streams are playing)
-        
-        NOT real streams:
-        - Gift animations: src contains /gifts/ or /misc/
-        - Ads: src contains /ads/ or /promo/
-        - Square videos (gifts often are square like 2160x1920)
-        - Paused videos with no active playback
-        
-        Returns: (is_real_stream, reason)
-        """
         width = dims.get("width", 0)
         height = dims.get("height", 0)
         ready_state = dims.get("readyState", 0)
         paused = dims.get("paused", True)
         
-        # Check 1: Reject if too small
         if width <= 100 or height <= 100:
             return False, "too_small"
         
-        # Check 2: Reject if paused (live streams should be playing)
-        # Exception: very early loading (readyState < 2)
-        if paused and ready_state >= 2:
-            return False, f"paused_ready{ready_state}"
-        
-        # Check 3: Reject if src contains non-stream keywords
         if src:
             src_lower = src.lower()
             for keyword in self.NON_STREAM_KEYWORDS:
                 if keyword in src_lower:
                     return False, f"suspicious_src:{keyword}"
         
-        # Check 4: Reject square-ish videos (aspect ratio close to 1:1)
-        # Live streams are typically portrait (9:16 ≈ 0.56) or landscape (16:9 ≈ 1.78)
-        if width > 0 and height > 0:
-            aspect_ratio = width / height
-            # If aspect ratio is between 0.75 and 1.3, it's roughly square (likely gift)
-            if 0.75 <= aspect_ratio <= 1.3:
-                return False, f"square_aspect:{aspect_ratio:.2f}"
+        # Live streams should be playing. Paused videos with readyState >= 2 are likely static images or ads.
+        if paused and ready_state >= 2:
+            return False, "paused"
         
-        # Check 5: readyState should be at least 2 (HAVE_CURRENT_DATA)
         if ready_state < 2:
             return False, f"low_ready_state:{ready_state}"
+        
+        if width > 0 and height > 0:
+            aspect_ratio = width / height
+            # Reject square-ish videos (gifts/animations are often 1:1)
+            if 0.75 <= aspect_ratio <= 1.3:
+                return False, f"square_aspect:{aspect_ratio:.2f}"
         
         return True, "valid_live_stream"
 
     # ============================================================
-    # COMPREHENSIVE PREMIUM DETECTION
+    # COMPREHENSIVE PREMIUM DETECTION (STRICT)
     # ============================================================
-    async def _check_premium_indicators(self, page) -> dict:
-        """
-        Comprehensive premium detection checking multiple signals:
-        1. DOM overlay (lock icon covering video area)
-        2. Text indicators (premium, private room, coins, VIP)
-        3. Large centered paywall modal
-        
-        Returns dict with details for debugging.
-        """
+    async def _check_premium_indicators(self, page, has_active_video: bool) -> dict:
         result = {
             "is_premium": False,
             "reasons": [],
             "dom_overlay": False,
-            "text_indicators": [],
-            "has_paywall_modal": False,
         }
+        
+        if not has_active_video:
+            return result  # Do not guess premium without a video
         
         try:
             js_code = """
             () => {
-                const result = {
-                    dom_overlay: false,
-                    text_indicators: [],
-                    has_paywall_modal: false,
-                };
-                
                 const isVisible = (el) => {
                     if (!el) return false;
                     const rect = el.getBoundingClientRect();
@@ -235,7 +196,6 @@ class SuperLiveDiscovery:
                              rect1.bottom < rect2.top || rect1.top > rect2.bottom);
                 };
                 
-                // Find main video (largest visible one with portrait aspect)
                 const videos = document.querySelectorAll('video');
                 let mainVideo = null;
                 let maxArea = 0;
@@ -244,14 +204,12 @@ class SuperLiveDiscovery:
                     const rect = video.getBoundingClientRect();
                     const area = rect.width * rect.height;
                     const aspect = rect.width / (rect.height || 1);
-                    // Only consider portrait videos (likely live streams)
                     if (area > maxArea && rect.width > 200 && aspect < 0.8) {
                         maxArea = area;
                         mainVideo = video;
                     }
                 }
                 
-                // 1. Check for lock overlay on main video
                 if (mainVideo) {
                     const lockSelectors = [
                         '[class*="lock"]', '[class*="paywall"]', '[class*="private"]',
@@ -275,110 +233,29 @@ class SuperLiveDiscovery:
                                     );
                                     const overlapRatio = overlapArea / (videoRect.width * videoRect.height);
                                     if (overlapRatio > 0.15) {
-                                        result.dom_overlay = true;
-                                        break;
+                                        return true; // DOM overlay detected
                                     }
                                 }
                             }
-                            if (result.dom_overlay) break;
                         } catch (e) {}
                     }
                 }
-                
-                // 2. Check for text indicators in main content area
-                const premiumTexts = [
-                    'premium', 'private', 'privé', 'prive', 'vip',
-                    'coins', 'coin', 'piece', 'pièce', 'pay to watch',
-                    'subscribe to watch', 'abonner', 'unlock', 'débloquer',
-                    'exclusive', 'exclusif', 'مميز', 'خاص', 'حصري',
-                    'premium only', 'members only', 'paid room', 'غرفه خاصه'
-                ];
-                
-                const bodyText = document.body.innerText.toLowerCase();
-                for (const text of premiumTexts) {
-                    if (bodyText.includes(text.toLowerCase())) {
-                        const elements = document.querySelectorAll('*');
-                        for (const el of elements) {
-                            if (!isVisible(el)) continue;
-                            const elText = (el.innerText || '').toLowerCase();
-                            if (elText.includes(text.toLowerCase())) {
-                                const rect = el.getBoundingClientRect();
-                                // In upper 75% of screen (not footer)
-                                if (rect.top < window.innerHeight * 0.75 && rect.height < 200) {
-                                    if (!result.text_indicators.includes(text)) {
-                                        result.text_indicators.push(text);
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                // 3. Check for large centered paywall modal
-                const modalSelectors = [
-                    '[class*="modal"]', '[class*="dialog"]', '[class*="overlay"]',
-                    '[class*="paywall"]', '[class*="premium-popup"]',
-                    '[role="dialog"]', '[role="alertdialog"]'
-                ];
-                
-                for (const selector of modalSelectors) {
-                    try {
-                        const modals = document.querySelectorAll(selector);
-                        for (const modal of modals) {
-                            if (!isVisible(modal)) continue;
-                            const rect = modal.getBoundingClientRect();
-                            if (rect.width < 300 || rect.height < 300) continue;
-                            const centerX = rect.left + rect.width / 2;
-                            const centerY = rect.top + rect.height / 2;
-                            const screenCenterX = window.innerWidth / 2;
-                            const screenCenterY = window.innerHeight / 2;
-                            if (Math.abs(centerX - screenCenterX) < 200 && 
-                                Math.abs(centerY - screenCenterY) < 200) {
-                                const modalText = (modal.innerText || '').toLowerCase();
-                                for (const text of premiumTexts) {
-                                    if (modalText.includes(text.toLowerCase())) {
-                                        result.has_paywall_modal = true;
-                                        if (!result.text_indicators.includes('modal:' + text)) {
-                                            result.text_indicators.push('modal:' + text);
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if (result.has_paywall_modal) break;
-                    } catch (e) {}
-                }
-                
-                return result;
+                return false;
             }
             """
-            dom_result = await page.evaluate(js_code)
-            
-            if dom_result.get("dom_overlay"):
+            dom_overlay = await page.evaluate(js_code)
+            if dom_overlay:
                 result["is_premium"] = True
                 result["dom_overlay"] = True
-                result["reasons"].append("DOM overlay")
-            
-            text_indicators = dom_result.get("text_indicators", [])
-            if text_indicators:
-                result["is_premium"] = True
-                result["text_indicators"] = text_indicators
-                result["reasons"].append(f"Text: {', '.join(text_indicators[:3])}")
-            
-            if dom_result.get("has_paywall_modal"):
-                result["is_premium"] = True
-                result["has_paywall_modal"] = True
-                result["reasons"].append("Paywall modal")
-            
+                result["reasons"].append("DOM overlay on video")
+                
         except Exception as e:
             self.log(f"Premium indicators check error: {e}")
         
         return result
 
     # ============================================================
-    # PHASE 1: IDENTITY RESOLUTION (UNCHANGED)
+    # PHASE 1: IDENTITY RESOLUTION
     # ============================================================
     async def discover_profile_id(self, user_id: str) -> Optional[Dict[str, Any]]:
         current_time = time.time()
@@ -568,7 +445,7 @@ class SuperLiveDiscovery:
                 "username": None, "source": "fallback", "uncertain": True}
 
     # ============================================================
-    # PHASE 2: LIVE STATUS DETECTION (ENHANCED)
+    # PHASE 2: LIVE STATUS DETECTION (ENHANCED v10.1)
     # ============================================================
     async def check_live_status(self, profile_url: str, user_id: str = "", profile_id: str = "",
                                 phase1_username: str = None) -> Optional[Dict[str, Any]]:
@@ -604,69 +481,69 @@ class SuperLiveDiscovery:
                     return {"is_live": False, "reason": "page_not_found_404"}
 
                 # ============================================================
-                # STEP 1: SMART VIDEO DETECTION (filter out gifts/ads)
+                # STEP 1: SMART VIDEO DETECTION WITH RETRY
                 # ============================================================
                 has_active_video = False
                 video_stream_url = None
                 rejected_videos = []
                 
-                try:
-                    # Collect all videos from main document
+                for attempt in range(3):
                     videos = await page.locator("video").all()
-                    self.log(f"Found {len(videos)} video element(s) in main document")
-                    
-                    # Also check iframes for hidden videos
                     try:
                         iframes = await page.locator("iframe").all()
-                        for iframe in iframes[:5]:
+                        for iframe in iframes[:3]:
                             try:
                                 frame = await iframe.content_frame()
                                 if frame:
                                     iframe_videos = await frame.locator("video").all()
                                     videos.extend(iframe_videos)
-                                    if iframe_videos:
-                                        self.log(f"Found {len(iframe_videos)} video(s) in iframe")
-                            except:
-                                pass
-                    except:
-                        pass
+                            except: pass
+                    except: pass
                     
-                    for i, video in enumerate(videos):
-                        try:
-                            dims = await video.evaluate("""el => ({
-                                width: el.videoWidth || el.clientWidth,
-                                height: el.videoHeight || el.clientHeight,
-                                readyState: el.readyState, 
-                                paused: el.paused,
-                                src: el.src || el.currentSrc || ''
-                            })""")
-                            src = dims.get("src", "")
-                            
-                            # Smart check: is this a real live stream?
-                            is_real, reason = self._is_live_stream_video(dims, src)
-                            
-                            if is_real:
-                                has_active_video = True
-                                video_stream_url = src if src else None
-                                self.log(f"Video {i}: ✓ REAL LIVE STREAM {dims}")
-                                break
-                            else:
-                                rejected_videos.append({"index": i, "dims": dims, "reason": reason})
-                                self.log(f"Video {i}: ✗ REJECTED ({reason}) {dims}")
-                        except Exception as e:
-                            self.log(f"Video {i} check error: {e}")
-                            continue
+                    if len(videos) > 0:
+                        break
                     
-                    if rejected_videos and not has_active_video:
-                        self.log(f"All {len(rejected_videos)} videos rejected as non-stream content")
-                except Exception as e:
-                    self.log(f"Video check error: {e}")
+                    self.log(f"No videos found, waiting 5s (attempt {attempt+1}/3)...")
+                    await asyncio.sleep(5)
+
+                self.log(f"Found {len(videos)} total video element(s) after retries")
+                
+                for i, video in enumerate(videos):
+                    try:
+                        dims = await video.evaluate("""el => ({
+                            width: el.videoWidth || el.clientWidth,
+                            height: el.videoHeight || el.clientHeight,
+                            readyState: el.readyState, 
+                            paused: el.paused,
+                            src: el.src || el.currentSrc || ''
+                        })""")
+                        src = dims.get("src", "")
+                        
+                        is_real, reason = self._is_live_stream_video(dims, src)
+                        
+                        if is_real:
+                            has_active_video = True
+                            video_stream_url = src if src else None
+                            self.log(f"Video {i}: ✓ REAL LIVE STREAM {dims}")
+                            break
+                        else:
+                            rejected_videos.append({"index": i, "dims": dims, "reason": reason})
+                            self.log(f"Video {i}: ✗ REJECTED ({reason}) {dims}")
+                    except Exception as e:
+                        self.log(f"Video {i} check error: {e}")
+                        continue
+                
+                if not has_active_video:
+                    if rejected_videos:
+                        self.log(f"All {len(rejected_videos)} videos rejected as non-stream content (gifts/ads/paused).")
+                    else:
+                        self.log("No video elements found on page after retries.")
 
                 # STEP 2: Check DOM for live indicators
                 dom_is_live = await self._check_dom_live_indicator(page)
 
-                # STEP 3: COMPREHENSIVE PREMIUM DETECTION
-                premium_check = await self._check_premium_indicators(page)
+                # STEP 3: STRICT PREMIUM DETECTION (No text guessing)
+                premium_check = await self._check_premium_indicators(page, has_active_video)
                 dom_is_premium = premium_check["is_premium"]
                 if dom_is_premium:
                     self.log(f"Premium detected: {', '.join(premium_check['reasons'])}")
@@ -674,47 +551,38 @@ class SuperLiveDiscovery:
                 # STEP 4: Check API responses
                 api_result = self._check_api_live_status(api_responses, user_id)
                 api_says_live = bool(api_result and api_result.get("is_live"))
-                
-                # Also check API for premium flag
-                api_is_premium = False
-                if api_result:
-                    api_is_premium = bool(api_result.get("is_premium") or 
-                                         api_result.get("room_type") == "premium" or
-                                         api_result.get("access_level") == "premium")
+                api_is_premium = bool(api_result and (api_result.get("is_premium") or api_result.get("room_type") == "premium"))
 
                 # ============================================================
-                # STEP 5: DETERMINE STATUS
+                # STEP 5: DETERMINE STATUS (STRICT RULES)
                 # ============================================================
                 is_live = False
                 is_premium = False
                 stream_url = video_stream_url
 
                 if has_active_video:
-                    # Real video exists
                     if dom_is_premium or api_is_premium:
-                        # Video + premium indicator = PREMIUM stream
                         is_live = True
                         is_premium = True
-                        self.log(f"VIDEO ACTIVE + premium indicator -> LIVE_PREMIUM")
+                        self.log("VIDEO ACTIVE + premium indicator -> LIVE_PREMIUM")
                     elif dom_is_live or api_says_live:
                         is_live = True
                         is_premium = False
-                        self.log(f"VIDEO ACTIVE + live indicator -> LIVE_NORMAL")
+                        self.log("VIDEO ACTIVE + live indicator -> LIVE_NORMAL")
                     else:
                         is_live = False
-                        self.log(f"VIDEO ACTIVE but no live/premium indicator -> OFFLINE")
-                elif dom_is_live or api_says_live:
-                    # No video but live indicator exists
-                    if dom_is_premium or api_is_premium:
-                        is_live = True
-                        is_premium = True
-                        self.log(f"NO VIDEO + live indicator + PREMIUM -> LIVE_PREMIUM")
-                    else:
-                        is_live = False
-                        self.log(f"NO VIDEO + live indicator + NO premium -> OFFLINE (false positive)")
+                        self.log("VIDEO ACTIVE but no live/premium indicator -> OFFLINE")
                 else:
-                    is_live = False
-                    self.log(f"NO VIDEO + NO live indicator -> OFFLINE")
+                    # NO ACTIVE VIDEO
+                    # Do NOT trust text indicators alone. They are too noisy.
+                    # Only trust explicit API is_live: true WITH a stream_url.
+                    if api_says_live and api_result.get("stream_url"):
+                        is_live = True
+                        is_premium = api_is_premium
+                        self.log("NO VIDEO but API explicitly says LIVE with URL -> LIVE")
+                    else:
+                        is_live = False
+                        self.log("NO ACTIVE VIDEO and no explicit API stream URL -> OFFLINE")
 
                 # ============================================================
                 # STEP 6: EXTRACT STREAM ID
@@ -781,7 +649,7 @@ class SuperLiveDiscovery:
             return None
 
     # ============================================================
-    # STREAM ID EXTRACTION METHODS (UNCHANGED)
+    # STREAM ID EXTRACTION METHODS
     # ============================================================
     def _find_stream_id_from_api(self, responses: List[Dict], user_id: str, 
                                    profile_id: str, username: str) -> Optional[str]:
@@ -881,9 +749,6 @@ class SuperLiveDiscovery:
             self.log(f"Page source stream_id extraction error: {e}")
         return None
 
-    # ============================================================
-    # DOM LIVE INDICATOR CHECK
-    # ============================================================
     async def _check_dom_live_indicator(self, page) -> bool:
         try:
             live_selectors = [
