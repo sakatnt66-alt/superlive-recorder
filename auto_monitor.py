@@ -106,7 +106,32 @@ def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name
         print(f"[AUTO] ✗ Error triggering recording for {user_id}: {e}")
         return False
 
-async def check_user(discovery: SuperLiveDiscovery, user: dict) -> dict:
+def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
+    """
+    Check if stream_id is a valid stream ID (not user_id).
+    Valid stream IDs:
+    - Are different from user_id
+    - Have at least 9 digits
+    - Are numeric
+    """
+    stream_id_str = str(stream_id)
+    user_id_str = str(user_id)
+    
+    # Must be different from user_id
+    if stream_id_str == user_id_str:
+        return False
+    
+    # Must have at least 9 digits
+    if len(stream_id_str) < 9:
+        return False
+    
+    # Must be numeric
+    if not stream_id_str.isdigit():
+        return False
+    
+    return True
+
+async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list) -> dict:
     """Check a single user's live state"""
     user_id = str(user.get("stream_id"))
     print(f"[AUTO] [Phase 1] Resolving {user_id}")
@@ -144,10 +169,37 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict) -> dict:
         
         is_live = live_result.get("is_live", False)
         is_premium = live_result.get("is_premium", False)
-        stream_id = live_result.get("stream_id", user_id)
-        final_username = live_result.get("username") or username or user_id
+        raw_stream_id = live_result.get("stream_id", user_id)
         
-        # Log results in old format
+        # Validate stream_id
+        stream_id_valid = is_valid_stream_id(raw_stream_id, user_id)
+        
+        # Determine final stream_id and URL
+        if stream_id_valid and is_live:
+            # Use the real stream_id from page source
+            stream_id = str(raw_stream_id)
+            stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
+        else:
+            # stream_id is invalid or stream is offline
+            # Use profile_url as fallback
+            stream_id = user_id
+            stream_url = profile_url
+        
+        # Get username
+        final_username = live_result.get("username") or username
+        
+        # If username is still empty or equals user_id, try to get from watchlist
+        if not final_username or str(final_username) == str(user_id):
+            for w in watchlist:
+                if str(w.get("stream_id")) == str(user_id) and w.get("display_name"):
+                    final_username = w.get("display_name")
+                    break
+        
+        # Final fallback: use user_id
+        if not final_username:
+            final_username = user_id
+        
+        # Log results
         print(f"[AUTO] username={user_id}")
         print(f"[AUTO] source=discovery_layer")
         print(f"[AUTO] profile_url={profile_url}")
@@ -181,7 +233,7 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict) -> dict:
         return {
             "user_id": user_id,
             "stream_id": stream_id,
-            "stream_url": f"https://superlivetv.com/fr/livestream/{stream_id}",
+            "stream_url": stream_url,
             "stream_name": final_username
         }
         
@@ -235,7 +287,7 @@ async def main():
     
     async def check_with_semaphore(user):
         async with semaphore:
-            return await check_user(discovery, user)
+            return await check_user(discovery, user, watchlist)
     
     # Run checks concurrently
     tasks = [check_with_semaphore(u) for u in to_check]
