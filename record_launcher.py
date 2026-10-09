@@ -73,8 +73,58 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
     print(f"[PRE-FLIGHT] Starting validation for stream {stream_id}")
     
     try:
-        # Use Discovery to check stream state
         discovery = SuperLiveDiscovery()
+        
+        # ============================================================
+        # SMART PATH: If URL is already a livestream URL, check it directly
+        # ============================================================
+        is_livestream_url = '/livestream/' in stream_url
+        
+        if is_livestream_url:
+            print(f"[PRE-FLIGHT] URL is a livestream URL - checking directly")
+            
+            # Try direct check first
+            live_result = await discovery.check_live_status(
+                profile_url=stream_url,
+                user_id=stream_id,
+                profile_id="",
+                phase1_username=None
+            )
+            
+            if live_result:
+                is_live = live_result.get("is_live", False)
+                is_premium = live_result.get("is_premium", False)
+                detected_stream_id = live_result.get("stream_id")
+                username = live_result.get("username")
+                
+                print(f"[PRE-FLIGHT] Direct check result: is_live={is_live}, is_premium={is_premium}")
+                
+                # If LIVE_NORMAL, success!
+                if is_live and not is_premium:
+                    print(f"[PRE-FLIGHT] ✓ Stream validated via direct check: LIVE_NORMAL, username={username}")
+                    return {
+                        "success": True,
+                        "status": "LIVE_NORMAL",
+                        "username": username,
+                        "error": None
+                    }
+                
+                # If PREMIUM, fail early
+                if is_premium:
+                    return {
+                        "success": False,
+                        "status": "LIVE_PREMIUM",
+                        "username": username,
+                        "error": "Stream is Premium (paywalled)"
+                    }
+                
+                # If not live, continue to discovery flow as fallback
+                print(f"[PRE-FLIGHT] Direct check shows offline - trying discovery flow")
+        
+        # ============================================================
+        # FALLBACK: Discovery flow
+        # ============================================================
+        print(f"[PRE-FLIGHT] Using discovery flow")
         
         # Phase 1: Resolve identity
         profile_result = await discovery.discover_profile_id(stream_id)
