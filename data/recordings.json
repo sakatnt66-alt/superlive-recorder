@@ -63,7 +63,9 @@
       "stream_name": "🪻🪻زهرة النرجس 🪻🪻",
       "status": "recording",
       "started_at": "2026-10-09T09:18:34.104Z",
-      "source": "auto"
+      "source": "auto",
+      "state": "failed",
+      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
