@@ -72,9 +72,10 @@
       "stream_id": "152593057",
       "stream_url": "https://superlivetv.com/fr/livestream/152593057",
       "stream_name": null,
-      "status": "recording",
+      "status": "stopped",
       "started_at": "2026-10-09T01:02:28.235Z",
-      "source": "manual"
+      "source": "manual",
+      "stopped_at": "2026-10-09T01:24:21.678Z"
     }
   ]
 }
