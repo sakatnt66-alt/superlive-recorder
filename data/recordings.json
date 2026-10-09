@@ -58,9 +58,10 @@
       "stream_id": "61325170",
       "stream_url": "https://superlivetv.com/fr/profile/22782357?isFromSearch=true",
       "stream_name": "💜البندري🖤💎🎠🎠🎠",
-      "status": "recording",
+      "status": "stopped",
       "started_at": "2026-10-08T23:12:07.683Z",
-      "source": "auto"
+      "source": "auto",
+      "stopped_at": "2026-10-09T00:01:47.308Z"
     },
     {
       "stream_id": "65826144",
