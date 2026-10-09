@@ -75,7 +75,9 @@
       "stream_name": "🇲🇦🦌غزلان فرنسي🦌",
       "status": "recording",
       "started_at": "2026-10-09T01:51:36.673Z",
-      "source": "auto"
+      "source": "auto",
+      "state": "failed",
+      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     },
     {
       "stream_id": "72741120",
