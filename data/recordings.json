@@ -59,15 +59,6 @@
       "stopped_at": "2026-10-09T00:26:08.958Z"
     },
     {
-      "stream_id": "33018909",
-      "stream_url": "https://superlivetv.com/fr/livestream/152592539",
-      "stream_name": "🇲🇦🦌غزلان فرنسي🦌",
-      "status": "stopped",
-      "started_at": "2026-10-09T00:46:09.704Z",
-      "source": "auto",
-      "stopped_at": "2026-10-09T00:52:11.355Z"
-    },
-    {
       "stream_id": "61055822",
       "stream_url": "https://superlivetv.com/fr/livestream/152592720",
       "stream_name": "الملكه",
@@ -93,6 +84,14 @@
       "status": "recording",
       "started_at": "2026-10-09T01:02:28.235Z",
       "source": "manual"
+    },
+    {
+      "stream_id": "33018909",
+      "stream_url": "https://superlivetv.com/fr/livestream/152593996",
+      "stream_name": "🇲🇦🦌غزلان فرنسي🦌",
+      "status": "recording",
+      "started_at": "2026-10-09T01:05:01.819Z",
+      "source": "auto"
     }
   ]
 }
