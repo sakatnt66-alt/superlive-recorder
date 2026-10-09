@@ -52,15 +52,6 @@
       "stopped_at": "2026-10-09T15:13:28.363Z"
     },
     {
-      "stream_id": "72741120",
-      "stream_url": "https://superlivetv.com/fr/livestream/152633119",
-      "stream_name": "ميساء💝💝",
-      "status": "stopped",
-      "started_at": "2026-10-09T14:41:37.432Z",
-      "source": "auto",
-      "stopped_at": "2026-10-09T15:13:26.333Z"
-    },
-    {
       "stream_id": "61055822",
       "stream_url": "https://superlivetv.com/fr/livestream/152633831",
       "stream_name": "الملكه",
@@ -81,11 +72,6 @@
       "state": "failed",
       "error": "Live video was not detected; last selector error=Error: No visible live video target found",
       "stopped_at": "2026-10-09T15:18:36.219Z"
-    },
-    {
-      "stream_id": "72741120",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
