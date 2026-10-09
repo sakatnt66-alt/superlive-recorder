@@ -77,6 +77,14 @@
       "started_at": "2026-10-09T00:46:09.704Z",
       "source": "auto",
       "stopped_at": "2026-10-09T00:52:11.355Z"
+    },
+    {
+      "stream_id": "61055822",
+      "stream_url": "https://superlivetv.com/fr/livestream/152592720",
+      "stream_name": "الملكه",
+      "status": "recording",
+      "started_at": "2026-10-09T00:54:56.121Z",
+      "source": "auto"
     }
   ]
 }
