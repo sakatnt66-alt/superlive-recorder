@@ -76,16 +76,6 @@
       "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     },
     {
-      "stream_id": "99919557",
-      "stream_url": "https://superlivetv.com/fr/livestream/99919557",
-      "stream_name": "♥️شوشو ♥️ خ لف❤️‍🔥",
-      "status": "recording",
-      "started_at": "2026-10-09T00:17:06.503Z",
-      "source": "auto",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
-    },
-    {
       "stream_id": "33018909",
       "stream_url": "https://superlivetv.com/fr/livestream/152591422",
       "stream_name": "🇲🇦🦌غزلان فرنسي🦌",
