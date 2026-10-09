@@ -70,20 +70,6 @@
       "started_at": "2026-10-09T14:25:57.914Z",
       "source": "auto",
       "stopped_at": "2026-10-09T14:26:37.847Z"
-    },
-    {
-      "stream_id": "54846395",
-      "stream_url": "https://superlivetv.com/fr/livestream/152632210",
-      "stream_name": "برنسيسه 👑",
-      "status": "stopped",
-      "started_at": "2026-10-09T14:26:00.226Z",
-      "source": "auto",
-      "stopped_at": "2026-10-09T14:26:35.658Z"
-    },
-    {
-      "stream_id": "54846395",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
