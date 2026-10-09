@@ -42,9 +42,10 @@
       "stream_id": "33018909",
       "stream_url": "https://superlivetv.com/fr/rizlani6479?isFromSearch=true",
       "stream_name": "🇲🇦🦌غزلان فرنسي🦌",
-      "status": "recording",
+      "status": "stopped",
       "started_at": "2026-10-08T23:12:04.453Z",
-      "source": "auto"
+      "source": "auto",
+      "stopped_at": "2026-10-09T00:01:51.640Z"
     },
     {
       "stream_id": "61055822",
