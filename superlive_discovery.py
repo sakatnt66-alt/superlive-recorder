@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-SuperLive Discovery Module - Version 10.0 (Final Stable Release)
+SuperLive Discovery Module - Version 10.2 (Critical Fixes)
 
-CRITICAL FEATURES:
-1. Smart username extraction: Cleans @mentions, numbers, and filters bad names.
-2. Smart Stream ID extraction: Finds the 9-digit stream ID from API, JS, or Page Source.
-3. Smart video detection: Filters out gift animations, ads, and promo videos.
-4. Comprehensive premium detection: Checks for DOM overlays, text indicators, and paywall modals.
+CRITICAL FIXES in v10.2:
+1. Strict src validation: Rejects fake video elements with empty or invalid src.
+2. Smart Premium logic: If a valid video is actively playing, it CANNOT be paywalled.
+3. Stream URL priority: If a valid 7+ digit stream_id is found, it overrides profile_url.
 """
 
 import asyncio
@@ -129,6 +128,9 @@ class SuperLiveDiscovery:
         if name.lower() in self.BAD_USERNAMES: return None
         return name
 
+    # ============================================================
+    # STRICT VIDEO DETECTION (FIXED)
+    # ============================================================
     def _is_live_stream_video(self, dims: dict, src: str = "") -> Tuple[bool, str]:
         width = dims.get("width", 0)
         height = dims.get("height", 0)
@@ -139,19 +141,32 @@ class SuperLiveDiscovery:
             return False, "too_small"
         if paused and ready_state >= 2:
             return False, f"paused_ready{ready_state}"
-        if src:
-            src_lower = src.lower()
-            for keyword in self.NON_STREAM_KEYWORDS:
-                if keyword in src_lower:
-                    return False, f"suspicious_src:{keyword}"
+        
+        # CRITICAL FIX: src MUST be a valid stream source
+        if not src:
+            return False, "empty_src"
+        
+        src_lower = src.lower()
+        if not ("blob:" in src_lower or ".m3u8" in src_lower or ".mpd" in src_lower or "rtmp" in src_lower or "webrtc" in src_lower or "mediastream" in src_lower):
+            return False, f"invalid_src_format:{src[:50]}"
+            
+        for keyword in self.NON_STREAM_KEYWORDS:
+            if keyword in src_lower:
+                return False, f"suspicious_src:{keyword}"
+                
         if width > 0 and height > 0:
             aspect_ratio = width / height
             if 0.75 <= aspect_ratio <= 1.3:
                 return False, f"square_aspect:{aspect_ratio:.2f}"
+                
         if ready_state < 2:
             return False, f"low_ready_state:{ready_state}"
+            
         return True, "valid_live_stream"
 
+    # ============================================================
+    # COMPREHENSIVE PREMIUM DETECTION
+    # ============================================================
     async def _check_premium_indicators(self, page) -> dict:
         result = {
             "is_premium": False,
@@ -271,6 +286,9 @@ class SuperLiveDiscovery:
             self.log(f"Premium indicators check error: {e}")
         return result
 
+    # ============================================================
+    # PHASE 1: IDENTITY RESOLUTION
+    # ============================================================
     async def discover_profile_id(self, user_id: str) -> Optional[Dict[str, Any]]:
         current_time = time.time()
         if user_id in self.profile_cache:
@@ -439,6 +457,9 @@ class SuperLiveDiscovery:
     def _fallback(self, user_id: str) -> Dict[str, Any]:
         return {"profile_url": f"{self.BASE_URL}/fr/livestream/{user_id}", "profile_id": user_id, "username": None, "source": "fallback", "uncertain": True}
 
+    # ============================================================
+    # PHASE 2: LIVE STATUS DETECTION (FIXED)
+    # ============================================================
     async def check_live_status(self, profile_url: str, user_id: str = "", profile_id: str = "", phase1_username: str = None) -> Optional[Dict[str, Any]]:
         self.log(f"Phase 2: Checking live at {profile_url}")
         if not PLAYWRIGHT_AVAILABLE: return None
@@ -496,6 +517,8 @@ class SuperLiveDiscovery:
                                 video_stream_url = src if src else None
                                 self.log(f"Video {i}: ✓ REAL LIVE STREAM {dims}")
                                 break
+                            else:
+                                self.log(f"Video {i}: ✗ REJECTED ({reason}) {dims}")
                         except Exception as e:
                             self.log(f"Video {i} check error: {e}")
                             continue
@@ -514,22 +537,18 @@ class SuperLiveDiscovery:
                 if api_result:
                     api_is_premium = bool(api_result.get("is_premium") or str(api_result.get("room_type", "")).lower() == "premium" or str(api_result.get("access_level", "")).lower() == "premium")
 
+                # ============================================================
+                # STEP 5: DETERMINE STATUS (FIXED)
+                # ============================================================
                 is_live = False
                 is_premium = False
                 stream_url = video_stream_url
 
                 if has_active_video:
-                    if dom_is_premium or api_is_premium:
-                        is_live = True
-                        is_premium = True
-                        self.log("VIDEO ACTIVE + premium indicator -> LIVE_PREMIUM")
-                    elif dom_is_live or api_says_live:
-                        is_live = True
-                        is_premium = False
-                        self.log("VIDEO ACTIVE + live indicator -> LIVE_NORMAL")
-                    else:
-                        is_live = False
-                        self.log("VIDEO ACTIVE but no live/premium indicator -> OFFLINE")
+                    # CRITICAL FIX: If a valid video is actively playing, it CANNOT be paywalled!
+                    is_live = True
+                    is_premium = False
+                    self.log("VIDEO ACTIVE + valid stream -> LIVE_NORMAL")
                 elif dom_is_live or api_says_live:
                     if dom_is_premium or api_is_premium:
                         is_live = True
@@ -542,27 +561,35 @@ class SuperLiveDiscovery:
                     is_live = False
                     self.log("NO VIDEO + NO live indicator -> OFFLINE")
 
+                # ============================================================
+                # STEP 6: EXTRACT STREAM ID & URL (FIXED)
+                # ============================================================
                 stream_id = None
+
                 if is_live and not is_premium:
                     stream_id = self._find_stream_id_from_api(api_responses, user_id, profile_id, phase1_username)
-                    if stream_id: self.log(f"stream_id from API: {stream_id}")
+                    if stream_id:
+                        self.log(f"stream_id from API: {stream_id}")
+
                     if not stream_id:
                         stream_id = await self._extract_stream_id_from_js(page)
-                        if stream_id: self.log(f"stream_id from JS: {stream_id}")
+                        if stream_id:
+                            self.log(f"stream_id from JS: {stream_id}")
+
                     if not stream_id:
                         stream_id = await self._extract_stream_id_from_page_source(page, user_id)
-                        if stream_id: self.log(f"stream_id from page source: {stream_id}")
+                        if stream_id:
+                            self.log(f"stream_id from page source: {stream_id}")
 
-                if not stream_id:
-                    if is_live and not is_premium:
-                        if self._is_from_search(profile_url):
-                            stream_id = user_id
-                            self.log(f"Using user_id as stream_id (URL verified): {stream_id}")
-                        else:
-                            self.log("WARNING: Could not find stream_id - SKIPPING")
-                            is_live = False
-                    else:
-                        stream_id = user_id
+                # CRITICAL FIX: If we found a valid stream_id, construct the stream_url from it!
+                if stream_id and len(str(stream_id)) >= 7:
+                    stream_url = f"{self.BASE_URL}/fr/livestream/{stream_id}"
+                else:
+                    if not stream_url:
+                        if api_result: stream_url = api_result.get("stream_url")
+                        if not stream_url: stream_url = profile_url
+                
+                if stream_url: stream_url = self._clean_stream_url(stream_url)
 
                 username = phase1_username
                 if not username and api_result and api_result.get("username"):
@@ -570,11 +597,6 @@ class SuperLiveDiscovery:
                 if not username:
                     page_username = await self._extract_username_from_page(page)
                     if page_username: username = self._clean_username(page_username)
-
-                if not stream_url:
-                    if api_result: stream_url = api_result.get("stream_url")
-                    if not stream_url: stream_url = profile_url
-                if stream_url: stream_url = self._clean_stream_url(stream_url)
 
                 await browser.close()
 
@@ -595,6 +617,9 @@ class SuperLiveDiscovery:
             self.log(f"check_live_status error: {e}")
             return None
 
+    # ============================================================
+    # STREAM ID EXTRACTION METHODS
+    # ============================================================
     def _find_stream_id_from_api(self, responses: List[Dict], user_id: str, profile_id: str, username: str) -> Optional[str]:
         for resp in responses:
             body = resp.get("body")
