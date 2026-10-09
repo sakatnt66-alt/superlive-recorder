@@ -56,6 +56,14 @@
       "status": "recording",
       "started_at": "2026-10-09T06:03:12.362Z",
       "source": "auto"
+    },
+    {
+      "stream_id": "63828781",
+      "stream_url": "https://superlivetv.com/fr/livestream/152622973",
+      "stream_name": "👑 شامخة ملكة 👑🇲🇦",
+      "status": "recording",
+      "started_at": "2026-10-09T11:14:43.507Z",
+      "source": "auto"
     }
   ]
 }
