@@ -59,16 +59,6 @@
       "source": "auto"
     },
     {
-      "stream_id": "63828781",
-      "stream_url": "https://superlivetv.com/fr/livestream/152629564",
-      "stream_name": "👑 شامخة ملكة 👑🇲🇦",
-      "status": "recording",
-      "started_at": "2026-10-09T14:06:18.766Z",
-      "source": "auto",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
-    },
-    {
       "stream_id": "65826144",
       "stream_url": "https://superlivetv.com/fr/livestream/152629307",
       "stream_name": "🪬🍬💞الفرسه الورديه💞🍬🪬",
