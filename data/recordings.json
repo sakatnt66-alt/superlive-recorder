@@ -88,20 +88,6 @@
       "started_at": "2026-10-09T01:31:35.592Z",
       "source": "auto",
       "stopped_at": "2026-10-09T01:37:07.874Z"
-    },
-    {
-      "stream_id": "33018909",
-      "stream_url": "https://superlivetv.com/fr/livestream/152595990",
-      "stream_name": "🇲🇦🦌غزلان فرنسي🦌",
-      "status": "stopped",
-      "started_at": "2026-10-09T01:34:49.479Z",
-      "source": "auto",
-      "stopped_at": "2026-10-09T01:37:02.202Z"
-    },
-    {
-      "stream_id": "33018909",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
