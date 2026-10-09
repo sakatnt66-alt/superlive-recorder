@@ -71,10 +71,10 @@ def get_active_recordings() -> list:
     
     return []
 
-def trigger_recording(stream_id: str, stream_url: str, stream_name: str) -> bool:
+def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name: str) -> bool:
     """Trigger recording via worker"""
     if not WORKER_API_URL or not AUTO_API_TOKEN:
-        print(f"[AUTO] Worker API not configured")
+        print(f"[AUTO] ✗ Worker API not configured (WORKER_API_URL or AUTO_API_TOKEN missing)")
         return False
     
     url = f"{WORKER_API_URL}/api/auto-trigger/{stream_id}"
@@ -93,16 +93,18 @@ def trigger_recording(stream_id: str, stream_url: str, stream_name: str) -> bool
             if response.status == 200:
                 data = json.loads(response.read().decode('utf-8'))
                 if data.get("success"):
-                    print(f"[AUTO] ✓ Triggered recording for {stream_id} ({stream_name})")
+                    print(f"[AUTO] START_RECORDING {user_id} (stream_id={stream_id}) -> {stream_url}")
                     return True
                 else:
-                    print(f"[AUTO] ✗ Failed to trigger: {data.get('error')}")
+                    error = data.get('error', 'unknown')
+                    print(f"[AUTO] ✗ Failed to trigger {user_id}: {error}")
+                    return False
             else:
-                print(f"[AUTO] ✗ HTTP {response.status}")
+                print(f"[AUTO] ✗ HTTP {response.status} when triggering {user_id}")
+                return False
     except Exception as e:
-        print(f"[AUTO] Error triggering recording: {e}")
-    
-    return False
+        print(f"[AUTO] ✗ Error triggering recording for {user_id}: {e}")
+        return False
 
 async def check_user(discovery: SuperLiveDiscovery, user: dict) -> dict:
     """Check a single user's live state"""
@@ -118,8 +120,8 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict) -> dict:
             return None
         
         profile_url = profile_result.get("profile_url")
-        if not profile_url:
-            print(f"[AUTO] ✗ No profile URL for {user_id}")
+        if not profile_url or profile_url.endswith("/None") or "/profile/None" in profile_url:
+            print(f"[AUTO] ✗ Invalid profile URL for {user_id}: {profile_url}")
             return None
         
         username = profile_result.get("username", "")
@@ -145,7 +147,7 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict) -> dict:
         stream_id = live_result.get("stream_id", user_id)
         final_username = live_result.get("username") or username or user_id
         
-        # Log results
+        # Log results in old format
         print(f"[AUTO] username={user_id}")
         print(f"[AUTO] source=discovery_layer")
         print(f"[AUTO] profile_url={profile_url}")
@@ -154,6 +156,7 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict) -> dict:
             print(f"[AUTO] profile_id={profile_id}")
         
         print(f"[AUTO] stream_id={stream_id}")
+        print(f"[AUTO] display_name={final_username}")
         
         if is_premium:
             print(f"[AUTO] phase=p2_premium")
@@ -169,19 +172,21 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict) -> dict:
             print(f"[AUTO] reason=no_live")
             return None
         
-        # LIVE_NORMAL - trigger recording
-        print(f"[AUTO] phase=p2_live_normal")
+        # LIVE_NORMAL - candidate for recording
+        print(f"[AUTO] phase=phase_3_done")
         print(f"[AUTO] status=LIVE_NORMAL")
-        print(f"[AUTO] action=TRIGGER_RECORDING")
+        print(f"[AUTO] action=CANDIDATE")
+        print(f"[AUTO] reason=live")
         
         return {
+            "user_id": user_id,
             "stream_id": stream_id,
             "stream_url": f"https://superlivetv.com/fr/livestream/{stream_id}",
             "stream_name": final_username
         }
         
     except Exception as e:
-        print(f"[AUTO] Error checking user {user_id}: {e}")
+        print(f"[AUTO] ✗ Error checking user {user_id}: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -192,7 +197,7 @@ async def main():
     
     # Load watchlist
     if not WATCHLIST_FILE.exists():
-        print("[AUTO] Watchlist file not found")
+        print("[AUTO] ✗ Watchlist file not found")
         return
     
     try:
@@ -200,7 +205,7 @@ async def main():
             watchlist_data = json.load(f)
             watchlist = watchlist_data.get("watchlist", [])
     except Exception as e:
-        print(f"[AUTO] Error loading watchlist: {e}")
+        print(f"[AUTO] ✗ Error loading watchlist: {e}")
         return
     
     print(f"[AUTO] Watchlist: {len(watchlist)} users")
@@ -210,7 +215,7 @@ async def main():
     print(f"[AUTO] Active: {len(active)}/5")
     
     if len(active) >= 5:
-        print("[AUTO] Concurrency limit reached")
+        print("[AUTO] ✗ Concurrency limit reached (5/5)")
         return
     
     # Filter users not already recording
@@ -220,7 +225,7 @@ async def main():
     print(f"[AUTO] Discovery for {len(to_check)} users (Concurrency: {MAX_CONCURRENT})")
     
     if not to_check:
-        print("[AUTO] No users to check")
+        print("[AUTO] ✓ No users to check (all already recording)")
         return
     
     # Phase 1 & 2: Discovery
@@ -245,15 +250,23 @@ async def main():
     
     print(f"[AUTO] Slots: {available_slots}")
     
+    if not to_record:
+        print("[AUTO] ✓ No LIVE_NORMAL streams detected")
+        print("[AUTO] Monitor completed")
+        return
+    
     # Trigger recordings
+    triggered = 0
     for record in to_record:
-        trigger_recording(
+        if trigger_recording(
+            record["user_id"],
             record["stream_id"],
             record["stream_url"],
             record["stream_name"]
-        )
+        ):
+            triggered += 1
     
-    print("[AUTO] Monitor completed")
+    print(f"[AUTO] Monitor completed")
 
 if __name__ == "__main__":
     asyncio.run(main())
