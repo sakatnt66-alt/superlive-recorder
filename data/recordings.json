@@ -61,11 +61,12 @@
       "stream_id": "63828781",
       "stream_url": "https://superlivetv.com/fr/livestream/152622973",
       "stream_name": "👑 شامخة ملكة 👑🇲🇦",
-      "status": "recording",
+      "status": "stopped",
       "started_at": "2026-10-09T11:14:43.507Z",
       "source": "auto",
       "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
+      "error": "Live video was not detected; last selector error=Error: No visible live video target found",
+      "stopped_at": "2026-10-09T13:54:36.448Z"
     },
     {
       "stream_id": "65826144",
