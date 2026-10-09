@@ -49,14 +49,6 @@
       "source": "auto",
       "state": "failed",
       "error": "Live video was not detected; last selector error=Error: No visible live video target found"
-    },
-    {
-      "stream_id": "54846395",
-      "stream_url": "https://superlivetv.com/fr/livestream/152631317",
-      "stream_name": "برنسيسه 👑",
-      "status": "recording",
-      "started_at": "2026-10-09T14:12:33.193Z",
-      "source": "auto"
     }
   ]
 }
