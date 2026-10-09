@@ -83,7 +83,9 @@
       "stream_name": "♥️شوشو ♥️ خ لف❤️‍🔥",
       "status": "recording",
       "started_at": "2026-10-09T00:46:17.920Z",
-      "source": "auto"
+      "source": "auto",
+      "state": "failed",
+      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
