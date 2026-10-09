@@ -89,9 +89,10 @@
       "stream_id": "72741120",
       "stream_url": "https://superlivetv.com/fr/livestream/152591292",
       "stream_name": "ميساء💝💝",
-      "status": "recording",
+      "status": "stopped",
       "started_at": "2026-10-09T01:41:30.060Z",
-      "source": "auto"
+      "source": "auto",
+      "stopped_at": "2026-10-09T01:43:30.073Z"
     }
   ]
 }
