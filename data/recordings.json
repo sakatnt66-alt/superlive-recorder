@@ -51,16 +51,6 @@
       "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     },
     {
-      "stream_id": "84424763",
-      "stream_url": "https://superlivetv.com/fr/livestream/152631530",
-      "stream_name": "ندي الدلوعة نار 🔥🔥",
-      "status": "recording",
-      "started_at": "2026-10-09T14:12:31.135Z",
-      "source": "auto",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
-    },
-    {
       "stream_id": "54846395",
       "stream_url": "https://superlivetv.com/fr/livestream/152631317",
       "stream_name": "برنسيسه 👑",
