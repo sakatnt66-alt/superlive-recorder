@@ -53,7 +53,9 @@
       "stream_name": "الملكة كيوته",
       "status": "recording",
       "started_at": "2026-10-09T00:07:07.639Z",
-      "source": "auto"
+      "source": "auto",
+      "state": "failed",
+      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     },
     {
       "stream_id": "61325170",
