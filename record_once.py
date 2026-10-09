@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import subprocess
 import struct
 import sys
@@ -537,7 +538,7 @@ def analyze_webm_video_timing(path):
                 large_gaps.append(
                     (index, previous, current, delta)
                 )
-        previous = current
+            previous = current
     previous = None
     for current in dts_values:
         if previous is not None:
@@ -546,7 +547,7 @@ def analyze_webm_video_timing(path):
                 duplicate_dts += 1
             elif delta < 0:
                 backwards_dts += 1
-        previous = current
+            previous = current
     first_pts = pts_values[0]
     last_pts = pts_values[-1]
     timeline_span = max(0.0, last_pts - first_pts)
@@ -1268,8 +1269,7 @@ def remux_h264_to_mkv(
         "-i", str(h264_path),
         "-map", "0:v:0",
         "-c:v", "copy",
-        "-bsf:v",
-        f"setts=pts=N*90000/{frame_rate:.12f}+6000:dts=N*90000/{frame_rate:.12f}:time_base=1/90000",
+        "-bsf:v", f"setts=pts=N*90000/{frame_rate:.12f}+6000:dts=N*90000/{frame_rate:.12f}:time_base=1/90000",
         "-f", "matroska",
         str(mkv_path),
     ]
@@ -1575,7 +1575,7 @@ def split_webm_if_needed(webm_path):
     * Video packet count must match the source exactly.
     * If the source has audio, audio packet count must also match exactly.
     * Unknown source packet counts are a hard failure; 0/0 is never treated
-      as successful integrity verification.
+    as successful integrity verification.
     * The source WebM is never modified.
     """
     webm_path = Path(webm_path)
@@ -2904,38 +2904,11 @@ WEBRTC_HOOK = r"""
         for (let index = 0; index < videos.length; index++) {
             const video = videos[index];
             try {
-                let stream = video.srcObject;
-                let isMediaSource = false;
-
-                // FIX: Support HLS / MediaSource / standard <video src="...">
-                if (!stream) {
-                    const src = video.src || video.currentSrc || '';
-                    if (src && (src.includes('.m3u8') || src.includes('.mpd') || src.startsWith('blob:') || src.includes('/video/'))) {
-                        try {
-                            if (typeof video.captureStream === 'function') {
-                                stream = video.captureStream();
-                                isMediaSource = true;
-                            } else if (typeof video.mozCaptureStream === 'function') {
-                                stream = video.mozCaptureStream();
-                                isMediaSource = true;
-                            }
-                        } catch (e) {
-                            // Ignore captureStream errors
-                        }
-                    }
-                }
-
+                const stream = video.srcObject;
                 if (!stream) continue;
-
-                let videoTrack = stream
+                const videoTrack = stream
                     .getVideoTracks()
                     .find(t => t.readyState === "live");
-                
-                // FIX: For HLS/captureStream, readyState might not be "live" initially
-                if (!videoTrack && isMediaSource) {
-                    videoTrack = stream.getVideoTracks()[0];
-                }
-
                 if (!videoTrack) continue;
                 if (video.videoWidth <= 0 || video.videoHeight <= 0) continue;
                 if (video.readyState < 2) continue;
@@ -2991,10 +2964,6 @@ WEBRTC_HOOK = r"""
                 if (sameTargetDom) identityScore += 1000000;
                 if (activePackets) identityScore += 10000;
                 if (activeDecoded) identityScore += 1000;
-
-                // FIX: Boost HLS/MediaSource if it matches the target DOM
-                if (isMediaSource && sameTargetDom) identityScore += 500000;
-
                 const score =
                     identityScore
                     + Math.min(visibleArea, 1000000) / 100
@@ -3013,7 +2982,6 @@ WEBRTC_HOOK = r"""
                     sameTargetDom,
                     stats,
                     score,
-                    isMediaSource,
                 });
             } catch (e) {
                 console.warn("superlive target selection error", e);
@@ -3044,7 +3012,6 @@ WEBRTC_HOOK = r"""
                 streamIds: best.streamIds,
                 sameTargetDom: best.sameTargetDom,
                 inboundStats: best.stats,
-                isMediaSource: best.isMediaSource,
             },
             candidates: candidates.map(item => ({
                 index: item.index,
@@ -3064,7 +3031,6 @@ WEBRTC_HOOK = r"""
                 sameTargetDom: item.sameTargetDom,
                 score: item.score,
                 inboundStats: item.stats,
-                isMediaSource: item.isMediaSource,
             })),
         };
     };
@@ -3772,8 +3738,8 @@ WEBRTC_HOOK = r"""
             let recordingVideoTrack = videoTrack;
             let recordingAudioTrack =
                 audioTrack && audioTrack.readyState === "live"
-                    ? audioTrack
-                    : null;
+                ? audioTrack
+                : null;
             if (cloneTracks) {
                 try {
                     recordingVideoTrack = videoTrack.clone();
@@ -3994,12 +3960,12 @@ WEBRTC_HOOK = r"""
             const diag = window.__superliveRenderDiag;
             const duration =
                 diag.firstTimestamp !== null && diag.lastTimestamp !== null
-                    ? Math.max(0, (diag.lastTimestamp - diag.firstTimestamp) / 1000)
-                    : 0;
+                ? Math.max(0, (diag.lastTimestamp - diag.firstTimestamp) / 1000)
+                : 0;
             const fps =
                 duration > 0 && diag.callbackCount > 1
-                    ? (diag.callbackCount - 1) / duration
-                    : 0;
+                ? (diag.callbackCount - 1) / duration
+                : 0;
             return {
                 supported: !!diag.supported,
                 running: !!diag.running,
@@ -4055,8 +4021,8 @@ WEBRTC_HOOK = r"""
         const candidate =
             window.__superliveRecordingCandidates
             && window.__superliveRecordingCandidates[candidateIndex]
-                ? window.__superliveRecordingCandidates[candidateIndex]
-                : null;
+            ? window.__superliveRecordingCandidates[candidateIndex]
+            : null;
         const recordingStream = candidate
             ? candidate.stream
             : window.__preparedStream;
@@ -4434,74 +4400,74 @@ WEBRTC_HOOK = r"""
                     queueLength:
                         window
                             .__superliveUploadQueue
-                            ?
-                            window
-                                .__superliveUploadQueue
-                                .length
-                            :
-                            0,
+                        ?
+                        window
+                            .__superliveUploadQueue
+                            .length
+                        :
+                        0,
                     isUploading:
                         !!window
                             .__superliveIsUploading,
                     chunkCount:
                         window
                             .__superliveChunkCount
-                            || 0,
+                        || 0,
                     uploadedChunkCount:
                         window
                             .__superliveUploadedChunkCount
-                            || 0,
+                        || 0,
                     uploadError:
                         window
                             .__superliveUploadError
-                            || null,
+                        || null,
                     pendingDataTasks:
                         window
                             .__superlivePendingDataTasks
-                            || 0,
+                        || 0,
                     idleTimeMs:
                         window
                             .__superliveLastChunkAt
-                            ?
-                            performance.now()
-                            -
-                            window
-                                .__superliveLastChunkAt
-                            :
-                            Infinity,
+                        ?
+                        performance.now()
+                        -
+                        window
+                            .__superliveLastChunkAt
+                        :
+                        Infinity,
                     lastChunkSize:
                         window
                             .__superliveLastChunkSize
-                            || 0,
+                        || 0,
                     videoReadyState:
                         videoTrack
-                            ?
-                            videoTrack.readyState
-                            :
-                            null,
+                        ?
+                        videoTrack.readyState
+                        :
+                        null,
                     videoSettings:
                         videoTrack
                         &&
                         videoTrack.getSettings
-                            ?
-                            videoTrack.getSettings()
-                            :
-                            null,
+                        ?
+                        videoTrack.getSettings()
+                        :
+                        null,
                     renderDiagnostics:
                         window.__superliveGetRenderDiagnostics
-                            ?
-                            window.__superliveGetRenderDiagnostics()
-                            :
-                            null,
+                        ?
+                        window.__superliveGetRenderDiagnostics()
+                        :
+                        null,
                     recorderState:
                         window
                             .__superliveRecorder
-                            ?
-                            window
-                                .__superliveRecorder
-                                .state
-                            :
-                            null,
+                        ?
+                        window
+                            .__superliveRecorder
+                            .state
+                        :
+                        null,
                     finalDataReady:
                         !!window
                             .__superliveFinalDataReady
@@ -4796,12 +4762,12 @@ WEBRTC_HOOK = r"""
                     error: window.__superliveAudioUploadError,
                     trackState:
                         window.__preparedAudioTrack
-                            ? window.__preparedAudioTrack.readyState
-                            : null,
+                        ? window.__preparedAudioTrack.readyState
+                        : null,
                     trackMuted:
                         window.__preparedAudioTrack
-                            ? window.__preparedAudioTrack.muted
-                            : null
+                        ? window.__preparedAudioTrack.muted
+                        : null
                 };
             }
             await new Promise(
@@ -4853,8 +4819,8 @@ WEBRTC_HOOK = r"""
             window.__superliveAudioPendingDataTasks,
         recorderState:
             window.__superliveAudioRecorder
-                ? window.__superliveAudioRecorder.state
-                : null,
+            ? window.__superliveAudioRecorder.state
+            : null,
         finalDataReady:
             window.__superliveAudioFinalDataReady
     });
@@ -4886,12 +4852,12 @@ WEBRTC_HOOK = r"""
                             window.__superliveUploadError,
                         renderDiagnostics:
                             window.__superliveGetRenderDiagnostics
-                                ? window.__superliveGetRenderDiagnostics()
-                                : null,
+                            ? window.__superliveGetRenderDiagnostics()
+                            : null,
                         webrtcDiagnostics:
                             window.__superliveGetWebRTCStats
-                                ? await window.__superliveGetWebRTCStats()
-                                : null
+                            ? await window.__superliveGetWebRTCStats()
+                            : null
                     };
                 }
                 if (now >= nextRequestAt) {
@@ -4959,12 +4925,12 @@ WEBRTC_HOOK = r"""
                             window.__superliveActiveCandidateName || null,
                         renderDiagnostics:
                             window.__superliveGetRenderDiagnostics
-                                ? window.__superliveGetRenderDiagnostics()
-                                : null,
+                            ? window.__superliveGetRenderDiagnostics()
+                            : null,
                         webrtcDiagnostics:
                             window.__superliveGetWebRTCStats
-                                ? await window.__superliveGetWebRTCStats()
-                                : null
+                            ? await window.__superliveGetWebRTCStats()
+                            : null
                     };
                 }
                 await new Promise(
@@ -5005,6 +4971,16 @@ async def run_recording(playwright):
         log(
             "WARNING: STREAM_ID is empty"
         )
+    
+    # --- Fix: Extract 9-digit stream_id from URL if STREAM_ID is 8-digit user_id ---
+    TARGET_ID = STREAM_ID
+    if STREAM_ID and len(STREAM_ID) == 8 and URL:
+        url_match = re.search(r'/livestream/(\d{7,})', URL)
+        if url_match:
+            log(f"[INFO] STREAM_ID is user_id (8 digits). Extracted stream_id from URL for DOM matching: {url_match.group(1)}")
+            TARGET_ID = url_match.group(1)
+    # -----------------------------------------------------------------------------
+
     chromium_args = [
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
@@ -5016,7 +4992,7 @@ async def run_recording(playwright):
         "--disable-gpu",
     ]
     browser = await playwright.chromium.launch(
-        headless=False,
+        headless=True,
         args=chromium_args,
     )
     context = await browser.new_context(
@@ -5120,6 +5096,7 @@ async def run_recording(playwright):
                     )
                 except Exception:
                     pass
+
         async def handle_audio_chunk(
             route,
             request,
@@ -5148,6 +5125,7 @@ async def run_recording(playwright):
                     )
                 except Exception:
                     pass
+
         async def handle_encoded_video_chunk(
             route,
             request,
@@ -5230,7 +5208,8 @@ async def run_recording(playwright):
                         delta = timestamp_us - batch_previous_timestamp
                         if 1000 <= delta <= 1_000_000:
                             pending_deltas.append(delta)
-                    batch_previous_timestamp = timestamp_us
+                        batch_previous_timestamp = timestamp_us
+                    
                     if frame_type == 1 and encoded_h264_mode:
                         annexb = h264_payload_to_annexb(frame_data)
                         if not h264_contains_idr(annexb):
@@ -5248,9 +5227,11 @@ async def run_recording(playwright):
                                     "Encoded VP8 key frame failed sync-code validation: "
                                     + frame_data[:12].hex()
                                 )
-                            pending_frames.append((frame_type, timestamp_us, frame_data, None))
+                        pending_frames.append((frame_type, timestamp_us, frame_data, None))
+                
                 if not pending_frames:
                     raise RuntimeError("Encoded video batch contains no frames")
+                
                 # Ignore delta frames before the first keyframe. This mirrors
                 # the browser-side guard without changing the encoded payload.
                 accepted_frames = []
@@ -5263,12 +5244,15 @@ async def run_recording(playwright):
                         continue
                     accepted_frames.append((frame_type, timestamp_us, frame_data, annexb))
                     pending_bytes += len(frame_data)
+                
                 if not accepted_frames:
                     raise RuntimeError(
                         "Encoded video batch contains no frame at/after a validated keyframe"
                     )
+                
                 if encoded_video_first_timestamp is None:
                     encoded_video_first_timestamp = accepted_frames[0][1]
+                
                 # Commit only after the whole batch is validated.
                 for frame_type, timestamp_us, frame_data, annexb in accepted_frames:
                     if encoded_h264_mode:
@@ -5289,13 +5273,16 @@ async def run_recording(playwright):
                         )
                         encoded_video_file.write(frame_data)
                     encoded_video_last_timestamp = batch_previous_timestamp
+                
                 encoded_video_timestamp_deltas.extend(pending_deltas)
                 if len(encoded_video_timestamp_deltas) > 2000:
                     del encoded_video_timestamp_deltas[:-2000]
+                
                 encoded_video_frame_count += len(accepted_frames)
                 encoded_video_keyframe_count += pending_keyframes
                 encoded_video_total_bytes += pending_bytes
                 batch_frames = len(accepted_frames)
+                
                 # Timestamp regressions are logged/diagnosed, never treated
                 # as upload errors.
                 if pending_regressions:
@@ -5305,6 +5292,7 @@ async def run_recording(playwright):
                         f"batch={pending_regressions} "
                         f"total={encoded_video_timestamp_regressions}"
                     )
+                
                 encoded_video_file.flush()
                 encoded_video_chunk_count += 1
                 await route.fulfill(
@@ -5328,6 +5316,7 @@ async def run_recording(playwright):
                     )
                 except Exception:
                     pass
+
         await page.route(
             "**/__slr_chunk",
             handle_chunk,
@@ -5350,12 +5339,12 @@ async def run_recording(playwright):
         )
         await page.evaluate(
             """
-            (streamId) => {
+            (targetId) => {
                 window.__superliveTargetStreamId =
-                    streamId || null;
+                    targetId || null;
             }
             """,
-            STREAM_ID,
+            TARGET_ID,
         )
         log(
             "Page loaded. "
@@ -5458,14 +5447,26 @@ async def run_recording(playwright):
                                             targetDom,
                                         };
                                     };
+                                    
+                                    let pageContext = null;
+                                    if (videos.length === 0) {
+                                        pageContext = {
+                                            title: document.title,
+                                            url: window.location.href,
+                                            h1: document.querySelector('h1') ? document.querySelector('h1').innerText.trim() : null,
+                                            bodySnippet: document.body.innerText.trim().substring(0, 300).replace(/\\s+/g, ' ')
+                                        };
+                                    }
+                                    
                                     return {
                                         targetId: targetId || null,
                                         videoCount: videos.length,
                                         videos: videos.map(describe),
+                                        pageContext: pageContext
                                     };
                                 }
                                 """,
-                                STREAM_ID,
+                                TARGET_ID,
                             )
                             log(
                                 "Video detection diagnostics: "
