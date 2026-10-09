@@ -76,10 +76,10 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
         # Use Discovery to check stream state
         discovery = SuperLiveDiscovery()
         
-        # Resolve identity and check state
-        result = await discovery.resolve_user_identity(stream_id)
+        # Phase 1: Resolve identity
+        profile_result = await discovery.discover_profile_id(stream_id)
         
-        if not result:
+        if not profile_result:
             return {
                 "success": False,
                 "status": "UNKNOWN",
@@ -87,8 +87,9 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                 "error": "Failed to resolve user identity"
             }
         
-        profile_url = result.get("profile_url")
-        username = result.get("username") or result.get("display_name")
+        profile_url = profile_result.get("profile_url")
+        username = profile_result.get("username")
+        profile_id = profile_result.get("profile_id", "")
         
         if not profile_url:
             return {
@@ -98,10 +99,15 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                 "error": "No profile URL found"
             }
         
-        # Check live state
-        live_state = await discovery.check_live_state(profile_url)
+        # Phase 2: Check live state
+        live_result = await discovery.check_live_status(
+            profile_url=profile_url,
+            user_id=stream_id,
+            profile_id=profile_id,
+            phase1_username=username
+        )
         
-        if not live_state:
+        if not live_result:
             return {
                 "success": False,
                 "status": "UNKNOWN",
@@ -109,16 +115,17 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                 "error": "Failed to check live state"
             }
         
-        is_live = live_state.get("is_live", False)
-        is_premium = live_state.get("premium", False)
-        detected_stream_id = live_state.get("stream_id")
+        is_live = live_result.get("is_live", False)
+        is_premium = live_result.get("is_premium", False)
+        detected_stream_id = live_result.get("stream_id")
+        final_username = live_result.get("username") or username
         
         # Verify stream ID matches
         if detected_stream_id and str(detected_stream_id) != str(stream_id):
             return {
                 "success": False,
                 "status": "MISMATCH",
-                "username": username,
+                "username": final_username,
                 "error": f"Stream ID mismatch: expected {stream_id}, got {detected_stream_id}"
             }
         
@@ -127,7 +134,7 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
             return {
                 "success": False,
                 "status": "LIVE_PREMIUM",
-                "username": username,
+                "username": final_username,
                 "error": "Stream is Premium (paywalled)"
             }
         
@@ -135,16 +142,16 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
             return {
                 "success": False,
                 "status": "OFFLINE",
-                "username": username,
+                "username": final_username,
                 "error": "User is offline"
             }
         
         # Success - LIVE_NORMAL
-        print(f"[PRE-FLIGHT] ✓ Stream validated: LIVE_NORMAL, username={username}")
+        print(f"[PRE-FLIGHT] ✓ Stream validated: LIVE_NORMAL, username={final_username}")
         return {
             "success": True,
             "status": "LIVE_NORMAL",
-            "username": username,
+            "username": final_username,
             "error": None
         }
         
@@ -194,9 +201,9 @@ async def main():
         
         # Send appropriate error message
         if status == "LIVE_PREMIUM":
-            msg = f"💎 <b>بث Premium</b>\n👤 المستخدم: <code>{stream_id}</code>\n\n⚠️ هذا البث مدفوع ولا يمكن تسجيله."
+            msg = f"💎 <b>بث Premium</b>\n👤 المستخدم: <code>{stream_id}</code>\n👤 الاسم: <b>{username}</b>\n\n⚠️ هذا البث مدفوع ولا يمكن تسجيله."
         elif status == "OFFLINE":
-            msg = f"⚫ <b>غير متصل</b>\n👤 المستخدم: <code>{stream_id}</code>\n\n⚠️ المستخدم غير متصل حالياً."
+            msg = f"⚫ <b>غير متصل</b>\n👤 المستخدم: <code>{stream_id}</code>\n👤 الاسم: <b>{username}</b>\n\n⚠️ المستخدم غير متصل حالياً."
         elif status == "MISMATCH":
             msg = f"⚠️ <b>خطأ في الهوية</b>\n👤 المستخدم: <code>{stream_id}</code>\n\n❌ {error}"
         else:
