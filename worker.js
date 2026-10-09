@@ -1,8 +1,8 @@
-// worker.js - Version 10.1 (Robust KV & Clean Errors)
-
+// worker.js - Version 11.0 (Manual Recording Fix + Cleanup Confirmation)
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
     if (url.pathname === '/api/watchlist' && request.method === 'GET') return handleWatchlistList(request, env);
     if (url.pathname === '/api/active-recordings' && request.method === 'GET') return handleActiveRecordings(request, env);
     if (url.pathname.startsWith('/api/auto-trigger/') && request.method === 'POST') return handleAutoTrigger(request, url, env);
@@ -12,8 +12,10 @@ export default {
     if (url.pathname.startsWith('/api/check-stop/') && request.method === 'GET') return handleCheckStop(request, url, env);
     if (url.pathname === '/telegram/webhook' && request.method === 'POST') return handleTelegramWebhook(request, env);
     if (url.pathname === '/health') return jsonResponse({ status: 'ok', timestamp: new Date().toISOString() });
+
     return new Response('Not Found', { status: 404 });
   },
+
   async scheduled(event, env, ctx) {
     console.log('[AUTO-CRON] Triggered at ' + new Date().toISOString());
     ctx.waitUntil(handleAutoMonitorCron(env));
@@ -27,15 +29,22 @@ function isAuthorized(request, env) {
   if (!env.AUTO_API_TOKEN) return true;
   return request.headers.get('X-Auto-Token') === env.AUTO_API_TOKEN;
 }
+
 function unauthorizedResponse() { return jsonResponse({ error: 'Unauthorized' }, 401); }
-function escapeHtml(text) { return text ? String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : ''; }
-function jsonResponse(data, status = 200) { return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } }); }
+
+function escapeHtml(text) {
+  return text ? String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : '';
+}
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
+}
 
 async function getWatchlist(env) {
   try {
     const data = await env.SUPERLIVE_STATE.get(WATCHLIST_KEY, 'json');
     if (data && Array.isArray(data.watchlist)) return data;
-    if (Array.isArray(data)) return { watchlist: data }; // Fallback for old format
+    if (Array.isArray(data)) return { watchlist: data };
     return { watchlist: [] };
   } catch (e) {
     console.error('getWatchlist error:', e);
@@ -55,7 +64,7 @@ async function saveWatchlist(env, watchlistArray) {
 
 async function handleWatchlistList(request, env) {
   if (!isAuthorized(request, env)) return unauthorizedResponse();
-  try { return jsonResponse(await getWatchlist(env)); } 
+  try { return jsonResponse(await getWatchlist(env)); }
   catch (error) { return jsonResponse({ error: error.message }, 500); }
 }
 
@@ -76,29 +85,45 @@ async function handleAutoTrigger(request, url, env) {
     const body = await request.json();
     const streamUrl = body.stream_url || ('https://superlivetv.com/fr/livestream/' + streamId);
     const streamName = body.stream_name || '';
-    
+
     const wlData = await getWatchlist(env);
     if (!wlData.watchlist.some(e => String(e.stream_id) === streamId)) {
       return jsonResponse({ success: false, error: 'not_in_watchlist' }, 404);
     }
-    
+
     const recData = await env.SUPERLIVE_STATE.get(RECORDINGS_KEY, 'json') || { recordings: [] };
     const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
-    
+
     if (recordings.some(r => String(r.stream_id) === streamId && r.status === 'recording')) {
       return jsonResponse({ success: false, error: 'already_recording' }, 409);
     }
+
     if (recordings.filter(r => r.status === 'recording').length >= 5) {
       return jsonResponse({ success: false, error: 'concurrency_limit' }, 429);
     }
 
-    recordings.push({ stream_id: streamId, stream_url: streamUrl, stream_name: streamName, status: 'recording', started_at: new Date().toISOString(), source: 'auto' });
+    recordings.push({
+      stream_id: streamId,
+      stream_url: streamUrl,
+      stream_name: streamName,
+      status: 'recording',
+      started_at: new Date().toISOString(),
+      source: 'auto'
+    });
     await env.SUPERLIVE_STATE.put(RECORDINGS_KEY, JSON.stringify({ recordings }));
 
-    const triggerResult = await triggerGitHubDispatch(env, 'record_stream', { stream_url: streamUrl, stream_id: streamId, stream_name: streamName });
+    const triggerResult = await triggerGitHubDispatch(env, 'record_stream', {
+      stream_url: streamUrl,
+      stream_id: streamId,
+      stream_name: streamName
+    });
+
     if (triggerResult.success) {
       const nameLine = streamName ? ('\n👤 الاسم: <b>' + escapeHtml(streamName) + '</b>') : '';
-      await sendTelegramMessage(env, env.TELEGRAM_CHAT_ID, '🤖 <b>Auto Recording بدأ</b>\n📺 البث: <code>' + streamId + '</code>' + nameLine + '\n🔗 الرابط: <a href="' + streamUrl + '">افتح</a>', { parse_mode: 'HTML' });
+      await sendTelegramMessage(env, env.TELEGRAM_CHAT_ID,
+        '🤖 <b>Auto Recording بدأ</b>\n📺 البث: <code>' + streamId + '</code>' + nameLine + '\n🔗 الرابط: <a href="' + streamUrl + '">افتح</a>',
+        { parse_mode: 'HTML' }
+      );
       return jsonResponse({ success: true, started: true });
     } else {
       return jsonResponse({ success: false, error: triggerResult.error }, 502);
@@ -154,6 +179,10 @@ async function handleCheckStop(request, url, env) {
   } catch (error) { return jsonResponse({ error: error.message, should_stop: false }, 500); }
 }
 
+// ============================================================
+// TELEGRAM WEBHOOK
+// ============================================================
+
 async function handleTelegramWebhook(request, env) {
   try {
     const update = await request.json();
@@ -166,7 +195,9 @@ async function handleTelegramWebhook(request, env) {
 async function handleMessage(message, env) {
   const chatId = message.chat.id.toString();
   const text = (message.text || '').trim();
+
   if (chatId !== env.TELEGRAM_CHAT_ID) return new Response('OK');
+
   const parts = text.split(/\s+/);
   const command = parts[0].toLowerCase();
   const args = parts.slice(1);
@@ -174,19 +205,35 @@ async function handleMessage(message, env) {
   try {
     if (command === '/start' || command === '/help') { await sendMainMenu(chatId, env); return new Response('OK'); }
     if (command === '/status') { await handleStatus(chatId, env); return new Response('OK'); }
-    if (command === '/cleanup') { await handleCleanupCommand(chatId, env); return new Response('OK'); }
+    if (command === '/cleanup') { await handleCleanupConfirm(chatId, env); return new Response('OK'); }
     if (command === '/stop') { await handleStop(chatId, args[0] || null, env); return new Response('OK'); }
     if (command === '/addwatch') { await handleAddWatch(chatId, args[0] || null, env); return new Response('OK'); }
     if (command === '/removewatch') { await handleRemoveWatch(chatId, args[0] || null, env); return new Response('OK'); }
     if (command === '/watchlist') { await handleWatchlistCommand(chatId, env); return new Response('OK'); }
     if (command === '/testmonitor') { await handleTestMonitor(chatId, env); return new Response('OK'); }
-    
+
+    // ============================================================
+    // MANUAL RECORDING: Detect superlivetv.com URL in message
+    // ============================================================
     const streamUrl = text.match(/https?:\/\/[^\s]+/g)?.find(u => u.includes('superlivetv.com'));
     if (streamUrl) {
       const streamId = streamUrl.match(/livestream\/(\d+)/)?.[1];
-      if (streamId) { await handleRecord(chatId, streamUrl, env); return new Response('OK'); }
+      if (streamId) {
+        await handleRecord(chatId, streamUrl, streamId, env);
+        return new Response('OK');
+      } else {
+        await sendTelegramMessage(env, chatId,
+          '⚠️ الرابط لا يحتوي على معرف بث صالح.\n\nمثال صحيح:\n<code>https://superlivetv.com/fr/livestream/152643970</code>',
+          { parse_mode: 'HTML' }
+        );
+        return new Response('OK');
+      }
     }
-    await sendTelegramMessage(env, chatId, '🤖 أرسل رابط البث للبدء!\n<code>/addwatch 123456</code>\n<code>/watchlist</code>', { parse_mode: 'HTML' });
+
+    await sendTelegramMessage(env, chatId,
+      '🤖 أرسل رابط البث للبدء!\n\n<code>/addwatch 123456</code>\n<code>/watchlist</code>',
+      { parse_mode: 'HTML' }
+    );
   } catch (error) {
     await sendTelegramMessage(env, chatId, '❌ خطأ: ' + error.message, { parse_mode: 'HTML' });
   }
@@ -196,22 +243,31 @@ async function handleMessage(message, env) {
 async function handleCallbackQuery(callbackQuery, env) {
   const chatId = callbackQuery.message.chat.id.toString();
   const data = callbackQuery.data;
+
   if (chatId !== env.TELEGRAM_CHAT_ID) {
     await answerCallbackQuery(callbackQuery.id, env, '❌ غير مصرح');
     return new Response('OK');
   }
+
   try {
     if (data === 'status') await handleStatus(chatId, env);
-    else if (data === 'cleanup') await handleCleanupCommand(chatId, env);
+    else if (data === 'cleanup') await handleCleanupConfirm(chatId, env);
+    else if (data === 'cleanup_confirm') await handleCleanupExecute(chatId, env);
+    else if (data === 'cleanup_cancel') await sendMainMenu(chatId, env);
     else if (data === 'stop_menu') await showStopMenu(chatId, env);
     else if (data.startsWith('stop:')) await handleStop(chatId, data.split(':')[1], env);
     else if (data === 'back') await sendMainMenu(chatId, env);
     else if (data === 'watchlist') await handleWatchlistCommand(chatId, env);
     else if (data === 'test_monitor') await handleTestMonitor(chatId, env);
+
     await answerCallbackQuery(callbackQuery.id, env, '✓');
   } catch (error) { console.error('Callback error:', error); }
   return new Response('OK');
 }
+
+// ============================================================
+// WATCHLIST COMMANDS
+// ============================================================
 
 async function handleAddWatch(chatId, streamId, env) {
   try {
@@ -274,29 +330,65 @@ async function handleWatchlistCommand(chatId, env) {
   }
 }
 
-async function handleRecord(chatId, streamUrl, env) {
-  const streamId = streamUrl.match(/livestream\/(\d+)/)?.[1];
-  if (!streamId) return;
-  const recData = await env.SUPERLIVE_STATE.get(RECORDINGS_KEY, 'json') || { recordings: [] };
-  const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
-  if (recordings.some(r => String(r.stream_id) === streamId && r.status === 'recording')) {
-    await sendTelegramMessage(env, chatId, '⚠️ يُسجّل حالياً.', { parse_mode: 'HTML' });
-    return;
-  }
-  if (recordings.filter(r => r.status === 'recording').length >= 5) {
-    await sendTelegramMessage(env, chatId, '❌ الحد الأقصى (5) تم الوصول إليه.', { parse_mode: 'HTML' });
-    return;
-  }
-  recordings.push({ stream_id: streamId, stream_url: streamUrl, status: 'recording', started_at: new Date().toISOString(), source: 'manual' });
-  await env.SUPERLIVE_STATE.put(RECORDINGS_KEY, JSON.stringify({ recordings }));
-  
-  const triggerResult = await triggerGitHubDispatch(env, 'record_stream', { stream_url: streamUrl, stream_id: streamId });
-  if (triggerResult.success) {
-    await sendTelegramMessage(env, chatId, '🔴 <b>بدأ التسجيل!</b>\n📺 <code>' + streamId + '</code>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🛑 إيقاف', callback_data: 'stop:' + streamId }]] } });
-  } else {
-    await sendTelegramMessage(env, chatId, '❌ فشل: ' + triggerResult.error, { parse_mode: 'HTML' });
+// ============================================================
+// MANUAL RECORDING - FIXED
+// ============================================================
+
+async function handleRecord(chatId, streamUrl, streamId, env) {
+  try {
+    const recData = await env.SUPERLIVE_STATE.get(RECORDINGS_KEY, 'json') || { recordings: [] };
+    const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
+
+    // Check if already recording this stream
+    if (recordings.some(r => String(r.stream_id) === streamId && r.status === 'recording')) {
+      await sendTelegramMessage(env, chatId, '⚠️ هذا البث يُسجّل حالياً.', { parse_mode: 'HTML' });
+      return;
+    }
+
+    // Check concurrency limit
+    if (recordings.filter(r => r.status === 'recording').length >= 5) {
+      await sendTelegramMessage(env, chatId, '❌ الحد الأقصى (5 تسجيلات متزامنة) تم الوصول إليه.', { parse_mode: 'HTML' });
+      return;
+    }
+
+    // Add to active recordings
+    recordings.push({
+      stream_id: streamId,
+      stream_url: streamUrl,
+      status: 'recording',
+      started_at: new Date().toISOString(),
+      source: 'manual'
+    });
+    await env.SUPERLIVE_STATE.put(RECORDINGS_KEY, JSON.stringify({ recordings }));
+
+    // Trigger GitHub Actions
+    const triggerResult = await triggerGitHubDispatch(env, 'record_stream', {
+      stream_url: streamUrl,
+      stream_id: streamId
+    });
+
+    if (triggerResult.success) {
+      await sendTelegramMessage(env, chatId,
+        '🔴 <b>بدأ التسجيل اليدوي!</b>\n📺 البث: <code>' + streamId + '</code>\n🔗 الرابط: <a href="' + streamUrl + '">افتح</a>\n\n⏳ سيصلك الفيديو عند الانتهاء.',
+        {
+          parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🛑 إيقاف التسجيل', callback_data: 'stop:' + streamId }]] }
+        }
+      );
+    } else {
+      // Rollback: remove from recordings if dispatch failed
+      const rollbackRecordings = recordings.filter(r => !(String(r.stream_id) === streamId && r.status === 'recording' && r.source === 'manual'));
+      await env.SUPERLIVE_STATE.put(RECORDINGS_KEY, JSON.stringify({ recordings: rollbackRecordings }));
+      await sendTelegramMessage(env, chatId, '❌ فشل بدء التسجيل: ' + triggerResult.error, { parse_mode: 'HTML' });
+    }
+  } catch (error) {
+    await sendTelegramMessage(env, chatId, '❌ خطأ في بدء التسجيل: ' + error.message, { parse_mode: 'HTML' });
   }
 }
+
+// ============================================================
+// STATUS & STOP
+// ============================================================
 
 async function handleStatus(chatId, env) {
   const recData = await env.SUPERLIVE_STATE.get(RECORDINGS_KEY, 'json') || { recordings: [] };
@@ -305,9 +397,15 @@ async function handleStatus(chatId, env) {
     await sendTelegramMessage(env, chatId, '📭 لا توجد تسجيلات نشطة.', { parse_mode: 'HTML' });
     return;
   }
-  let msg = '📊 <b>التسجيلات النشطة:</b>\n';
-  for (const r of active) msg += '🔴 <code>' + r.stream_id + '</code>\n';
-  await sendTelegramMessage(env, chatId, msg, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🛑 إيقاف', callback_data: 'stop_menu' }]] } });
+  let msg = '📊 <b>التسجيلات النشطة (' + active.length + '/5):</b>\n\n';
+  for (const r of active) {
+    const source = r.source === 'auto' ? '🤖' : '✋';
+    msg += source + ' <code>' + r.stream_id + '</code>\n';
+  }
+  await sendTelegramMessage(env, chatId, msg, {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [[{ text: '🛑 إيقاف', callback_data: 'stop_menu' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
+  });
 }
 
 async function handleStop(chatId, streamId, env) {
@@ -315,61 +413,151 @@ async function handleStop(chatId, streamId, env) {
   const recData = await env.SUPERLIVE_STATE.get(RECORDINGS_KEY, 'json') || { recordings: [] };
   const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
   const r = recordings.find(x => String(x.stream_id) === streamId && x.status === 'recording');
-  if (!r) return;
+  if (!r) {
+    await sendTelegramMessage(env, chatId, '⚠️ التسجيل غير موجود أو متوقف بالفعل.', { parse_mode: 'HTML' });
+    return;
+  }
   r.status = 'stopped';
+  r.stopped_at = new Date().toISOString();
   await env.SUPERLIVE_STATE.put(RECORDINGS_KEY, JSON.stringify({ recordings }));
-  await sendTelegramMessage(env, chatId, '🛑 تم إيقاف: <code>' + streamId + '</code>', { parse_mode: 'HTML' });
+  await sendTelegramMessage(env, chatId, '🛑 تم إيقاف التسجيل: <code>' + streamId + '</code>', { parse_mode: 'HTML' });
 }
 
 async function showStopMenu(chatId, env) {
   const recData = await env.SUPERLIVE_STATE.get(RECORDINGS_KEY, 'json') || { recordings: [] };
   const active = (Array.isArray(recData.recordings) ? recData.recordings : []).filter(r => r.status === 'recording');
-  if (active.length === 0) return;
+  if (active.length === 0) {
+    await sendTelegramMessage(env, chatId, '📭 لا توجد تسجيلات نشطة لإيقافها.', { parse_mode: 'HTML' });
+    return;
+  }
   const buttons = active.map(r => [{ text: '🛑 ' + r.stream_id, callback_data: 'stop:' + r.stream_id }]);
-  await sendTelegramMessage(env, chatId, '🛑 اختر:', { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
+  buttons.push([{ text: '🔙 العودة', callback_data: 'back' }]);
+  await sendTelegramMessage(env, chatId, '🛑 اختر التسجيل المراد إيقافه:', { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
 }
 
-async function handleCleanupCommand(chatId, env) {
-  const recData = await env.SUPERLIVE_STATE.get(RECORDINGS_KEY, 'json') || { recordings: [] };
-  const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
-  const active = recordings.filter(r => r.status === 'recording');
-  await env.SUPERLIVE_STATE.put(RECORDINGS_KEY, JSON.stringify({ recordings: active }));
-  await sendTelegramMessage(env, chatId, '🧹 تم تنظيف ' + (recordings.length - active.length) + ' تسجيل.', { parse_mode: 'HTML' });
+// ============================================================
+// CLEANUP WITH CONFIRMATION
+// ============================================================
+
+async function handleCleanupConfirm(chatId, env) {
+  try {
+    const recData = await env.SUPERLIVE_STATE.get(RECORDINGS_KEY, 'json') || { recordings: [] };
+    const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
+    const active = recordings.filter(r => r.status === 'recording');
+    const inactive = recordings.length - active.length;
+
+    if (inactive === 0) {
+      await sendTelegramMessage(env, chatId, '✅ لا توجد تسجيلات منتهية لتنظيفها.', { parse_mode: 'HTML' });
+      return;
+    }
+
+    await sendTelegramMessage(env, chatId,
+      '🧹 <b>تنظيف قائمة التسجيلات</b>\n\n' +
+      '📊 إجمالي التسجيلات: <b>' + recordings.length + '</b>\n' +
+      '🔴 نشطة (لن تُحذف): <b>' + active.length + '</b>\n' +
+      '🗑️ منتهية (ستُحذف): <b>' + inactive + '</b>\n\n' +
+      '⚠️ سيتم حذف التسجيلات المنتهية من القائمة فقط.\n' +
+      'لن يتم حذف ملفات الفيديو أو قائمة المراقبة.\n\n' +
+      'هل أنت متأكد؟',
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '✅ نعم، احذف', callback_data: 'cleanup_confirm' }, { text: '❌ إلغاء', callback_data: 'cleanup_cancel' }]
+          ]
+        }
+      }
+    );
+  } catch (error) {
+    await sendTelegramMessage(env, chatId, '❌ خطأ: ' + error.message, { parse_mode: 'HTML' });
+  }
 }
+
+async function handleCleanupExecute(chatId, env) {
+  try {
+    const recData = await env.SUPERLIVE_STATE.get(RECORDINGS_KEY, 'json') || { recordings: [] };
+    const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
+    const active = recordings.filter(r => r.status === 'recording');
+    const deletedCount = recordings.length - active.length;
+
+    await env.SUPERLIVE_STATE.put(RECORDINGS_KEY, JSON.stringify({ recordings: active }));
+
+    await sendTelegramMessage(env, chatId,
+      '🧹 ✅ تم تنظيف <b>' + deletedCount + '</b> تسجيل منتهٍ بنجاح.\n\n📊 المتبقي: <b>' + active.length + '</b> تسجيل نشط.',
+      {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
+      }
+    );
+  } catch (error) {
+    await sendTelegramMessage(env, chatId, '❌ فشل التنظيف: ' + error.message, { parse_mode: 'HTML' });
+  }
+}
+
+// ============================================================
+// TEST MONITOR
+// ============================================================
 
 async function handleTestMonitor(chatId, env) {
-  await sendTelegramMessage(env, chatId, '🧪 جاري التشغيل...', { parse_mode: 'HTML' });
+  await sendTelegramMessage(env, chatId, '🧪 جاري تشغيل المراقبة...', { parse_mode: 'HTML' });
   const result = await triggerGitHubDispatch(env, 'auto_monitor', { source: 'telegram_button' });
-  await sendTelegramMessage(env, chatId, result.success ? '✅ تم التشغيل' : '❌ فشل: ' + result.error, { parse_mode: 'HTML' });
+  await sendTelegramMessage(env, chatId, result.success ? '✅ تم تشغيل المراقبة بنجاح' : '❌ فشل التشغيل: ' + result.error, { parse_mode: 'HTML' });
 }
+
+// ============================================================
+// MAIN MENU - FIXED
+// ============================================================
 
 async function sendMainMenu(chatId, env) {
   const wlData = await getWatchlist(env);
   const recData = await env.SUPERLIVE_STATE.get(RECORDINGS_KEY, 'json') || { recordings: [] };
   const active = (Array.isArray(recData.recordings) ? recData.recordings : []).filter(r => r.status === 'recording').length;
-  await sendTelegramMessage(env, chatId, '🎬 <b>SuperLive Recorder</b>\n📊 النشطة: <b>' + active + '/5</b>\n📋 المراقبة: <b>' + wlData.watchlist.length + '</b>', {
-    parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: [[{ text: '📊 الحالة', callback_data: 'status' }, { text: '🛑 إيقاف', callback_data: 'stop_menu' }], [{ text: '📋 القائمة', callback_data: 'watchlist' }, { text: '🧪 تشغيل', callback_data: 'test_monitor' }], [{ text: '🧹 تنظيف', callback_data: 'cleanup' }]] }
-  });
+
+  await sendTelegramMessage(env, chatId,
+    '🎬 <b>SuperLive Recorder</b>\n\n' +
+    '📊 النشطة: <b>' + active + '/5</b>\n' +
+    '📋 المراقبة: <b>' + wlData.watchlist.length + '</b>\n\n' +
+    '💡 أرسل رابط بث مباشر لبدء التسجيل اليدوي.',
+    {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '📊 الحالة', callback_data: 'status' }, { text: '🛑 إيقاف', callback_data: 'stop_menu' }],
+          [{ text: '📋 القائمة', callback_data: 'watchlist' }, { text: '🧪 تشغيل مراقبة', callback_data: 'test_monitor' }],
+          [{ text: '🧹 تنظيف التسجيلات', callback_data: 'cleanup' }]
+        ]
+      }
+    }
+  );
 }
+
+// ============================================================
+// TELEGRAM API HELPERS
+// ============================================================
 
 async function sendTelegramMessage(env, chatId, text, options = {}) {
   try {
     await fetch('https://api.telegram.org/bot' + env.TELEGRAM_BOT_TOKEN + '/sendMessage', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(Object.assign({ chat_id: chatId, text: text, parse_mode: 'HTML' }, options))
     });
-  } catch (e) {}
+  } catch (e) { console.error('sendTelegramMessage error:', e); }
 }
 
 async function answerCallbackQuery(id, env, text) {
   try {
     await fetch('https://api.telegram.org/bot' + env.TELEGRAM_BOT_TOKEN + '/answerCallbackQuery', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ callback_query_id: id, text })
     });
   } catch (e) {}
 }
+
+// ============================================================
+// CRON & GITHUB DISPATCH
+// ============================================================
 
 async function handleAutoMonitorCron(env) {
   try {
@@ -384,7 +572,12 @@ async function triggerGitHubDispatch(env, eventType, payload) {
   try {
     const response = await fetch('https://api.github.com/repos/' + env.GITHUB_REPO + '/dispatches', {
       method: 'POST',
-      headers: { 'Authorization': 'token ' + env.GITHUB_TOKEN, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json', 'User-Agent': 'SuperLive-Worker' },
+      headers: {
+        'Authorization': 'token ' + env.GITHUB_TOKEN,
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'SuperLive-Worker'
+      },
       body: JSON.stringify({ event_type: eventType, client_payload: payload })
     });
     return response.status === 204 ? { success: true } : { success: false, error: 'HTTP ' + response.status };
