@@ -54,7 +54,9 @@
       "stream_name": "🪬🍬💞الفرسه الورديه💞🍬🪬",
       "status": "recording",
       "started_at": "2026-10-09T15:52:15.449Z",
-      "source": "auto"
+      "source": "auto",
+      "state": "failed",
+      "error": "Page is blank (Stream Offline or Blocked)"
     },
     {
       "stream_id": "72741120",
