@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-SuperLive Discovery Module - Version 10.2 (Critical Fixes)
+SuperLive Discovery Module - Version 10.3 (Restored to Working State)
 
-CRITICAL FIXES in v10.2:
-1. Strict src validation: Rejects fake video elements with empty or invalid src.
-2. Smart Premium logic: If a valid video is actively playing, it CANNOT be paywalled.
-3. Stream URL priority: If a valid 7+ digit stream_id is found, it overrides profile_url.
+CRITICAL RESTORATIONS from v10.0:
+1. Video detection: Accepts WebRTC videos with empty src (srcObject-based)
+2. Premium detection: ONLY via DOM overlay or API flag (no text indicators)
+3. Retry logic: 3 attempts with 5s wait for video loading
+4. VERIFY_WAIT_MS: 10000ms (10 seconds) for proper page load
 """
 
 import asyncio
@@ -26,7 +27,7 @@ class SuperLiveDiscovery:
     BASE_URL = "https://superlivetv.com"
     PAGE_TIMEOUT_MS = 30000
     SEARCH_WAIT_MS = 8000
-    VERIFY_WAIT_MS = 10000
+    VERIFY_WAIT_MS = 10000  # RESTORED: 10 seconds for proper page load
 
     USER_AGENT = (
         "Mozilla/5.0 (X11; Linux x86_64) "
@@ -129,67 +130,87 @@ class SuperLiveDiscovery:
         return name
 
     # ============================================================
-    # STRICT VIDEO DETECTION (FIXED)
+    # SMART VIDEO DETECTION (RESTORED - accepts WebRTC with empty src)
     # ============================================================
     def _is_live_stream_video(self, dims: dict, src: str = "") -> Tuple[bool, str]:
+        """
+        Determine if a video element is a REAL live stream.
+        
+        IMPORTANT: SuperLiveTV uses WebRTC, so src is often EMPTY!
+        The video comes via srcObject (MediaStream), not src URL.
+        We only reject if src contains known non-stream keywords.
+        """
         width = dims.get("width", 0)
         height = dims.get("height", 0)
         ready_state = dims.get("readyState", 0)
         paused = dims.get("paused", True)
         
+        # Check 1: Reject if too small
         if width <= 100 or height <= 100:
             return False, "too_small"
+        
+        # Check 2: Reject if paused (live streams should be playing)
         if paused and ready_state >= 2:
             return False, f"paused_ready{ready_state}"
         
-        # CRITICAL FIX: src MUST be a valid stream source
-        if not src:
-            return False, "empty_src"
+        # Check 3: Reject if src contains non-stream keywords (gifts, ads, etc.)
+        # BUT: Empty src is OK for WebRTC streams!
+        if src:
+            src_lower = src.lower()
+            for keyword in self.NON_STREAM_KEYWORDS:
+                if keyword in src_lower:
+                    return False, f"suspicious_src:{keyword}"
         
-        src_lower = src.lower()
-        if not ("blob:" in src_lower or ".m3u8" in src_lower or ".mpd" in src_lower or "rtmp" in src_lower or "webrtc" in src_lower or "mediastream" in src_lower):
-            return False, f"invalid_src_format:{src[:50]}"
-            
-        for keyword in self.NON_STREAM_KEYWORDS:
-            if keyword in src_lower:
-                return False, f"suspicious_src:{keyword}"
-                
+        # Check 4: Reject square-ish videos (aspect ratio close to 1:1)
         if width > 0 and height > 0:
             aspect_ratio = width / height
             if 0.75 <= aspect_ratio <= 1.3:
                 return False, f"square_aspect:{aspect_ratio:.2f}"
-                
+        
+        # Check 5: readyState should be at least 2 (HAVE_CURRENT_DATA)
         if ready_state < 2:
             return False, f"low_ready_state:{ready_state}"
-            
+        
         return True, "valid_live_stream"
 
     # ============================================================
-    # COMPREHENSIVE PREMIUM DETECTION
+    # STRICT PREMIUM DETECTION (ONLY DOM overlay + API flag)
     # ============================================================
     async def _check_premium_indicators(self, page) -> dict:
+        """
+        Strict premium detection:
+        1. DOM overlay (lock icon physically covering the video)
+        2. API flag (is_premium: true)
+        
+        Text indicators and modals are NOT used because they cause
+        false positives (premium text appears in footer/navigation).
+        """
         result = {
             "is_premium": False,
             "reasons": [],
             "dom_overlay": False,
-            "text_indicators": [],
-            "has_paywall_modal": False,
         }
+        
         try:
             js_code = """
             () => {
-                const result = { dom_overlay: false, text_indicators: [], has_paywall_modal: false };
                 const isVisible = (el) => {
                     if (!el) return false;
                     const rect = el.getBoundingClientRect();
                     const style = window.getComputedStyle(el);
-                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+                    return rect.width > 0 && rect.height > 0 && 
+                           style.display !== 'none' && style.visibility !== 'hidden' &&
+                           style.opacity !== '0';
                 };
+                
                 const elementsOverlap = (el1, el2) => {
                     const rect1 = el1.getBoundingClientRect();
                     const rect2 = el2.getBoundingClientRect();
-                    return !(rect1.right < rect2.left || rect1.left > rect2.right || rect1.bottom < rect2.top || rect1.top > rect2.bottom);
+                    return !(rect1.right < rect2.left || rect1.left > rect2.right ||
+                             rect1.bottom < rect2.top || rect1.top > rect2.bottom);
                 };
+                
+                // Find main video (largest visible one with portrait aspect)
                 const videos = document.querySelectorAll('video');
                 let mainVideo = null;
                 let maxArea = 0;
@@ -203,8 +224,16 @@ class SuperLiveDiscovery:
                         mainVideo = video;
                     }
                 }
+                
+                // Check for lock overlay on main video
                 if (mainVideo) {
-                    const lockSelectors = ['[class*="lock"]', '[class*="paywall"]', '[class*="private"]', '[class*="premium"]', '[class*="exclusive"]', '[class*="vip"]', '[class*="subscribe"]', '[class*="unlock"]', '[class*="coin"]', '[data-premium="true"]', '[data-private="true"]'];
+                    const lockSelectors = [
+                        '[class*="lock"]', '[class*="paywall"]', '[class*="private"]',
+                        '[class*="premium"]', '[class*="exclusive"]', '[class*="vip"]',
+                        '[class*="subscribe"]', '[class*="unlock"]', '[class*="coin"]',
+                        '[data-premium="true"]', '[data-private="true"]'
+                    ];
+                    
                     for (const selector of lockSelectors) {
                         try {
                             const locks = document.querySelectorAll(selector);
@@ -214,76 +243,32 @@ class SuperLiveDiscovery:
                                 if (lockRect.width < 80 || lockRect.height < 80) continue;
                                 if (elementsOverlap(mainVideo, lock)) {
                                     const videoRect = mainVideo.getBoundingClientRect();
-                                    const overlapArea = (Math.max(0, Math.min(lockRect.right, videoRect.right) - Math.max(lockRect.left, videoRect.left)) * Math.max(0, Math.min(lockRect.bottom, videoRect.bottom) - Math.max(lockRect.top, videoRect.top)));
+                                    const overlapArea = (
+                                        Math.max(0, Math.min(lockRect.right, videoRect.right) - Math.max(lockRect.left, videoRect.left)) *
+                                        Math.max(0, Math.min(lockRect.bottom, videoRect.bottom) - Math.max(lockRect.top, videoRect.top))
+                                    );
                                     const overlapRatio = overlapArea / (videoRect.width * videoRect.height);
-                                    if (overlapRatio > 0.15) { result.dom_overlay = true; break; }
-                                }
-                            }
-                            if (result.dom_overlay) break;
-                        } catch (e) {}
-                    }
-                }
-                const premiumTexts = ['premium', 'private', 'privé', 'prive', 'vip', 'coins', 'coin', 'piece', 'pièce', 'pay to watch', 'subscribe to watch', 'abonner', 'unlock', 'débloquer', 'exclusive', 'exclusif', 'مميز', 'خاص', 'حصري', 'premium only', 'members only', 'paid room', 'غرفه خاصه'];
-                const bodyText = document.body.innerText.toLowerCase();
-                for (const text of premiumTexts) {
-                    if (bodyText.includes(text.toLowerCase())) {
-                        const elements = document.querySelectorAll('*');
-                        for (const el of elements) {
-                            if (!isVisible(el)) continue;
-                            const elText = (el.innerText || '').toLowerCase();
-                            if (elText.includes(text.toLowerCase())) {
-                                const rect = el.getBoundingClientRect();
-                                if (rect.top < window.innerHeight * 0.75 && rect.height < 200) {
-                                    if (!result.text_indicators.includes(text)) result.text_indicators.push(text);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                const modalSelectors = ['[class*="modal"]', '[class*="dialog"]', '[class*="overlay"]', '[class*="paywall"]', '[class*="premium-popup"]', '[role="dialog"]', '[role="alertdialog"]'];
-                for (const selector of modalSelectors) {
-                    try {
-                        const modals = document.querySelectorAll(selector);
-                        for (const modal of modals) {
-                            if (!isVisible(modal)) continue;
-                            const rect = modal.getBoundingClientRect();
-                            if (rect.width < 300 || rect.height < 300) continue;
-                            const centerX = rect.left + rect.width / 2;
-                            const centerY = rect.top + rect.height / 2;
-                            if (Math.abs(centerX - window.innerWidth / 2) < 200 && Math.abs(centerY - window.innerHeight / 2) < 200) {
-                                const modalText = (modal.innerText || '').toLowerCase();
-                                for (const text of premiumTexts) {
-                                    if (modalText.includes(text.toLowerCase())) {
-                                        result.has_paywall_modal = true;
-                                        if (!result.text_indicators.includes('modal:' + text)) result.text_indicators.push('modal:' + text);
-                                        break;
+                                    if (overlapRatio > 0.15) {
+                                        return true;
                                     }
                                 }
                             }
-                        }
-                        if (result.has_paywall_modal) break;
-                    } catch (e) {}
+                        } catch (e) {}
+                    }
                 }
-                return result;
+                return false;
             }
             """
-            dom_result = await page.evaluate(js_code)
-            if dom_result.get("dom_overlay"):
+            dom_overlay = await page.evaluate(js_code)
+            
+            if dom_overlay:
                 result["is_premium"] = True
                 result["dom_overlay"] = True
-                result["reasons"].append("DOM overlay")
-            text_indicators = dom_result.get("text_indicators", [])
-            if text_indicators:
-                result["is_premium"] = True
-                result["text_indicators"] = text_indicators
-                result["reasons"].append(f"Text: {', '.join(text_indicators[:3])}")
-            if dom_result.get("has_paywall_modal"):
-                result["is_premium"] = True
-                result["has_paywall_modal"] = True
-                result["reasons"].append("Paywall modal")
+                result["reasons"].append("DOM overlay on video")
+            
         except Exception as e:
             self.log(f"Premium indicators check error: {e}")
+        
         return result
 
     # ============================================================
@@ -303,7 +288,7 @@ class SuperLiveDiscovery:
             if result.get("username"): result["username"] = self._clean_username(result["username"])
             self.profile_cache[user_id] = result
             self.cache_timestamps[user_id] = current_time
-            self.log(f"Method A OK: {result['profile_url']}, username={result.get('username')}")
+            self.log(f"Method A OK: {result['profile_url']}")
             return result
 
         result = await self._method_c_livestream(user_id)
@@ -336,33 +321,54 @@ class SuperLiveDiscovery:
                 search_url = f"{self.BASE_URL}/fr/search?q={user_id}"
                 await page.goto(search_url, timeout=self.PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
                 await page.wait_for_timeout(self.SEARCH_WAIT_MS)
-                
-                for resp in api_responses:
-                    profile_data = self._find_profile_in_obj(resp.get("body"), user_id, 0)
-                    if profile_data:
-                        profile_url = profile_data.get("profile_url") or (f"{self.BASE_URL}/fr/profile/{profile_data.get('profile_id')}" if profile_data.get("profile_id") else None)
-                        if profile_url and self._is_valid_profile_url(profile_url, user_id):
-                            await browser.close()
-                            return {"profile_url": profile_url, "profile_id": profile_data.get("profile_id"), "username": profile_data.get("username"), "source": "api"}
-                
+                result = self._search_api_for_profile(api_responses, user_id)
+                if result and result.get("profile_url"):
+                    await browser.close()
+                    return result
+                result = await self._search_dom_for_profile(page, user_id)
                 await browser.close()
-                return None
+                return result
         except Exception as e:
             self.log(f"Method A error: {e}")
             return None
 
+    def _search_api_for_profile(self, responses: List[Dict], user_id: str) -> Optional[Dict[str, Any]]:
+        for resp in responses:
+            body = resp.get("body")
+            if not body: continue
+            profile_data = self._find_profile_in_obj(body, user_id, depth=0)
+            if profile_data:
+                profile_url = profile_data.get("profile_url")
+                if not profile_url:
+                    pid = profile_data.get("profile_id")
+                    if pid: profile_url = f"{self.BASE_URL}/fr/profile/{pid}"
+                if profile_url and self._is_valid_profile_url(profile_url, user_id):
+                    username = profile_data.get("username")
+                    if username: username = self._clean_username(username)
+                    return {"profile_url": profile_url, "profile_id": profile_data.get("profile_id"),
+                            "username": username, "source": "api"}
+        return None
+
     def _find_profile_in_obj(self, obj: Any, user_id: str, depth: int) -> Optional[Dict]:
         if depth > 10: return None
         if isinstance(obj, dict):
-            has_uid = any(isinstance(v, (str, int)) and str(v) == str(user_id) and any(t in str(k).lower() for t in ("id", "user", "uid")) for k, v in obj.items())
+            has_uid = False
+            for k, v in obj.items():
+                if isinstance(v, (str, int)) and str(v) == str(user_id):
+                    kl = str(k).lower()
+                    if any(t in kl for t in ("id", "user", "uid")):
+                        has_uid = True
+                        break
             if has_uid:
-                res = {"profile_id": None, "profile_url": None, "username": None}
+                result = {"profile_id": None, "profile_url": None, "username": None}
                 for k, v in obj.items():
                     kl = str(k).lower()
-                    if kl in ("profile_id", "profileid", "channel_id"): res["profile_id"] = str(v)
-                    elif kl in ("profile_url", "url", "link", "href") and isinstance(v, str) and v.startswith("http"): res["profile_url"] = v
-                    elif kl in ("username", "nickname", "display_name", "name") and isinstance(v, str) and v.strip(): res["username"] = v.strip()
-                if res["profile_id"] or res["profile_url"]: return res
+                    if kl in ("profile_id", "profileid", "channel_id"): result["profile_id"] = str(v)
+                    if kl in ("profile_url", "url", "link", "href"):
+                        if isinstance(v, str) and v.startswith("http"): result["profile_url"] = v
+                    if kl in ("username", "nickname", "display_name", "name"):
+                        if isinstance(v, str) and v.strip(): result["username"] = v.strip()
+                if result["profile_id"] or result["profile_url"]: return result
             for v in obj.values():
                 r = self._find_profile_in_obj(v, user_id, depth + 1)
                 if r: return r
@@ -378,7 +384,8 @@ class SuperLiveDiscovery:
             (userId) => {
                 const results = [];
                 const links = document.querySelectorAll('a[href]');
-                const systemSlugs = ['search','discover','login','register','explore','trending','popular','followings','followers','messages','notifications','settings','categories','home','nonlogin-messages'];
+                const systemSlugs = ['search','discover','login','register','explore','trending',
+                    'popular','followings','followers','messages','notifications','settings','categories','home','nonlogin-messages'];
                 for (const link of links) {
                     const href = link.getAttribute('href');
                     if (!href) continue;
@@ -393,7 +400,8 @@ class SuperLiveDiscovery:
                     const hashMatch = href.match(/\\/profile\\/([a-f0-9]{32,})/);
                     const slugMatch = href.match(/\\/fr\\/([a-zA-Z0-9_]+)/);
                     if (profileMatch || hashMatch || (slugMatch && !systemSlugs.includes(slugMatch[1]))) {
-                        results.push({href: href, text: (link.innerText || '').trim(), hasUserId: contextText.includes(userId), isProfile: !!(profileMatch || hashMatch)});
+                        results.push({href: href, text: (link.innerText || '').trim(),
+                            hasUserId: contextText.includes(userId), isProfile: !!(profileMatch || hashMatch)});
                     }
                 }
                 results.sort((a, b) => {
@@ -441,26 +449,23 @@ class SuperLiveDiscovery:
                 url = f"{self.BASE_URL}/fr/livestream/{user_id}"
                 await page.goto(url, timeout=self.PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
                 await page.wait_for_timeout(self.SEARCH_WAIT_MS)
-                
-                for resp in api_responses:
-                    profile_data = self._find_profile_in_obj(resp.get("body"), user_id, 0)
-                    if profile_data and profile_data.get("profile_url"):
-                        await browser.close()
-                        return {"profile_url": profile_data["profile_url"], "profile_id": profile_data.get("profile_id"), "username": profile_data.get("username"), "source": "livestream"}
-                
+                result = self._search_api_for_profile(api_responses, user_id)
                 await browser.close()
+                if result and result.get("profile_url"): return result
                 return {"profile_url": url, "profile_id": user_id, "username": None, "source": "livestream_url"}
         except Exception as e:
             self.log(f"Method C error: {e}")
             return None
 
     def _fallback(self, user_id: str) -> Dict[str, Any]:
-        return {"profile_url": f"{self.BASE_URL}/fr/livestream/{user_id}", "profile_id": user_id, "username": None, "source": "fallback", "uncertain": True}
+        return {"profile_url": f"{self.BASE_URL}/fr/livestream/{user_id}", "profile_id": user_id,
+                "username": None, "source": "fallback", "uncertain": True}
 
     # ============================================================
-    # PHASE 2: LIVE STATUS DETECTION (FIXED)
+    # PHASE 2: LIVE STATUS DETECTION (RESTORED with Retry Logic)
     # ============================================================
-    async def check_live_status(self, profile_url: str, user_id: str = "", profile_id: str = "", phase1_username: str = None) -> Optional[Dict[str, Any]]:
+    async def check_live_status(self, profile_url: str, user_id: str = "", profile_id: str = "",
+                                phase1_username: str = None) -> Optional[Dict[str, Any]]:
         self.log(f"Phase 2: Checking live at {profile_url}")
         if not PLAYWRIGHT_AVAILABLE: return None
 
@@ -492,13 +497,20 @@ class SuperLiveDiscovery:
                     await browser.close()
                     return {"is_live": False, "reason": "page_not_found_404"}
 
+                # ============================================================
+                # STEP 1: SMART VIDEO DETECTION WITH RETRY LOGIC
+                # ============================================================
                 has_active_video = False
                 video_stream_url = None
-                try:
+                rejected_videos = []
+                
+                for attempt in range(3):
                     videos = await page.locator("video").all()
+                    
+                    # Also check iframes
                     try:
                         iframes = await page.locator("iframe").all()
-                        for iframe in iframes[:5]:
+                        for iframe in iframes[:3]:
                             try:
                                 frame = await iframe.content_frame()
                                 if frame:
@@ -507,48 +519,82 @@ class SuperLiveDiscovery:
                             except: pass
                     except: pass
                     
-                    for i, video in enumerate(videos):
-                        try:
-                            dims = await video.evaluate("""el => ({ width: el.videoWidth || el.clientWidth, height: el.videoHeight || el.clientHeight, readyState: el.readyState, paused: el.paused, src: el.src || el.currentSrc || '' })""")
-                            src = dims.get("src", "")
-                            is_real, reason = self._is_live_stream_video(dims, src)
-                            if is_real:
-                                has_active_video = True
-                                video_stream_url = src if src else None
-                                self.log(f"Video {i}: ✓ REAL LIVE STREAM {dims}")
-                                break
-                            else:
-                                self.log(f"Video {i}: ✗ REJECTED ({reason}) {dims}")
-                        except Exception as e:
-                            self.log(f"Video {i} check error: {e}")
-                            continue
-                except Exception as e:
-                    self.log(f"Video check error: {e}")
+                    if len(videos) > 0:
+                        break
+                    
+                    self.log(f"No videos found, waiting 5s (attempt {attempt+1}/3)...")
+                    await asyncio.sleep(5)
 
+                self.log(f"Found {len(videos)} total video element(s) after retries")
+                
+                for i, video in enumerate(videos):
+                    try:
+                        dims = await video.evaluate("""el => ({
+                            width: el.videoWidth || el.clientWidth,
+                            height: el.videoHeight || el.clientHeight,
+                            readyState: el.readyState, 
+                            paused: el.paused,
+                            src: el.src || el.currentSrc || ''
+                        })""")
+                        src = dims.get("src", "")
+                        
+                        is_real, reason = self._is_live_stream_video(dims, src)
+                        
+                        if is_real:
+                            has_active_video = True
+                            video_stream_url = src if src else None
+                            self.log(f"Video {i}: ✓ REAL LIVE STREAM {dims}")
+                            break
+                        else:
+                            rejected_videos.append({"index": i, "dims": dims, "reason": reason})
+                            self.log(f"Video {i}: ✗ REJECTED ({reason}) {dims}")
+                    except Exception as e:
+                        self.log(f"Video {i} check error: {e}")
+                        continue
+                
+                if not has_active_video:
+                    if rejected_videos:
+                        self.log(f"All {len(rejected_videos)} videos rejected as non-stream content.")
+                    else:
+                        self.log("No video elements found on page after retries.")
+
+                # STEP 2: Check DOM for live indicators
                 dom_is_live = await self._check_dom_live_indicator(page)
+
+                # STEP 3: STRICT PREMIUM DETECTION (DOM overlay only)
                 premium_check = await self._check_premium_indicators(page)
                 dom_is_premium = premium_check["is_premium"]
                 if dom_is_premium:
                     self.log(f"Premium detected: {', '.join(premium_check['reasons'])}")
 
+                # STEP 4: Check API responses
                 api_result = self._check_api_live_status(api_responses, user_id)
                 api_says_live = bool(api_result and api_result.get("is_live"))
                 api_is_premium = False
                 if api_result:
-                    api_is_premium = bool(api_result.get("is_premium") or str(api_result.get("room_type", "")).lower() == "premium" or str(api_result.get("access_level", "")).lower() == "premium")
+                    api_is_premium = bool(api_result.get("is_premium") or 
+                                         api_result.get("room_type") == "premium" or
+                                         api_result.get("access_level") == "premium")
 
                 # ============================================================
-                # STEP 5: DETERMINE STATUS (FIXED)
+                # STEP 5: DETERMINE STATUS
                 # ============================================================
                 is_live = False
                 is_premium = False
                 stream_url = video_stream_url
 
                 if has_active_video:
-                    # CRITICAL FIX: If a valid video is actively playing, it CANNOT be paywalled!
-                    is_live = True
-                    is_premium = False
-                    self.log("VIDEO ACTIVE + valid stream -> LIVE_NORMAL")
+                    if dom_is_premium or api_is_premium:
+                        is_live = True
+                        is_premium = True
+                        self.log("VIDEO ACTIVE + premium indicator -> LIVE_PREMIUM")
+                    elif dom_is_live or api_says_live:
+                        is_live = True
+                        is_premium = False
+                        self.log("VIDEO ACTIVE + live indicator -> LIVE_NORMAL")
+                    else:
+                        is_live = False
+                        self.log("VIDEO ACTIVE but no live/premium indicator -> OFFLINE")
                 elif dom_is_live or api_says_live:
                     if dom_is_premium or api_is_premium:
                         is_live = True
@@ -559,10 +605,10 @@ class SuperLiveDiscovery:
                         self.log("NO VIDEO + live indicator + NO premium -> OFFLINE (false positive)")
                 else:
                     is_live = False
-                    self.log("NO VIDEO + NO live indicator -> OFFLINE")
+                    self.log("NO ACTIVE VIDEO and no explicit API stream URL -> OFFLINE")
 
                 # ============================================================
-                # STEP 6: EXTRACT STREAM ID & URL (FIXED)
+                # STEP 6: EXTRACT STREAM ID
                 # ============================================================
                 stream_id = None
 
@@ -581,22 +627,29 @@ class SuperLiveDiscovery:
                         if stream_id:
                             self.log(f"stream_id from page source: {stream_id}")
 
-                # CRITICAL FIX: If we found a valid stream_id, construct the stream_url from it!
-                if stream_id and len(str(stream_id)) >= 7:
-                    stream_url = f"{self.BASE_URL}/fr/livestream/{stream_id}"
-                else:
-                    if not stream_url:
-                        if api_result: stream_url = api_result.get("stream_url")
-                        if not stream_url: stream_url = profile_url
-                
-                if stream_url: stream_url = self._clean_stream_url(stream_url)
+                if not stream_id:
+                    if is_live and not is_premium:
+                        if self._is_from_search(profile_url):
+                            stream_id = user_id
+                            self.log(f"Using user_id as stream_id (URL verified): {stream_id}")
+                        else:
+                            self.log(f"WARNING: Could not find stream_id - SKIPPING")
+                            is_live = False
+                    else:
+                        stream_id = user_id
 
+                # Username extraction
                 username = phase1_username
                 if not username and api_result and api_result.get("username"):
                     username = self._clean_username(api_result["username"])
                 if not username:
                     page_username = await self._extract_username_from_page(page)
                     if page_username: username = self._clean_username(page_username)
+
+                if not stream_url:
+                    if api_result: stream_url = api_result.get("stream_url")
+                    if not stream_url: stream_url = profile_url
+                if stream_url: stream_url = self._clean_stream_url(stream_url)
 
                 await browser.close()
 
@@ -610,7 +663,8 @@ class SuperLiveDiscovery:
                     "is_premium": is_premium,
                     "username": username,
                 }
-                self.log(f"Phase 2 FINAL: is_live={is_live}, premium={is_premium}, stream_id={stream_id}, user_id={user_id}")
+                self.log(f"Phase 2 FINAL: is_live={is_live}, premium={is_premium}, "
+                         f"stream_id={stream_id}, user_id={user_id}")
                 return result
 
         except Exception as e:
@@ -620,7 +674,8 @@ class SuperLiveDiscovery:
     # ============================================================
     # STREAM ID EXTRACTION METHODS
     # ============================================================
-    def _find_stream_id_from_api(self, responses: List[Dict], user_id: str, profile_id: str, username: str) -> Optional[str]:
+    def _find_stream_id_from_api(self, responses: List[Dict], user_id: str, 
+                                   profile_id: str, username: str) -> Optional[str]:
         for resp in responses:
             body = resp.get("body")
             if not body: continue
@@ -629,7 +684,8 @@ class SuperLiveDiscovery:
                 return stream_id
         return None
     
-    def _deep_search_stream_id(self, obj: Any, user_id: str, profile_id: str, username: str, depth: int) -> Optional[str]:
+    def _deep_search_stream_id(self, obj: Any, user_id: str, profile_id: str, 
+                                username: str, depth: int) -> Optional[str]:
         if depth > 15: return None
         if isinstance(obj, dict):
             stream_id_candidate = None
@@ -637,7 +693,8 @@ class SuperLiveDiscovery:
             username_match = False
             for k, v in obj.items():
                 kl = str(k).lower()
-                if kl in ("stream_id", "streamid", "live_id", "liveid", "broadcast_id", "broadcastid", "current_stream_id", "id"):
+                if kl in ("stream_id", "streamid", "live_id", "liveid", 
+                         "broadcast_id", "broadcastid", "current_stream_id", "id"):
                     if v and str(v).isdigit() and len(str(v)) >= 7:
                         stream_id_candidate = str(v)
                 if kl in ("user_id", "userid", "uid", "owner_id"):
@@ -677,7 +734,8 @@ class SuperLiveDiscovery:
                 function deepSearch(obj, depth) {
                     if (depth > 10) return null;
                     if (typeof obj === 'object' && obj !== null) {
-                        const streamIdKeys = ['stream_id', 'streamId', 'live_id', 'liveId', 'broadcast_id', 'broadcastId', 'current_stream_id', 'streamID', 'liveID'];
+                        const streamIdKeys = ['stream_id', 'streamId', 'live_id', 'liveId',
+                            'broadcast_id', 'broadcastId', 'current_stream_id', 'streamID', 'liveID'];
                         for (const key of streamIdKeys) {
                             if (obj[key] && typeof obj[key] === 'number' && obj[key] > 1000000) return String(obj[key]);
                             if (obj[key] && typeof obj[key] === 'string' && /^\\d{7,}$/.test(obj[key])) return obj[key];
@@ -712,11 +770,15 @@ class SuperLiveDiscovery:
             return None
         except Exception as e:
             self.log(f"Page source stream_id extraction error: {e}")
-        return None
+            return None
 
     async def _check_dom_live_indicator(self, page) -> bool:
         try:
-            live_selectors = [".live-badge", ".live-indicator", ".is-live", '[data-status="live"]', '[class*="live-badge"]', '[class*="live-indicator"]', '[class*="is-live"]']
+            live_selectors = [
+                ".live-badge", ".live-indicator", ".is-live",
+                '[data-status="live"]', '[class*="live-badge"]',
+                '[class*="live-indicator"]', '[class*="is-live"]',
+            ]
             for selector in live_selectors:
                 try:
                     elements = await page.locator(selector).all()
@@ -749,7 +811,8 @@ class SuperLiveDiscovery:
     def _find_live_status_in_obj(self, obj: Any, user_id: str, depth: int) -> Optional[Dict]:
         if depth > 10: return None
         if isinstance(obj, dict):
-            result = {"is_live": False, "stream_url": None, "stream_id": None, "username": None, "is_premium": False}
+            result = {"is_live": False, "stream_url": None, "stream_id": None, 
+                     "username": None, "is_premium": False}
             for k, v in obj.items():
                 kl = str(k).lower()
                 if kl in ("is_live", "islive", "live", "streaming", "is_streaming", "online"):
@@ -778,7 +841,8 @@ class SuperLiveDiscovery:
 
     async def _extract_username_from_page(self, page) -> Optional[str]:
         try:
-            selectors = ['[class*="username"]', '[class*="display-name"]', '[class*="profile-name"]', "h1", "h2"]
+            selectors = ['[class*="username"]', '[class*="display-name"]',
+                '[class*="profile-name"]', "h1", "h2"]
             for selector in selectors:
                 try:
                     elements = await page.locator(selector).all()
