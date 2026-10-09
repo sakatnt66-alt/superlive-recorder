@@ -61,15 +61,6 @@
       "stopped_at": "2026-10-09T01:37:04.023Z"
     },
     {
-      "stream_id": "65826144",
-      "stream_url": "https://superlivetv.com/fr/livestream/152593057",
-      "stream_name": "🪬🍬💞الفرسه الورديه💞🍬🪬",
-      "status": "stopped",
-      "started_at": "2026-10-09T01:31:35.592Z",
-      "source": "auto",
-      "stopped_at": "2026-10-09T01:37:07.874Z"
-    },
-    {
       "stream_id": "33018909",
       "stream_url": "https://superlivetv.com/fr/livestream/152595990",
       "stream_name": "🇲🇦🦌غزلان فرنسي🦌",
@@ -95,11 +86,6 @@
       "started_at": "2026-10-09T01:41:30.060Z",
       "source": "auto",
       "stopped_at": "2026-10-09T01:43:30.073Z"
-    },
-    {
-      "stream_id": "65826144",
-      "state": "failed",
-      "error": "Live video was not detected; last selector error=Error: No visible live video target found"
     }
   ]
 }
