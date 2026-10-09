@@ -19,10 +19,18 @@ from superlive_discovery import SuperLiveDiscovery
 # Configuration
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-WORKER_API_URL = os.environ.get("WORKER_API_URL", "")
-AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "")
+WORKER_API_URL = os.environ.get("WORKER_API_URL", "").strip()
+AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# Debug: Print configuration status
+print(f"[DEBUG] WORKER_API_URL: {'SET' if WORKER_API_URL else 'MISSING'} (length={len(WORKER_API_URL)})")
+print(f"[DEBUG] AUTO_API_TOKEN: {'SET' if AUTO_API_TOKEN else 'MISSING'} (length={len(AUTO_API_TOKEN)})")
+
+# Remove trailing slash from WORKER_API_URL if present
+if WORKER_API_URL and WORKER_API_URL.endswith('/'):
+    WORKER_API_URL = WORKER_API_URL[:-1]
 
 WATCHLIST_FILE = Path("data/watchlist.json")
 MAX_CONCURRENT = 4
@@ -66,8 +74,10 @@ def get_active_recordings() -> list:
             if response.status == 200:
                 data = json.loads(response.read().decode('utf-8'))
                 return data.get("recordings", [])
+            else:
+                print(f"[WORKER] ✗ HTTP {response.status} when fetching active recordings")
     except Exception as e:
-        print(f"[WORKER] Error getting active recordings: {e}")
+        print(f"[WORKER] ✗ Error getting active recordings: {e}")
     
     return []
 
