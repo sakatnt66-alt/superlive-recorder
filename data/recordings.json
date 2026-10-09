@@ -41,16 +41,6 @@
       "stopped_at": "2026-10-09T15:13:24.123Z"
     },
     {
-      "stream_id": "21421785",
-      "stream_url": "https://superlivetv.com/fr/livestream/152631022",
-      "stream_name": "نجلاء💎🎀",
-      "status": "recording",
-      "started_at": "2026-10-09T15:52:11.227Z",
-      "source": "auto",
-      "state": "failed",
-      "error": "Page is blank (Stream Offline or Blocked)"
-    },
-    {
       "stream_id": "24353293",
       "stream_url": "https://superlivetv.com/fr/livestream/152635012",
       "stream_name": "Alisa",
