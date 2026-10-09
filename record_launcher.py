@@ -64,6 +64,31 @@ def update_worker_state(stream_id: str, state: dict):
     except Exception as e:
         print(f"[WORKER] Error updating state: {e}")
 
+def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
+    """
+    Check if stream_id is a valid stream ID (not user_id).
+    Valid stream IDs:
+    - Are different from user_id
+    - Have at least 9 digits
+    - Are numeric
+    """
+    stream_id_str = str(stream_id)
+    user_id_str = str(user_id)
+    
+    # Must be different from user_id
+    if stream_id_str == user_id_str:
+        return False
+    
+    # Must have at least 9 digits
+    if len(stream_id_str) < 9:
+        return False
+    
+    # Must be numeric
+    if not stream_id_str.isdigit():
+        return False
+    
+    return True
+
 async def verify_stream_is_accessible(stream_url: str) -> dict:
     """
     Smart verification: check if video is ACTUALLY playing.
@@ -183,7 +208,7 @@ async def verify_stream_is_accessible(stream_url: str) -> dict:
 async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
     """
     Pre-flight validation before recording.
-    Returns dict with: success, status, username, error
+    Returns dict with: success, status, username, error, actual_stream_id
     """
     print(f"[PRE-FLIGHT] Starting validation for stream {stream_id}")
     
@@ -225,9 +250,16 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
             if live_result:
                 is_live = live_result.get("is_live", False)
                 is_premium = live_result.get("is_premium", False)
-                # Use username from live_result, or fallback to discovered, or user_id
+                raw_stream_id = live_result.get("stream_id")
                 username = live_result.get("username") or discovered_username
-                print(f"[PRE-FLIGHT] Discovery says: is_live={is_live}, is_premium={is_premium}, username={username}")
+                
+                # Validate stream_id
+                actual_stream_id = stream_id
+                if raw_stream_id and is_valid_stream_id(raw_stream_id, stream_id):
+                    actual_stream_id = str(raw_stream_id)
+                    print(f"[PRE-FLIGHT] ✓ Valid stream_id detected: {actual_stream_id}")
+                
+                print(f"[PRE-FLIGHT] Discovery says: is_live={is_live}, is_premium={is_premium}, username={username}, stream_id={actual_stream_id}")
                 
                 # ============================================================
                 # SMART OVERRIDE: If Discovery says PREMIUM but video is playing,
@@ -247,6 +279,7 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                             "success": True,
                             "status": "LIVE_NORMAL",
                             "username": username or stream_id,
+                            "actual_stream_id": actual_stream_id,
                             "error": None
                         }
                     else:
@@ -255,15 +288,17 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                             "success": False,
                             "status": "LIVE_PREMIUM",
                             "username": username,
+                            "actual_stream_id": actual_stream_id,
                             "error": "Stream is Premium (paywalled) - video cannot play"
                         }
                 
                 if is_live and not is_premium:
-                    print(f"[PRE-FLIGHT] ✓ Stream validated: LIVE_NORMAL, username={username}")
+                    print(f"[PRE-FLIGHT] ✓ Stream validated: LIVE_NORMAL, username={username}, stream_id={actual_stream_id}")
                     return {
                         "success": True,
                         "status": "LIVE_NORMAL",
                         "username": username,
+                        "actual_stream_id": actual_stream_id,
                         "error": None
                     }
                 
@@ -276,6 +311,7 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                             "success": True,
                             "status": "LIVE_NORMAL",
                             "username": username or stream_id,
+                            "actual_stream_id": actual_stream_id,
                             "error": None
                         }
                     
@@ -283,6 +319,7 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                         "success": False,
                         "status": "OFFLINE",
                         "username": username,
+                        "actual_stream_id": actual_stream_id,
                         "error": "User is offline"
                     }
         
@@ -296,6 +333,7 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                 "success": False,
                 "status": "UNKNOWN",
                 "username": None,
+                "actual_stream_id": stream_id,
                 "error": "Failed to resolve user identity"
             }
         
@@ -308,6 +346,7 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                 "success": False,
                 "status": "UNKNOWN",
                 "username": username,
+                "actual_stream_id": stream_id,
                 "error": "No profile URL found"
             }
         
@@ -323,12 +362,19 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                 "success": False,
                 "status": "UNKNOWN",
                 "username": username,
+                "actual_stream_id": stream_id,
                 "error": "Failed to check live state"
             }
         
         is_live = live_result.get("is_live", False)
         is_premium = live_result.get("is_premium", False)
+        raw_stream_id = live_result.get("stream_id")
         final_username = live_result.get("username") or username
+        
+        # Validate stream_id
+        actual_stream_id = stream_id
+        if raw_stream_id and is_valid_stream_id(raw_stream_id, stream_id):
+            actual_stream_id = str(raw_stream_id)
         
         # Smart override for false PREMIUM detection
         if is_live and is_premium:
@@ -340,12 +386,14 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                     "success": True,
                     "status": "LIVE_NORMAL",
                     "username": final_username or stream_id,
+                    "actual_stream_id": actual_stream_id,
                     "error": None
                 }
             return {
                 "success": False,
                 "status": "LIVE_PREMIUM",
                 "username": final_username,
+                "actual_stream_id": actual_stream_id,
                 "error": "Stream is Premium (paywalled)"
             }
         
@@ -354,6 +402,7 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                 "success": False,
                 "status": "LIVE_PREMIUM",
                 "username": final_username,
+                "actual_stream_id": actual_stream_id,
                 "error": "Stream is Premium (paywalled)"
             }
         
@@ -362,14 +411,16 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                 "success": False,
                 "status": "OFFLINE",
                 "username": final_username,
+                "actual_stream_id": actual_stream_id,
                 "error": "User is offline"
             }
         
-        print(f"[PRE-FLIGHT] ✓ Stream validated: LIVE_NORMAL, username={final_username}")
+        print(f"[PRE-FLIGHT] ✓ Stream validated: LIVE_NORMAL, username={final_username}, stream_id={actual_stream_id}")
         return {
             "success": True,
             "status": "LIVE_NORMAL",
             "username": final_username,
+            "actual_stream_id": actual_stream_id,
             "error": None
         }
         
@@ -381,6 +432,7 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
             "success": False,
             "status": "ERROR",
             "username": None,
+            "actual_stream_id": stream_id,
             "error": str(e)
         }
 
@@ -414,19 +466,20 @@ async def main():
         status = validation["status"]
         username = validation["username"] or "Unknown"
         error = validation["error"]
+        actual_stream_id = validation["actual_stream_id"]
         
         if status == "LIVE_PREMIUM":
-            msg = f"💎 <b>بث Premium</b>\n👤 المستخدم: <code>{stream_id}</code>\n👤 الاسم: <b>{username}</b>\n\n⚠️ هذا البث مدفوع ولا يمكن تسجيله."
+            msg = f"💎 <b>بث Premium</b>\n👤 المستخدم: <code>{actual_stream_id}</code>\n👤 الاسم: <b>{username}</b>\n\n⚠️ هذا البث مدفوع ولا يمكن تسجيله."
         elif status == "OFFLINE":
-            msg = f"⚫ <b>غير متصل</b>\n👤 المستخدم: <code>{stream_id}</code>\n👤 الاسم: <b>{username}</b>\n\n⚠️ المستخدم غير متصل حالياً."
+            msg = f"⚫ <b>غير متصل</b>\n👤 المستخدم: <code>{actual_stream_id}</code>\n👤 الاسم: <b>{username}</b>\n\n⚠️ المستخدم غير متصل حالياً."
         elif status == "MISMATCH":
-            msg = f"⚠️ <b>خطأ في الهوية</b>\n👤 المستخدم: <code>{stream_id}</code>\n\n❌ {error}"
+            msg = f"⚠️ <b>خطأ في الهوية</b>\n👤 المستخدم: <code>{actual_stream_id}</code>\n\n❌ {error}"
         else:
-            msg = f"❌ <b>فشل التحقق</b>\n👤 المستخدم: <code>{stream_id}</code>\n\n⚠️ {error}"
+            msg = f"❌ <b>فشل التحقق</b>\n👤 المستخدم: <code>{actual_stream_id}</code>\n\n⚠️ {error}"
         
         send_telegram_message(msg)
         
-        update_worker_state(stream_id, {
+        update_worker_state(actual_stream_id, {
             "status": "failed",
             "error": error,
             "failed_at": datetime.now(timezone.utc).isoformat()
@@ -436,10 +489,18 @@ async def main():
         sys.exit(1)
     
     detected_username = validation["username"]
+    actual_stream_id = validation["actual_stream_id"]
+    
     if detected_username and not stream_name:
         stream_name = detected_username
         print(f"[PRE-FLIGHT] ✓ Using detected username: {stream_name}")
         os.environ["STREAM_NAME"] = stream_name
+    
+    # Update STREAM_ID if a valid stream_id was detected
+    if actual_stream_id != stream_id:
+        print(f"[PRE-FLIGHT] ✓ Using detected stream_id: {actual_stream_id} (was {stream_id})")
+        os.environ["STREAM_ID"] = actual_stream_id
+        stream_id = actual_stream_id
     
     print(f"\n[PRE-FLIGHT] ✓ All checks passed - proceeding with recording")
     
