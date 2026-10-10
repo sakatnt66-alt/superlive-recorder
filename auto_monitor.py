@@ -172,7 +172,7 @@ def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name
     except urllib.error.HTTPError as e:
         body = read_error_body(e)
         if e.code == 409:
-            print(f"[AUTO] ⚠️ SKIPPED {user_id}: already recording (stream={stream_id})")
+            print(f"[AUTO] ⚠️ SKIPPED {user_id}: already recording")
         elif e.code == 404:
             print(f"[AUTO] ✗ NOT IN WATCHLIST {user_id}")
         elif e.code == 429:
@@ -186,10 +186,6 @@ def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name
 
 
 def update_display_name(user_id: str, display_name: str) -> bool:
-    """
-    Update the display_name for a user in Cloudflare KV.
-    Called automatically when auto_monitor discovers a real name.
-    """
     if not WORKER_API_URL or not AUTO_API_TOKEN:
         return False
     if not display_name or display_name == user_id:
@@ -211,7 +207,7 @@ def update_display_name(user_id: str, display_name: str) -> bool:
                     print(f"[AUTO] ✓ Updated display_name for {user_id}: {display_name}")
                 return data.get("success", False)
     except urllib.error.HTTPError as e:
-        if e.code != 400:  # 400 means name equals user_id (expected)
+        if e.code != 400:
             print(f"[AUTO] ✗ Failed to update display_name for {user_id}: HTTP {e.code}")
     except Exception as e:
         print(f"[AUTO] ✗ Error updating display_name: {e}")
@@ -223,13 +219,29 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
     print(f"[AUTO] [Phase 1] Resolving {user_id}")
     
     try:
+        # Phase 1: Discover profile
         profile_result = await discovery.discover_profile_id(user_id)
+        
         if not profile_result:
+            print(f"[AUTO] ✗ Failed to resolve {user_id}")
             return None
         
         profile_url = profile_result.get("profile_url")
         if not profile_url or "/None" in profile_url:
+            print(f"[AUTO] ✗ Invalid profile URL for {user_id}")
             return None
+        
+        # ============================================================
+        # METHOD C FALLBACK DETECTION
+        # If profile_url is /livestream/{user_id}, it's a Method C fallback
+        # that won't give us a real stream_id - handle specially
+        # ============================================================
+        is_method_c_fallback = False
+        if '/livestream/' in profile_url:
+            match = re.search(r'/livestream/(\d+)', profile_url)
+            if match and match.group(1) == user_id:
+                is_method_c_fallback = True
+                print(f"[AUTO] ⚠️ Method C fallback: /livestream/{user_id}")
         
         username = profile_result.get("username", "")
         profile_id = profile_result.get("profile_id", "")
@@ -237,6 +249,12 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         if profile_id and not is_valid_profile_id(profile_id):
             profile_id = ""
         
+        # Only log Phase 1 OK for real profile URLs (not Method C fallback)
+        if not is_method_c_fallback:
+            print(f"[AUTO] [Phase 1] OK: {profile_url}")
+            print(f"[AUTO] [Phase 2] Check live at {profile_url}")
+        
+        # Phase 2: Check live status
         live_result = await discovery.check_live_status(
             profile_url=profile_url,
             user_id=user_id,
@@ -252,54 +270,98 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         raw_stream_id = live_result.get("stream_id", user_id)
         stream_id_valid = is_valid_stream_id(raw_stream_id, user_id)
         
+        # ============================================================
+        # SECOND CHANCE: If OFFLINE from profile, try direct livestream
+        # This catches cases where the stream is live but profile page
+        # doesn't show the video (like the ميساء case)
+        # ============================================================
+        if not is_live and not is_premium:
+            direct_url = f"https://superlivetv.com/fr/livestream/{user_id}"
+            
+            # Only try second chance if we haven't already checked this URL
+            if profile_url != direct_url:
+                print(f"[AUTO] ⚠️ OFFLINE on profile - trying second chance at {direct_url}")
+                
+                direct_result = await discovery.check_live_status(
+                    profile_url=direct_url,
+                    user_id=user_id,
+                    profile_id="",
+                    phase1_username=username
+                )
+                
+                if direct_result:
+                    direct_live = direct_result.get("is_live", False)
+                    direct_premium = direct_result.get("is_premium", False)
+                    direct_stream_id = direct_result.get("stream_id", user_id)
+                    direct_stream_valid = is_valid_stream_id(direct_stream_id, user_id)
+                    
+                    if direct_live:
+                        print(f"[AUTO] ✓ SECOND CHANCE SUCCESS: stream is LIVE!")
+                        is_live = True
+                        is_premium = direct_premium
+                        raw_stream_id = direct_stream_id
+                        stream_id_valid = direct_stream_valid
+                    else:
+                        print(f"[AUTO] ✗ Second chance confirmed: OFFLINE")
+        
+        # ============================================================
+        # Determine final stream_id
+        # ============================================================
         if stream_id_valid and is_live:
             stream_id = str(raw_stream_id)
             stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
         else:
-            livestream_match = re.search(r'/livestream/(\d+)', profile_url)
-            if livestream_match and is_valid_stream_id(livestream_match.group(1), user_id):
-                stream_id = livestream_match.group(1)
-                stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
-            else:
-                stream_id = user_id
-                stream_url = profile_url
+            stream_id = user_id
+            stream_url = ""  # Don't use invalid URL
         
+        # Get username
         final_username = live_result.get("username") or username
-        
         if not final_username or str(final_username) == str(user_id):
             for w in watchlist:
                 if str(w.get("stream_id")) == str(user_id) and w.get("display_name"):
                     final_username = w.get("display_name")
                     break
-        
         if not final_username:
             final_username = user_id
         
-        # ============================================================
-        # AUTO-UPDATE DISPLAY NAME in KV
-        # ============================================================
+        # Auto-update display_name in KV
         if final_username and final_username != user_id:
             update_display_name(user_id, final_username)
         
+        # ============================================================
+        # Display results (CLEAN - only valid info)
+        # ============================================================
         print(f"[AUTO] username={user_id}")
-        print(f"[AUTO] source=discovery_layer")
-        print(f"[AUTO] profile_url={profile_url}")
-        if profile_id:
-            print(f"[AUTO] profile_id={profile_id}")
-        print(f"[AUTO] stream_id={stream_id} (valid={stream_id_valid})")
         print(f"[AUTO] display_name={final_username}")
         
+        # Only show profile_url for real profiles (not Method C fallback)
+        if not is_method_c_fallback:
+            print(f"[AUTO] profile_url={profile_url}")
+            if profile_id:
+                print(f"[AUTO] profile_id={profile_id}")
+        
+        # Only show stream_id if valid
+        if stream_id_valid:
+            print(f"[AUTO] stream_id={stream_id} ✓")
+        elif is_live:
+            print(f"[AUTO] stream_id=N/A (live but no valid ID)")
+        
+        # ============================================================
+        # Decision
+        # ============================================================
         if is_premium:
             print(f"[AUTO] phase=p2_premium - SKIP_PREMIUM")
             return None
+        
         if not is_live:
             print(f"[AUTO] phase=p2_offline - SKIP_OFFLINE")
             return None
+        
         if not stream_id_valid:
-            print(f"[AUTO] phase=p2_invalid_stream - SKIP")
+            print(f"[AUTO] phase=p2_invalid_stream - SKIP (no valid stream_id)")
             return None
         
-        print(f"[AUTO] phase=phase_3_done - CANDIDATE")
+        print(f"[AUTO] phase=phase_3_done - CANDIDATE ✓")
         
         return {
             "user_id": user_id,
@@ -310,6 +372,8 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         
     except Exception as e:
         print(f"[AUTO] ✗ Error checking user {user_id}: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -341,8 +405,6 @@ async def main():
     to_check = [u for u in watchlist if str(u.get("stream_id")) not in active_user_ids]
     
     print(f"[AUTO] Discovery for {len(to_check)} users (Concurrency: {MAX_CONCURRENT})")
-    print(f"[AUTO] Active user_ids: {active_user_ids}")
-    print(f"[AUTO] Active stream_ids: {active_stream_ids}")
     
     if not to_check:
         print("[AUTO] ✓ No users to check")
