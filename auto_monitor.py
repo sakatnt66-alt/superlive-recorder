@@ -36,18 +36,12 @@ print(f"[DEBUG] AUTO_API_TOKEN: {'SET' if AUTO_API_TOKEN else 'MISSING'} (length
 if WORKER_API_URL and WORKER_API_URL.endswith('/'):
     WORKER_API_URL = WORKER_API_URL[:-1]
 
-WATCHLIST_FILE = Path("data/watchlist.json")
+WATCHLIST_FILE = Path("data/watchlist.json")  # Fallback only
 MAX_CONCURRENT = 4
 
 
 def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
-    """
-    Check if stream_id is a valid stream ID (not user_id, not hash).
-    Valid stream IDs:
-    - Are different from user_id
-    - Have at least 9 digits
-    - Are numeric only (no letters/hashes)
-    """
+    """Check if stream_id is valid (different from user_id, 9+ digits, numeric)."""
     stream_id_str = str(stream_id)
     user_id_str = str(user_id)
     
@@ -57,25 +51,18 @@ def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
         return False
     if not stream_id_str.isdigit():
         return False
-    
     return True
 
 
 def is_valid_profile_id(profile_id: str) -> bool:
-    """
-    Check if profile_id is valid (numeric, not a hash).
-    Reject hashes like "95c3fb183522a4bbe89a1f3972046720c69e2f3b"
-    """
+    """Check if profile_id is valid (numeric, not a hash)."""
     if not profile_id:
         return False
-    
     profile_id_str = str(profile_id)
-    
     if not profile_id_str.isdigit():
         return False
     if len(profile_id_str) < 5 or len(profile_id_str) > 15:
         return False
-    
     return True
 
 
@@ -116,6 +103,54 @@ def send_telegram_message(text: str, parse_mode: str = "HTML"):
         print(f"[TELEGRAM] Error sending message: {e}")
 
 
+def get_watchlist() -> list:
+    """
+    Get watchlist from Worker API (KV - authoritative source).
+    Falls back to local file if Worker is not configured.
+    """
+    # Try Worker API first (authoritative source, updated by Telegram)
+    if WORKER_API_URL and AUTO_API_TOKEN:
+        url = f"{WORKER_API_URL}/api/watchlist"
+        req = urllib.request.Request(url, headers={
+            'X-Auto-Token': AUTO_API_TOKEN,
+            'Content-Type': 'application/json',
+            'User-Agent': USER_AGENT,
+            'Accept': 'application/json'
+        })
+        
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                if response.status == 200:
+                    data = json.loads(response.read().decode('utf-8'))
+                    watchlist = data.get("watchlist", [])
+                    print(f"[WATCHLIST] ✓ Loaded {len(watchlist)} users from Worker API (KV)")
+                    return watchlist
+                else:
+                    print(f"[WATCHLIST] ✗ HTTP {response.status} when fetching watchlist")
+        except urllib.error.HTTPError as e:
+            body = read_error_body(e)
+            print(f"[WATCHLIST] ✗ HTTP Error {e.code}: {e.reason}")
+            print(f"[WATCHLIST]   Response: {body}")
+        except Exception as e:
+            print(f"[WATCHLIST] ✗ Error fetching watchlist: {e}")
+    
+    # Fallback to local file
+    print("[WATCHLIST] ⚠️ Falling back to local watchlist.json")
+    if not WATCHLIST_FILE.exists():
+        print("[WATCHLIST] ✗ Local watchlist.json not found")
+        return []
+    
+    try:
+        with open(WATCHLIST_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            watchlist = data.get("watchlist", [])
+            print(f"[WATCHLIST] Loaded {len(watchlist)} users from local file")
+            return watchlist
+    except Exception as e:
+        print(f"[WATCHLIST] ✗ Error loading local watchlist: {e}")
+        return []
+
+
 def get_active_recordings() -> list:
     """Get active recordings from worker"""
     if not WORKER_API_URL or not AUTO_API_TOKEN:
@@ -140,11 +175,6 @@ def get_active_recordings() -> list:
         body = read_error_body(e)
         print(f"[WORKER] ✗ HTTP Error {e.code}: {e.reason}")
         print(f"[WORKER]   Response: {body}")
-        if e.code == 403:
-            print(f"[WORKER]   → Cloudflare WAF may be blocking GitHub Actions")
-            print(f"[WORKER]   → Solution: Pause WAF rules or allow GitHub Actions IPs")
-        elif e.code == 401:
-            print(f"[WORKER]   → AUTO_API_TOKEN mismatch between GitHub and Cloudflare")
     except Exception as e:
         print(f"[WORKER] ✗ Error getting active recordings: {e}")
     
@@ -152,19 +182,15 @@ def get_active_recordings() -> list:
 
 
 def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name: str) -> bool:
-    """Trigger recording via worker
-    
-    IMPORTANT: Use user_id in URL (for watchlist lookup), pass stream_id in payload.
-    The watchlist stores user_ids (like 61055822), not stream_ids (like 152665656).
+    """
+    Trigger recording via worker.
+    URL contains user_id (watchlist key), payload contains stream_id (real ID).
     """
     if not WORKER_API_URL or not AUTO_API_TOKEN:
-        print(f"[AUTO] ✗ Worker API not configured (WORKER_API_URL or AUTO_API_TOKEN missing)")
+        print(f"[AUTO] ✗ Worker API not configured")
         return False
     
-    # Use user_id in URL (this is what's stored in watchlist)
     url = f"{WORKER_API_URL}/api/auto-trigger/{user_id}"
-    
-    # Pass stream_id (the real stream ID) in the payload
     payload = json.dumps({
         "stream_url": stream_url,
         "stream_id": stream_id,
@@ -196,13 +222,34 @@ def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name
                 return False
     except urllib.error.HTTPError as e:
         body = read_error_body(e)
-        print(f"[AUTO] ✗ HTTP Error {e.code}: {e.reason} when triggering {user_id}")
-        print(f"[AUTO]   Response: {body}")
-        if e.code == 403:
+        
+        # Parse the response to get specific error details
+        error_detail = ""
+        try:
+            resp_data = json.loads(body)
+            error_detail = resp_data.get('error', '')
+        except:
+            pass
+        
+        if e.code == 409:  # Conflict - already recording
+            print(f"[AUTO] ⚠️ SKIPPED {user_id}: already recording (stream={stream_id})")
+            print(f"[AUTO]   → This is normal - the recording is already in progress")
+            return False
+        elif e.code == 404:
+            print(f"[AUTO] ✗ NOT IN WATCHLIST {user_id}: user_id not found in watchlist")
+            return False
+        elif e.code == 429:
+            print(f"[AUTO] ✗ CONCURRENCY LIMIT REACHED for {user_id}")
+            return False
+        elif e.code == 403:
+            print(f"[AUTO] ✗ HTTP Error 403: Forbidden when triggering {user_id}")
             print(f"[AUTO]   → Cloudflare WAF may be blocking GitHub Actions")
-            print(f"[AUTO]   → Solution: Pause WAF rules or allow GitHub Actions IPs")
         elif e.code == 401:
-            print(f"[AUTO]   → AUTO_API_TOKEN mismatch between GitHub and Cloudflare")
+            print(f"[AUTO] ✗ HTTP Error 401: Unauthorized when triggering {user_id}")
+            print(f"[AUTO]   → AUTO_API_TOKEN mismatch")
+        else:
+            print(f"[AUTO] ✗ HTTP Error {e.code}: {e.reason} when triggering {user_id}")
+            print(f"[AUTO]   Response: {body}")
         return False
     except Exception as e:
         print(f"[AUTO] ✗ Error triggering recording for {user_id}: {e}")
@@ -230,7 +277,6 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         username = profile_result.get("username", "")
         profile_id = profile_result.get("profile_id", "")
         
-        # Validate profile_id (reject hashes)
         if profile_id and not is_valid_profile_id(profile_id):
             print(f"[AUTO] ⚠️ Invalid profile_id (hash detected): {profile_id}")
             profile_id = ""
@@ -254,17 +300,12 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         is_premium = live_result.get("is_premium", False)
         raw_stream_id = live_result.get("stream_id", user_id)
         
-        # Validate stream_id (reject user_id and hashes)
         stream_id_valid = is_valid_stream_id(raw_stream_id, user_id)
         
-        # Determine final stream_id and URL
         if stream_id_valid and is_live:
-            # Use the real stream_id from page source
             stream_id = str(raw_stream_id)
             stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
         else:
-            # stream_id is invalid or stream is offline
-            # Try to find a valid stream_id from profile_url
             livestream_match = re.search(r'/livestream/(\d+)', profile_url)
             if livestream_match:
                 potential_id = livestream_match.group(1)
@@ -278,21 +319,17 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
                 stream_id = user_id
                 stream_url = profile_url
         
-        # Get username
         final_username = live_result.get("username") or username
         
-        # If username is still empty or equals user_id, try to get from watchlist
         if not final_username or str(final_username) == str(user_id):
             for w in watchlist:
                 if str(w.get("stream_id")) == str(user_id) and w.get("display_name"):
                     final_username = w.get("display_name")
                     break
         
-        # Final fallback: use user_id
         if not final_username:
             final_username = user_id
         
-        # Log results
         print(f"[AUTO] username={user_id}")
         print(f"[AUTO] source=discovery_layer")
         print(f"[AUTO] profile_url={profile_url}")
@@ -317,13 +354,10 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
             print(f"[AUTO] reason=no_live")
             return None
         
-        # LIVE_NORMAL - but must have valid stream_id
         if not stream_id_valid:
             print(f"[AUTO] ⚠️ LIVE_NORMAL but stream_id invalid ({stream_id} = user_id)")
             print(f"[AUTO] phase=p2_invalid_stream")
-            print(f"[AUTO] status=LIVE_NORMAL_INVALID")
             print(f"[AUTO] action=SKIP_INVALID_STREAM")
-            print(f"[AUTO] reason=invalid_stream_id")
             return None
         
         print(f"[AUTO] phase=phase_3_done")
@@ -349,17 +383,11 @@ async def main():
     """Main entry point"""
     print("[AUTO] Starting Auto Monitor (Optimized for Speed)")
     
-    # Load watchlist
-    if not WATCHLIST_FILE.exists():
-        print("[AUTO] ✗ Watchlist file not found")
-        return
+    # Load watchlist from Worker API (KV) - authoritative source
+    watchlist = get_watchlist()
     
-    try:
-        with open(WATCHLIST_FILE, 'r', encoding='utf-8') as f:
-            watchlist_data = json.load(f)
-            watchlist = watchlist_data.get("watchlist", [])
-    except Exception as e:
-        print(f"[AUTO] ✗ Error loading watchlist: {e}")
+    if not watchlist:
+        print("[AUTO] ✗ Watchlist is empty - nothing to do")
         return
     
     print(f"[AUTO] Watchlist: {len(watchlist)} users")
@@ -372,11 +400,31 @@ async def main():
         print("[AUTO] ✗ Concurrency limit reached (5/5)")
         return
     
-    # Filter users not already recording
-    active_ids = {str(r.get("stream_id")) for r in active}
-    to_check = [u for u in watchlist if str(u.get("stream_id")) not in active_ids]
+    # Filter out users who are already recording (by user_id, NOT stream_id)
+    active_user_ids = set()
+    active_stream_ids = set()
+    for r in active:
+        if r.get("user_id"):
+            active_user_ids.add(str(r.get("user_id")))
+        if r.get("stream_id"):
+            active_stream_ids.add(str(r.get("stream_id")))
+    
+    # A user should be excluded if:
+    # 1. Their user_id is already recording, OR
+    # 2. Any of their potential stream_ids is already recording
+    to_check = []
+    for u in watchlist:
+        uid = str(u.get("stream_id"))  # Note: watchlist uses "stream_id" field for user_id
+        
+        # Skip if this user_id is already recording
+        if uid in active_user_ids:
+            continue
+        
+        to_check.append(u)
     
     print(f"[AUTO] Discovery for {len(to_check)} users (Concurrency: {MAX_CONCURRENT})")
+    print(f"[AUTO] Active user_ids: {active_user_ids}")
+    print(f"[AUTO] Active stream_ids: {active_stream_ids}")
     
     if not to_check:
         print("[AUTO] ✓ No users to check (all already recording)")
@@ -384,34 +432,47 @@ async def main():
     
     # Phase 1 & 2: Discovery
     discovery = SuperLiveDiscovery()
-    
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     
     async def check_with_semaphore(user):
         async with semaphore:
             return await check_user(discovery, user, watchlist)
     
-    # Run checks concurrently
     tasks = [check_with_semaphore(u) for u in to_check]
     results = await asyncio.gather(*tasks)
     
     # Filter successful results
     to_record = [r for r in results if r is not None]
     
+    # Deduplicate by stream_id (handle the 44656536/61055822 case)
+    seen_stream_ids = set()
+    deduplicated = []
+    for r in to_record:
+        sid = r["stream_id"]
+        if sid not in seen_stream_ids:
+            seen_stream_ids.add(sid)
+            deduplicated.append(r)
+        else:
+            print(f"[AUTO] ⚠️ Duplicate stream_id {sid} for user {r['user_id']} - skipping")
+    
+    if len(deduplicated) < len(to_record):
+        print(f"[AUTO] Deduplicated: {len(to_record)} → {len(deduplicated)} candidates")
+    
     # Check available slots
     available_slots = 5 - len(active)
-    to_record = to_record[:available_slots]
+    to_record_final = deduplicated[:available_slots]
     
     print(f"[AUTO] Slots: {available_slots}")
+    print(f"[AUTO] LIVE_NORMAL candidates: {len(to_record_final)}")
     
-    if not to_record:
-        print("[AUTO] ✓ No LIVE_NORMAL streams detected")
+    if not to_record_final:
+        print("[AUTO] ✓ No new LIVE_NORMAL streams to record")
         print("[AUTO] Monitor completed")
         return
     
     # Trigger recordings
     triggered = 0
-    for record in to_record:
+    for record in to_record_final:
         if trigger_recording(
             record["user_id"],
             record["stream_id"],
@@ -422,13 +483,13 @@ async def main():
     
     # Send Telegram notification
     if triggered > 0:
-        names = [f"• {r['stream_name']} ({r['stream_id']})" for r in to_record[:triggered]]
+        names = [f"• {r['stream_name']} ({r['stream_id']})" for r in to_record_final[:triggered]]
         send_telegram_message(
             f"🤖 <b>Auto Recording بدأ ({triggered})</b>\n\n" + "\n".join(names),
             parse_mode="HTML"
         )
     
-    print(f"[AUTO] Monitor completed")
+    print(f"[AUTO] Monitor completed - triggered {triggered}/{len(to_record_final)}")
 
 
 if __name__ == "__main__":
