@@ -1,4 +1,4 @@
-// worker.js - Version 12.0 (Complete Fix + Enhanced UI)
+// worker.js - Version 12.1 (Fix auto-trigger for user_id/stream_id separation)
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -110,32 +110,53 @@ async function handleCompletedRecordings(request, env) {
   } catch (error) { return jsonResponse({ error: error.message }, 500); }
 }
 
+// ============================================================
+// AUTO TRIGGER - FIXED: Uses user_id in URL, stream_id in body
+// ============================================================
 async function handleAutoTrigger(request, url, env) {
   if (!isAuthorized(request, env)) return unauthorizedResponse();
   try {
-    const streamId = url.pathname.split('/').pop();
+    // URL contains user_id (for watchlist lookup)
+    const userId = url.pathname.split('/').pop();
     const body = await request.json();
+    
+    // stream_id from payload is the REAL stream ID (like 152665656)
+    const streamId = body.stream_id || userId;
     const streamUrl = body.stream_url || ('https://superlivetv.com/fr/livestream/' + streamId);
     const streamName = body.stream_name || '';
 
+    // Check watchlist by user_id (not stream_id)
     const wlData = await getWatchlist(env);
-    if (!wlData.watchlist.some(e => String(e.stream_id) === streamId)) {
-      return jsonResponse({ success: false, error: 'not_in_watchlist' }, 404);
+    if (!wlData.watchlist.some(e => String(e.stream_id) === userId)) {
+      return jsonResponse({ 
+        success: false, 
+        error: 'not_in_watchlist', 
+        user_id: userId,
+        stream_id: streamId
+      }, 404);
     }
 
     const recData = await getRecordings(env);
     const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
 
+    // Check by stream_id (real stream), not user_id
     if (recordings.some(r => String(r.stream_id) === streamId && r.status === 'recording')) {
-      return jsonResponse({ success: false, error: 'already_recording' }, 409);
+      return jsonResponse({ 
+        success: false, 
+        error: 'already_recording', 
+        stream_id: streamId,
+        user_id: userId
+      }, 409);
     }
 
     if (recordings.filter(r => r.status === 'recording').length >= 5) {
       return jsonResponse({ success: false, error: 'concurrency_limit' }, 429);
     }
 
+    // Store both user_id and stream_id in recording
     recordings.push({
       stream_id: streamId,
+      user_id: userId,
       stream_url: streamUrl,
       stream_name: streamName,
       status: 'recording',
@@ -147,7 +168,8 @@ async function handleAutoTrigger(request, url, env) {
     const triggerResult = await triggerGitHubDispatch(env, 'record_stream', {
       stream_url: streamUrl,
       stream_id: streamId,
-      stream_name: streamName
+      stream_name: streamName,
+      user_id: userId
     });
 
     if (triggerResult.success) {
@@ -156,11 +178,22 @@ async function handleAutoTrigger(request, url, env) {
         '🤖 <b>Auto Recording بدأ</b>\n📺 البث: <code>' + streamId + '</code>' + nameLine + '\n🔗 الرابط: <a href="' + streamUrl + '">افتح</a>',
         { parse_mode: 'HTML' }
       );
-      return jsonResponse({ success: true, started: true });
+      return jsonResponse({ 
+        success: true, 
+        started: true, 
+        stream_id: streamId,
+        user_id: userId
+      });
     } else {
+      // Rollback: remove from recordings if dispatch failed
+      const rollbackRecordings = (Array.isArray(recData.recordings) ? recData.recordings : []);
+      await saveRecordings(env, rollbackRecordings);
       return jsonResponse({ success: false, error: triggerResult.error }, 502);
     }
-  } catch (error) { return jsonResponse({ error: error.message }, 500); }
+  } catch (error) { 
+    console.error('[handleAutoTrigger] Error:', error);
+    return jsonResponse({ error: error.message }, 500); 
+  }
 }
 
 async function handleUpdateState(request, url, env) {
@@ -245,9 +278,7 @@ async function handleMessage(message, env) {
     if (command === '/testmonitor') { await handleTestMonitor(chatId, env); return new Response('OK'); }
     if (command === '/recordings') { await handleRecordingsSearch(chatId, args[0] || null, env); return new Response('OK'); }
 
-    // ============================================================
     // MANUAL RECORDING: Detect superlivetv.com URL in message
-    // ============================================================
     const streamUrl = text.match(/https?:\/\/[^\s]+/g)?.find(u => u.includes('superlivetv.com'));
     if (streamUrl) {
       const streamId = streamUrl.match(/livestream\/(\d+)/)?.[1];
@@ -365,7 +396,7 @@ async function handleWatchlistCommand(chatId, env) {
 }
 
 // ============================================================
-// MANUAL RECORDING - FIXED
+// MANUAL RECORDING
 // ============================================================
 
 async function handleRecord(chatId, streamUrl, streamId, env) {
@@ -373,19 +404,16 @@ async function handleRecord(chatId, streamUrl, streamId, env) {
     const recData = await getRecordings(env);
     const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
 
-    // Check if already recording this stream
     if (recordings.some(r => String(r.stream_id) === streamId && r.status === 'recording')) {
       await sendTelegramMessage(env, chatId, '⚠️ هذا البث يُسجّل حالياً.', { parse_mode: 'HTML' });
       return;
     }
 
-    // Check concurrency limit
     if (recordings.filter(r => r.status === 'recording').length >= 5) {
       await sendTelegramMessage(env, chatId, '❌ الحد الأقصى (5 تسجيلات متزامنة) تم الوصول إليه.', { parse_mode: 'HTML' });
       return;
     }
 
-    // Add to active recordings
     recordings.push({
       stream_id: streamId,
       stream_url: streamUrl,
@@ -395,7 +423,6 @@ async function handleRecord(chatId, streamUrl, streamId, env) {
     });
     await saveRecordings(env, recordings);
 
-    // Trigger GitHub Actions
     const triggerResult = await triggerGitHubDispatch(env, 'record_stream', {
       stream_url: streamUrl,
       stream_id: streamId
@@ -410,8 +437,7 @@ async function handleRecord(chatId, streamUrl, streamId, env) {
         }
       );
     } else {
-      // Rollback: remove from recordings if dispatch failed
-      const rollbackRecordings = recordings.filter(r => !(String(r.stream_id) === streamId && r.status === 'recording' && r.source === 'manual'));
+      const rollbackRecordings = (Array.isArray(recData.recordings) ? recData.recordings : []);
       await saveRecordings(env, rollbackRecordings);
       await sendTelegramMessage(env, chatId, '❌ فشل بدء التسجيل: ' + triggerResult.error, { parse_mode: 'HTML' });
     }
@@ -568,7 +594,6 @@ async function handleRecordingsSearch(chatId, query, env) {
       return;
     }
     
-    // If query provided, filter
     let filtered = completed;
     if (query) {
       const q = query.toLowerCase();
@@ -583,7 +608,6 @@ async function handleRecordingsSearch(chatId, query, env) {
       return;
     }
     
-    // Show last 10 recordings
     const toShow = filtered.slice(-10).reverse();
     
     let msg = '📁 <b>التسجيلات المكتملة (' + filtered.length + '):</b>\n\n';
@@ -626,7 +650,7 @@ async function handleTestMonitor(chatId, env) {
 }
 
 // ============================================================
-// MAIN MENU - ENHANCED
+// MAIN MENU
 // ============================================================
 
 async function sendMainMenu(chatId, env) {
