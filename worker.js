@@ -1,4 +1,4 @@
-// worker.js - Version 12.1 (Fix auto-trigger for user_id/stream_id separation)
+// worker.js - Version 12.2 (Enhanced watchlist + status display)
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -7,6 +7,7 @@ export default {
     if (url.pathname === '/api/active-recordings' && request.method === 'GET') return handleActiveRecordings(request, env);
     if (url.pathname.startsWith('/api/auto-trigger/') && request.method === 'POST') return handleAutoTrigger(request, url, env);
     if (url.pathname.startsWith('/api/update-state/') && request.method === 'POST') return handleUpdateState(request, url, env);
+    if (url.pathname.startsWith('/api/update-display-name/') && request.method === 'POST') return handleUpdateDisplayName(request, url, env);
     if (url.pathname.startsWith('/api/delete-recording/') && request.method === 'DELETE') return handleDeleteRecording(request, url, env);
     if (url.pathname === '/api/cleanup' && request.method === 'POST') return handleCleanup(env);
     if (url.pathname.startsWith('/api/check-stop/') && request.method === 'GET') return handleCheckStop(request, url, env);
@@ -111,21 +112,65 @@ async function handleCompletedRecordings(request, env) {
 }
 
 // ============================================================
-// AUTO TRIGGER - FIXED: Uses user_id in URL, stream_id in body
+// NEW: Update display name for a user (called by auto_monitor.py)
+// ============================================================
+async function handleUpdateDisplayName(request, url, env) {
+  if (!isAuthorized(request, env)) return unauthorizedResponse();
+  try {
+    const userId = url.pathname.split('/').pop();
+    const body = await request.json();
+    const displayName = body.display_name;
+    
+    if (!displayName || String(displayName).trim() === '') {
+      return jsonResponse({ success: false, error: 'display_name required' }, 400);
+    }
+    
+    // Skip if display_name equals user_id (no useful name)
+    if (String(displayName) === String(userId)) {
+      return jsonResponse({ success: false, error: 'display_name equals user_id' }, 400);
+    }
+    
+    const wlData = await getWatchlist(env);
+    const idx = wlData.watchlist.findIndex(e => String(e.stream_id) === userId);
+    
+    if (idx === -1) {
+      return jsonResponse({ success: false, error: 'user not found in watchlist' }, 404);
+    }
+    
+    // Only update if current name is empty or different
+    const currentName = wlData.watchlist[idx].display_name;
+    if (currentName && currentName === displayName) {
+      return jsonResponse({ success: true, unchanged: true });
+    }
+    
+    wlData.watchlist[idx].display_name = displayName;
+    wlData.watchlist[idx].name_updated_at = new Date().toISOString();
+    await saveWatchlist(env, wlData.watchlist);
+    
+    return jsonResponse({ 
+      success: true, 
+      user_id: userId,
+      display_name: displayName 
+    });
+  } catch (error) { 
+    console.error('[handleUpdateDisplayName] Error:', error);
+    return jsonResponse({ error: error.message }, 500); 
+  }
+}
+
+// ============================================================
+// AUTO TRIGGER - Uses user_id in URL, stream_id in body
 // ============================================================
 async function handleAutoTrigger(request, url, env) {
   if (!isAuthorized(request, env)) return unauthorizedResponse();
   try {
-    // URL contains user_id (for watchlist lookup)
     const userId = url.pathname.split('/').pop();
     const body = await request.json();
     
-    // stream_id from payload is the REAL stream ID (like 152665656)
     const streamId = body.stream_id || userId;
     const streamUrl = body.stream_url || ('https://superlivetv.com/fr/livestream/' + streamId);
     const streamName = body.stream_name || '';
 
-    // Check watchlist by user_id (not stream_id)
     const wlData = await getWatchlist(env);
     if (!wlData.watchlist.some(e => String(e.stream_id) === userId)) {
       return jsonResponse({ 
@@ -139,7 +184,6 @@ async function handleAutoTrigger(request, url, env) {
     const recData = await getRecordings(env);
     const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
 
-    // Check by stream_id (real stream), not user_id
     if (recordings.some(r => String(r.stream_id) === streamId && r.status === 'recording')) {
       return jsonResponse({ 
         success: false, 
@@ -153,7 +197,6 @@ async function handleAutoTrigger(request, url, env) {
       return jsonResponse({ success: false, error: 'concurrency_limit' }, 429);
     }
 
-    // Store both user_id and stream_id in recording
     recordings.push({
       stream_id: streamId,
       user_id: userId,
@@ -185,7 +228,6 @@ async function handleAutoTrigger(request, url, env) {
         user_id: userId
       });
     } else {
-      // Rollback: remove from recordings if dispatch failed
       const rollbackRecordings = (Array.isArray(recData.recordings) ? recData.recordings : []);
       await saveRecordings(env, rollbackRecordings);
       return jsonResponse({ success: false, error: triggerResult.error }, 502);
@@ -278,7 +320,6 @@ async function handleMessage(message, env) {
     if (command === '/testmonitor') { await handleTestMonitor(chatId, env); return new Response('OK'); }
     if (command === '/recordings') { await handleRecordingsSearch(chatId, args[0] || null, env); return new Response('OK'); }
 
-    // MANUAL RECORDING: Detect superlivetv.com URL in message
     const streamUrl = text.match(/https?:\/\/[^\s]+/g)?.find(u => u.includes('superlivetv.com'));
     if (streamUrl) {
       const streamId = streamUrl.match(/livestream\/(\d+)/)?.[1];
@@ -345,9 +386,14 @@ async function handleAddWatch(chatId, streamId, env) {
       await sendTelegramMessage(env, chatId, '⚠️ هذا المستخدم موجود مسبقاً في القائمة.', { parse_mode: 'HTML' });
       return;
     }
-    data.watchlist.push({ stream_id: streamId, added_at: new Date().toISOString(), display_name: null });
+    data.watchlist.push({ 
+      stream_id: streamId, 
+      added_at: new Date().toISOString(), 
+      display_name: null 
+    });
     await saveWatchlist(env, data.watchlist);
-    await sendTelegramMessage(env, chatId, '✅ تمت إضافة <code>' + streamId + '</code> بنجاح.', {
+    await sendTelegramMessage(env, chatId, 
+      '✅ تمت إضافة <code>' + streamId + '</code> بنجاح.\n\n💡 سيتم اكتشاف الاسم تلقائياً في المراقبة القادمة.', {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [[{ text: '📋 القائمة', callback_data: 'watchlist' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
     });
@@ -377,21 +423,60 @@ async function handleRemoveWatch(chatId, streamId, env) {
   }
 }
 
+// ============================================================
+// ENHANCED: /watchlist with display names
+// ============================================================
 async function handleWatchlistCommand(chatId, env) {
   try {
     const data = await getWatchlist(env);
+    
     if (data.watchlist.length === 0) {
-      await sendTelegramMessage(env, chatId, '📋 القائمة فارغة.', { parse_mode: 'HTML' });
+      await sendTelegramMessage(env, chatId, '📋 القائمة فارغة.\n\nاستخدم: <code>/addwatch USER_ID</code>', { parse_mode: 'HTML' });
       return;
     }
-    let msg = '📋 <b>قائمة المراقبة (' + data.watchlist.length + '):</b>\n\n';
-    for (const e of data.watchlist) {
-      const name = e.display_name ? (' → ' + escapeHtml(e.display_name)) : '';
-      msg += '• <code>' + e.stream_id + '</code>' + name + '\n';
+    
+    // Split into chunks to avoid Telegram message length limit
+    const CHUNK_SIZE = 10;
+    const chunks = [];
+    
+    for (let i = 0; i < data.watchlist.length; i += CHUNK_SIZE) {
+      const chunk = data.watchlist.slice(i, i + CHUNK_SIZE);
+      let msg = '';
+      
+      if (i === 0) {
+        msg += '📋 <b>قائمة المراقبة (' + data.watchlist.length + '):</b>\n\n';
+      } else {
+        msg += '📋 <b>قائمة المراقبة (تابع ' + (i + 1) + '-' + Math.min(i + CHUNK_SIZE, data.watchlist.length) + '):</b>\n\n';
+      }
+      
+      for (const e of chunk) {
+        const userId = e.stream_id;
+        const name = e.display_name;
+        
+        if (name && name !== userId) {
+          // Format: • USER_ID → Display Name
+          msg += '• <code>' + userId + '</code> → <b>' + escapeHtml(name) + '</b>\n';
+        } else {
+          // Format: • USER_ID (name pending)
+          msg += '• <code>' + userId + '</code> <i>(الاسم قيد الاكتشاف)</i>\n';
+        }
+      }
+      
+      chunks.push(msg);
     }
-    await sendTelegramMessage(env, chatId, msg, { parse_mode: 'HTML' });
+    
+    // Send each chunk
+    for (let i = 0; i < chunks.length; i++) {
+      const isLast = (i === chunks.length - 1);
+      await sendTelegramMessage(env, chatId, chunks[i], {
+        parse_mode: 'HTML',
+        reply_markup: isLast ? { 
+          inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] 
+        } : undefined
+      });
+    }
   } catch (error) {
-    await sendTelegramMessage(env, chatId, '❌ خطأ في جلب القائمة.', { parse_mode: 'HTML' });
+    await sendTelegramMessage(env, chatId, '❌ خطأ في جلب القائمة: ' + error.message, { parse_mode: 'HTML' });
   }
 }
 
@@ -447,9 +532,8 @@ async function handleRecord(chatId, streamUrl, streamId, env) {
 }
 
 // ============================================================
-// STATUS & STOP
+// STATUS - ENHANCED: Only show duration, remove start time
 // ============================================================
-
 async function handleStatus(chatId, env) {
   const recData = await getRecordings(env);
   const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
@@ -474,7 +558,7 @@ async function handleStatus(chatId, env) {
     msg += '🔴 <b>التسجيل ' + (i + 1) + '</b> [' + source + ']\n';
     msg += '👤 الاسم: <b>' + escapeHtml(name) + '</b>\n';
     msg += '🆔 ID: <code>' + r.stream_id + '</code>\n';
-    msg += '🕒 بدأ: ' + startTime.toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }) + '\n';
+    // REMOVED: msg += '🕒 بدأ: ' + startTime.toLocaleTimeString(...) + '\n';
     msg += '⏱️ المدة: <code>' + durationStr + '</code>\n';
     msg += '⚙️ الحالة: جارٍ التسجيل\n\n';
   }
@@ -515,13 +599,13 @@ async function showStopMenu(chatId, env) {
     await sendTelegramMessage(env, chatId, '📭 لا توجد تسجيلات نشطة لإيقافها.', { parse_mode: 'HTML' });
     return;
   }
-  const buttons = active.map(r => [{ text: '🛑 ' + r.stream_id, callback_data: 'stop:' + r.stream_id }]);
+  const buttons = active.map(r => [{ text: '🛑 ' + (r.stream_name || r.stream_id), callback_data: 'stop:' + r.stream_id }]);
   buttons.push([{ text: '🔙 العودة', callback_data: 'back' }]);
   await sendTelegramMessage(env, chatId, '🛑 اختر التسجيل المراد إيقافه:', { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
 }
 
 // ============================================================
-// CLEANUP WITH CONFIRMATION
+// CLEANUP
 // ============================================================
 
 async function handleCleanupConfirm(chatId, env) {
