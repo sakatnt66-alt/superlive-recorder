@@ -1,4 +1,4 @@
-// worker.js - Version 12.3 (With name discovery endpoint)
+// worker.js - Version 12.1 (Fix auto-trigger for user_id/stream_id separation)
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -7,12 +7,10 @@ export default {
     if (url.pathname === '/api/active-recordings' && request.method === 'GET') return handleActiveRecordings(request, env);
     if (url.pathname.startsWith('/api/auto-trigger/') && request.method === 'POST') return handleAutoTrigger(request, url, env);
     if (url.pathname.startsWith('/api/update-state/') && request.method === 'POST') return handleUpdateState(request, url, env);
-    if (url.pathname.startsWith('/api/update-display-name/') && request.method === 'POST') return handleUpdateDisplayName(request, url, env);
     if (url.pathname.startsWith('/api/delete-recording/') && request.method === 'DELETE') return handleDeleteRecording(request, url, env);
     if (url.pathname === '/api/cleanup' && request.method === 'POST') return handleCleanup(env);
     if (url.pathname.startsWith('/api/check-stop/') && request.method === 'GET') return handleCheckStop(request, url, env);
     if (url.pathname === '/api/completed-recordings' && request.method === 'GET') return handleCompletedRecordings(request, env);
-    if (url.pathname === '/api/discover-names' && request.method === 'GET') return handleDiscoverNames(request, env);
     if (url.pathname === '/telegram/webhook' && request.method === 'POST') return handleTelegramWebhook(request, env);
     if (url.pathname === '/health') return jsonResponse({ status: 'ok', timestamp: new Date().toISOString() });
 
@@ -113,100 +111,23 @@ async function handleCompletedRecordings(request, env) {
 }
 
 // ============================================================
-// NEW: Discover names status endpoint
-// ============================================================
-async function handleDiscoverNames(request, env) {
-  if (!isAuthorized(request, env)) return unauthorizedResponse();
-  
-  try {
-    const wlData = await getWatchlist(env);
-    const usersMissingNames = wlData.watchlist.filter(u => 
-      !u.display_name || u.display_name === String(u.stream_id) || String(u.display_name).trim() === ''
-    );
-    const usersWithNames = wlData.watchlist.filter(u => 
-      u.display_name && u.display_name !== String(u.stream_id) && String(u.display_name).trim() !== ''
-    );
-    
-    return jsonResponse({
-      success: true,
-      total_users: wlData.watchlist.length,
-      users_with_names: usersWithNames.length,
-      users_missing_names: usersMissingNames.length,
-      missing_user_ids: usersMissingNames.map(u => String(u.stream_id)),
-      users_with_names_list: usersWithNames.map(u => ({
-        stream_id: String(u.stream_id),
-        display_name: u.display_name
-      })),
-      message: `Run 'python discover_missing_names.py' to update ${usersMissingNames.length} missing names`
-    });
-  } catch (error) {
-    return jsonResponse({ error: error.message }, 500);
-  }
-}
-
-// ============================================================
-// Update display name for a user (called by auto_monitor.py)
-// ============================================================
-async function handleUpdateDisplayName(request, url, env) {
-  if (!isAuthorized(request, env)) return unauthorizedResponse();
-  try {
-    const userId = url.pathname.split('/').pop();
-    const body = await request.json();
-    const displayName = body.display_name;
-    
-    if (!displayName || String(displayName).trim() === '') {
-      return jsonResponse({ success: false, error: 'display_name required' }, 400);
-    }
-    
-    if (String(displayName) === String(userId)) {
-      return jsonResponse({ success: false, error: 'display_name equals user_id' }, 400);
-    }
-    
-    const wlData = await getWatchlist(env);
-    const idx = wlData.watchlist.findIndex(e => String(e.stream_id) === userId);
-    
-    if (idx === -1) {
-      return jsonResponse({ success: false, error: 'user not found in watchlist' }, 404);
-    }
-    
-    const currentName = wlData.watchlist[idx].display_name;
-    if (currentName && currentName === displayName) {
-      return jsonResponse({ success: true, unchanged: true });
-    }
-    
-    wlData.watchlist[idx].display_name = displayName;
-    wlData.watchlist[idx].name_updated_at = new Date().toISOString();
-    await saveWatchlist(env, wlData.watchlist);
-    
-    return jsonResponse({ 
-      success: true, 
-      user_id: userId,
-      display_name: displayName 
-    });
-  } catch (error) { 
-    console.error('[handleUpdateDisplayName] Error:', error);
-    return jsonResponse({ error: error.message }, 500); 
-  }
-}
-
-// ============================================================
-// AUTO TRIGGER - Uses user_id in URL, stream_id in body
+// AUTO TRIGGER - FIXED: Uses user_id in URL, stream_id in body
 // ============================================================
 async function handleAutoTrigger(request, url, env) {
   if (!isAuthorized(request, env)) return unauthorizedResponse();
   try {
+    // URL contains user_id (for watchlist lookup)
     const userId = url.pathname.split('/').pop();
     const body = await request.json();
     
+    // stream_id from payload is the REAL stream ID (like 152665656)
     const streamId = body.stream_id || userId;
     const streamUrl = body.stream_url || ('https://superlivetv.com/fr/livestream/' + streamId);
     const streamName = body.stream_name || '';
 
+    // Check watchlist by user_id (not stream_id)
     const wlData = await getWatchlist(env);
-    
-    // Find user in watchlist and get stored display_name
-    const watchlistUser = wlData.watchlist.find(e => String(e.stream_id) === userId);
-    if (!watchlistUser) {
+    if (!wlData.watchlist.some(e => String(e.stream_id) === userId)) {
       return jsonResponse({ 
         success: false, 
         error: 'not_in_watchlist', 
@@ -214,13 +135,11 @@ async function handleAutoTrigger(request, url, env) {
         stream_id: streamId
       }, 404);
     }
-    
-    // If no stream_name provided but watchlist has one, use it
-    const finalStreamName = streamName || watchlistUser.display_name || '';
 
     const recData = await getRecordings(env);
     const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
 
+    // Check by stream_id (real stream), not user_id
     if (recordings.some(r => String(r.stream_id) === streamId && r.status === 'recording')) {
       return jsonResponse({ 
         success: false, 
@@ -234,11 +153,12 @@ async function handleAutoTrigger(request, url, env) {
       return jsonResponse({ success: false, error: 'concurrency_limit' }, 429);
     }
 
+    // Store both user_id and stream_id in recording
     recordings.push({
       stream_id: streamId,
       user_id: userId,
       stream_url: streamUrl,
-      stream_name: finalStreamName,
+      stream_name: streamName,
       status: 'recording',
       started_at: new Date().toISOString(),
       source: 'auto'
@@ -248,12 +168,12 @@ async function handleAutoTrigger(request, url, env) {
     const triggerResult = await triggerGitHubDispatch(env, 'record_stream', {
       stream_url: streamUrl,
       stream_id: streamId,
-      stream_name: finalStreamName,
+      stream_name: streamName,
       user_id: userId
     });
 
     if (triggerResult.success) {
-      const nameLine = finalStreamName ? ('\n👤 الاسم: <b>' + escapeHtml(finalStreamName) + '</b>') : '';
+      const nameLine = streamName ? ('\n👤 الاسم: <b>' + escapeHtml(streamName) + '</b>') : '';
       await sendTelegramMessage(env, env.TELEGRAM_CHAT_ID,
         '🤖 <b>Auto Recording بدأ</b>\n📺 البث: <code>' + streamId + '</code>' + nameLine + '\n🔗 الرابط: <a href="' + streamUrl + '">افتح</a>',
         { parse_mode: 'HTML' }
@@ -262,10 +182,10 @@ async function handleAutoTrigger(request, url, env) {
         success: true, 
         started: true, 
         stream_id: streamId,
-        user_id: userId,
-        stream_name: finalStreamName
+        user_id: userId
       });
     } else {
+      // Rollback: remove from recordings if dispatch failed
       const rollbackRecordings = (Array.isArray(recData.recordings) ? recData.recordings : []);
       await saveRecordings(env, rollbackRecordings);
       return jsonResponse({ success: false, error: triggerResult.error }, 502);
@@ -357,8 +277,8 @@ async function handleMessage(message, env) {
     if (command === '/watchlist') { await handleWatchlistCommand(chatId, env); return new Response('OK'); }
     if (command === '/testmonitor') { await handleTestMonitor(chatId, env); return new Response('OK'); }
     if (command === '/recordings') { await handleRecordingsSearch(chatId, args[0] || null, env); return new Response('OK'); }
-    if (command === '/names') { await handleNamesStatus(chatId, env); return new Response('OK'); }
 
+    // MANUAL RECORDING: Detect superlivetv.com URL in message
     const streamUrl = text.match(/https?:\/\/[^\s]+/g)?.find(u => u.includes('superlivetv.com'));
     if (streamUrl) {
       const streamId = streamUrl.match(/livestream\/(\d+)/)?.[1];
@@ -404,7 +324,6 @@ async function handleCallbackQuery(callbackQuery, env) {
     else if (data === 'watchlist') await handleWatchlistCommand(chatId, env);
     else if (data === 'test_monitor') await handleTestMonitor(chatId, env);
     else if (data === 'recordings') await handleRecordingsSearch(chatId, null, env);
-    else if (data === 'names_status') await handleNamesStatus(chatId, env);
 
     await answerCallbackQuery(callbackQuery.id, env, '✓');
   } catch (error) { console.error('Callback error:', error); }
@@ -426,14 +345,9 @@ async function handleAddWatch(chatId, streamId, env) {
       await sendTelegramMessage(env, chatId, '⚠️ هذا المستخدم موجود مسبقاً في القائمة.', { parse_mode: 'HTML' });
       return;
     }
-    data.watchlist.push({ 
-      stream_id: streamId, 
-      added_at: new Date().toISOString(), 
-      display_name: null 
-    });
+    data.watchlist.push({ stream_id: streamId, added_at: new Date().toISOString(), display_name: null });
     await saveWatchlist(env, data.watchlist);
-    await sendTelegramMessage(env, chatId, 
-      '✅ تمت إضافة <code>' + streamId + '</code> بنجاح.\n\n💡 سيتم اكتشاف الاسم تلقائياً في المراقبة القادمة.', {
+    await sendTelegramMessage(env, chatId, '✅ تمت إضافة <code>' + streamId + '</code> بنجاح.', {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [[{ text: '📋 القائمة', callback_data: 'watchlist' }], [{ text: '🔙 العودة', callback_data: 'back' }]] }
     });
@@ -463,93 +377,21 @@ async function handleRemoveWatch(chatId, streamId, env) {
   }
 }
 
-// ============================================================
-// /watchlist with display names (chunked for long lists)
-// ============================================================
 async function handleWatchlistCommand(chatId, env) {
   try {
     const data = await getWatchlist(env);
-    
     if (data.watchlist.length === 0) {
-      await sendTelegramMessage(env, chatId, '📋 القائمة فارغة.\n\nاستخدم: <code>/addwatch USER_ID</code>', { parse_mode: 'HTML' });
+      await sendTelegramMessage(env, chatId, '📋 القائمة فارغة.', { parse_mode: 'HTML' });
       return;
     }
-    
-    const CHUNK_SIZE = 10;
-    const chunks = [];
-    
-    for (let i = 0; i < data.watchlist.length; i += CHUNK_SIZE) {
-      const chunk = data.watchlist.slice(i, i + CHUNK_SIZE);
-      let msg = '';
-      
-      if (i === 0) {
-        msg += '📋 <b>قائمة المراقبة (' + data.watchlist.length + '):</b>\n\n';
-      } else {
-        msg += '📋 <b>قائمة المراقبة (تابع ' + (i + 1) + '-' + Math.min(i + CHUNK_SIZE, data.watchlist.length) + '):</b>\n\n';
-      }
-      
-      for (const e of chunk) {
-        const userId = String(e.stream_id);
-        const name = e.display_name;
-        
-        if (name && name !== userId && String(name).trim() !== '') {
-          msg += '• <code>' + userId + '</code> → <b>' + escapeHtml(name) + '</b>\n';
-        } else {
-          msg += '• <code>' + userId + '</code> <i>(الاسم قيد الاكتشاف)</i>\n';
-        }
-      }
-      
-      chunks.push(msg);
+    let msg = '📋 <b>قائمة المراقبة (' + data.watchlist.length + '):</b>\n\n';
+    for (const e of data.watchlist) {
+      const name = e.display_name ? (' → ' + escapeHtml(e.display_name)) : '';
+      msg += '• <code>' + e.stream_id + '</code>' + name + '\n';
     }
-    
-    for (let i = 0; i < chunks.length; i++) {
-      const isLast = (i === chunks.length - 1);
-      await sendTelegramMessage(env, chatId, chunks[i], {
-        parse_mode: 'HTML',
-        reply_markup: isLast ? { 
-          inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] 
-        } : undefined
-      });
-    }
+    await sendTelegramMessage(env, chatId, msg, { parse_mode: 'HTML' });
   } catch (error) {
-    await sendTelegramMessage(env, chatId, '❌ خطأ في جلب القائمة: ' + error.message, { parse_mode: 'HTML' });
-  }
-}
-
-// ============================================================
-// NEW: /names command - show name discovery status
-// ============================================================
-async function handleNamesStatus(chatId, env) {
-  try {
-    const wlData = await getWatchlist(env);
-    const usersWithNames = wlData.watchlist.filter(u => 
-      u.display_name && u.display_name !== String(u.stream_id) && String(u.display_name).trim() !== ''
-    );
-    const usersMissing = wlData.watchlist.filter(u => 
-      !u.display_name || u.display_name === String(u.stream_id) || String(u.display_name).trim() === ''
-    );
-    
-    let msg = '🔍 <b>حالة اكتشاف الأسماء</b>\n\n';
-    msg += '📊 الإجمالي: <b>' + wlData.watchlist.length + '</b>\n';
-    msg += '✅ مكتشفة: <b>' + usersWithNames.length + '</b>\n';
-    msg += '⏳ قيد الاكتشاف: <b>' + usersMissing.length + '</b>\n\n';
-    
-    if (usersMissing.length > 0) {
-      msg += '⏳ <b>المعرّفات قيد الاكتشاف:</b>\n';
-      for (const u of usersMissing) {
-        msg += '• <code>' + u.stream_id + '</code>\n';
-      }
-      msg += '\n💡 سيتم اكتشاف الأسماء تلقائياً عند بدء بث هؤلاء المستخدمين.';
-    } else {
-      msg += '🎉 جميع الأسماء مكتشفة!';
-    }
-    
-    await sendTelegramMessage(env, chatId, msg, {
-      parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [[{ text: '🔙 العودة', callback_data: 'back' }]] }
-    });
-  } catch (error) {
-    await sendTelegramMessage(env, chatId, '❌ خطأ: ' + error.message, { parse_mode: 'HTML' });
+    await sendTelegramMessage(env, chatId, '❌ خطأ في جلب القائمة.', { parse_mode: 'HTML' });
   }
 }
 
@@ -605,8 +447,9 @@ async function handleRecord(chatId, streamUrl, streamId, env) {
 }
 
 // ============================================================
-// STATUS - Only show duration (no start time)
+// STATUS & STOP
 // ============================================================
+
 async function handleStatus(chatId, env) {
   const recData = await getRecordings(env);
   const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
@@ -631,6 +474,7 @@ async function handleStatus(chatId, env) {
     msg += '🔴 <b>التسجيل ' + (i + 1) + '</b> [' + source + ']\n';
     msg += '👤 الاسم: <b>' + escapeHtml(name) + '</b>\n';
     msg += '🆔 ID: <code>' + r.stream_id + '</code>\n';
+    msg += '🕒 بدأ: ' + startTime.toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }) + '\n';
     msg += '⏱️ المدة: <code>' + durationStr + '</code>\n';
     msg += '⚙️ الحالة: جارٍ التسجيل\n\n';
   }
@@ -671,13 +515,13 @@ async function showStopMenu(chatId, env) {
     await sendTelegramMessage(env, chatId, '📭 لا توجد تسجيلات نشطة لإيقافها.', { parse_mode: 'HTML' });
     return;
   }
-  const buttons = active.map(r => [{ text: '🛑 ' + (r.stream_name || r.stream_id), callback_data: 'stop:' + r.stream_id }]);
+  const buttons = active.map(r => [{ text: '🛑 ' + r.stream_id, callback_data: 'stop:' + r.stream_id }]);
   buttons.push([{ text: '🔙 العودة', callback_data: 'back' }]);
   await sendTelegramMessage(env, chatId, '🛑 اختر التسجيل المراد إيقافه:', { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
 }
 
 // ============================================================
-// CLEANUP
+// CLEANUP WITH CONFIRMATION
 // ============================================================
 
 async function handleCleanupConfirm(chatId, env) {
@@ -828,8 +672,7 @@ async function sendMainMenu(chatId, env) {
         inline_keyboard: [
           [{ text: '📊 الحالة', callback_data: 'status' }, { text: '🛑 إيقاف', callback_data: 'stop_menu' }],
           [{ text: '📋 القائمة', callback_data: 'watchlist' }, { text: '📁 التسجيلات', callback_data: 'recordings' }],
-          [{ text: '🔍 الأسماء', callback_data: 'names_status' }, { text: '🧹 تنظيف', callback_data: 'cleanup' }],
-          [{ text: '🧪 تشغيل مراقبة', callback_data: 'test_monitor' }]
+          [{ text: '🧪 تشغيل مراقبة', callback_data: 'test_monitor' }, { text: '🧹 تنظيف', callback_data: 'cleanup' }]
         ]
       }
     }
