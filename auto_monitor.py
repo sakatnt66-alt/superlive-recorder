@@ -152,14 +152,22 @@ def get_active_recordings() -> list:
 
 
 def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name: str) -> bool:
-    """Trigger recording via worker"""
+    """Trigger recording via worker
+    
+    IMPORTANT: Use user_id in URL (for watchlist lookup), pass stream_id in payload.
+    The watchlist stores user_ids (like 61055822), not stream_ids (like 152665656).
+    """
     if not WORKER_API_URL or not AUTO_API_TOKEN:
         print(f"[AUTO] ✗ Worker API not configured (WORKER_API_URL or AUTO_API_TOKEN missing)")
         return False
     
-    url = f"{WORKER_API_URL}/api/auto-trigger/{stream_id}"
+    # Use user_id in URL (this is what's stored in watchlist)
+    url = f"{WORKER_API_URL}/api/auto-trigger/{user_id}"
+    
+    # Pass stream_id (the real stream ID) in the payload
     payload = json.dumps({
         "stream_url": stream_url,
+        "stream_id": stream_id,
         "stream_name": stream_name
     }).encode('utf-8')
     
@@ -175,7 +183,9 @@ def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name
             if response.status == 200:
                 data = json.loads(response.read().decode('utf-8'))
                 if data.get("success"):
-                    print(f"[AUTO] START_RECORDING {user_id} (stream_id={stream_id}) -> {stream_url}")
+                    print(f"[AUTO] ✓ START_RECORDING user={user_id}, stream={stream_id}")
+                    print(f"[AUTO]   → URL: {stream_url}")
+                    print(f"[AUTO]   → Name: {stream_name}")
                     return True
                 else:
                     error = data.get('error', 'unknown')
