@@ -7,6 +7,11 @@ on:
     - cron: '*/3 * * * *'
   workflow_dispatch:
 
+# منع التشغيل المتزامن - ينتظر حتى يكتمل السابق
+concurrency:
+  group: auto-monitor-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
@@ -21,7 +26,7 @@ jobs:
         with:
           python-version: '3.12'
       
-      - name: Install Playwright
+      - name: Install dependencies
         run: |
           pip install playwright
           playwright install chromium
