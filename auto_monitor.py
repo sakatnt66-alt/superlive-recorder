@@ -11,6 +11,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,6 +35,51 @@ if WORKER_API_URL and WORKER_API_URL.endswith('/'):
 
 WATCHLIST_FILE = Path("data/watchlist.json")
 MAX_CONCURRENT = 4
+
+def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
+    """
+    Check if stream_id is a valid stream ID (not user_id, not hash).
+    Valid stream IDs:
+    - Are different from user_id
+    - Have at least 9 digits
+    - Are numeric only (no letters/hashes)
+    """
+    stream_id_str = str(stream_id)
+    user_id_str = str(user_id)
+    
+    # Must be different from user_id
+    if stream_id_str == user_id_str:
+        return False
+    
+    # Must have at least 9 digits (stream IDs are typically 9+ digits)
+    if len(stream_id_str) < 9:
+        return False
+    
+    # Must be numeric only (reject hashes like "95c3fb183522...")
+    if not stream_id_str.isdigit():
+        return False
+    
+    return True
+
+def is_valid_profile_id(profile_id: str) -> bool:
+    """
+    Check if profile_id is valid (numeric, not a hash).
+    Reject hashes like "95c3fb183522a4bbe89a1f3972046720c69e2f3b"
+    """
+    if not profile_id:
+        return False
+    
+    profile_id_str = str(profile_id)
+    
+    # Must be numeric only (reject hashes)
+    if not profile_id_str.isdigit():
+        return False
+    
+    # Reasonable length for profile IDs (typically 8-10 digits)
+    if len(profile_id_str) < 5 or len(profile_id_str) > 15:
+        return False
+    
+    return True
 
 def send_telegram_message(text: str, parse_mode: str = "HTML"):
     """Send message to Telegram"""
@@ -76,6 +122,8 @@ def get_active_recordings() -> list:
                 return data.get("recordings", [])
             else:
                 print(f"[WORKER] ✗ HTTP {response.status} when fetching active recordings")
+    except urllib.error.HTTPError as e:
+        print(f"[WORKER] ✗ HTTP Error {e.code}: {e.reason} - Check AUTO_API_TOKEN")
     except Exception as e:
         print(f"[WORKER] ✗ Error getting active recordings: {e}")
     
@@ -112,34 +160,13 @@ def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name
             else:
                 print(f"[AUTO] ✗ HTTP {response.status} when triggering {user_id}")
                 return False
+    except urllib.error.HTTPError as e:
+        print(f"[AUTO] ✗ HTTP Error {e.code}: {e.reason} when triggering {user_id}")
+        print(f"[AUTO]   → Check that AUTO_API_TOKEN matches Cloudflare Worker secret")
+        return False
     except Exception as e:
         print(f"[AUTO] ✗ Error triggering recording for {user_id}: {e}")
         return False
-
-def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
-    """
-    Check if stream_id is a valid stream ID (not user_id).
-    Valid stream IDs:
-    - Are different from user_id
-    - Have at least 9 digits
-    - Are numeric
-    """
-    stream_id_str = str(stream_id)
-    user_id_str = str(user_id)
-    
-    # Must be different from user_id
-    if stream_id_str == user_id_str:
-        return False
-    
-    # Must have at least 9 digits
-    if len(stream_id_str) < 9:
-        return False
-    
-    # Must be numeric
-    if not stream_id_str.isdigit():
-        return False
-    
-    return True
 
 async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list) -> dict:
     """Check a single user's live state"""
@@ -162,6 +189,11 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         username = profile_result.get("username", "")
         profile_id = profile_result.get("profile_id", "")
         
+        # Validate profile_id (reject hashes)
+        if profile_id and not is_valid_profile_id(profile_id):
+            print(f"[AUTO] ⚠️ Invalid profile_id (hash detected): {profile_id}")
+            profile_id = ""
+        
         print(f"[AUTO] [Phase 1] OK: {profile_url}")
         print(f"[AUTO] [Phase 2] Check live at {profile_url}")
         
@@ -181,7 +213,7 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         is_premium = live_result.get("is_premium", False)
         raw_stream_id = live_result.get("stream_id", user_id)
         
-        # Validate stream_id
+        # Validate stream_id (reject user_id and hashes)
         stream_id_valid = is_valid_stream_id(raw_stream_id, user_id)
         
         # Determine final stream_id and URL
@@ -191,9 +223,19 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
             stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
         else:
             # stream_id is invalid or stream is offline
-            # Use profile_url as fallback
-            stream_id = user_id
-            stream_url = profile_url
+            # Try to find a valid stream_id from profile_url
+            livestream_match = re.search(r'/livestream/(\d+)', profile_url)
+            if livestream_match:
+                potential_id = livestream_match.group(1)
+                if is_valid_stream_id(potential_id, user_id):
+                    stream_id = potential_id
+                    stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
+                else:
+                    stream_id = user_id
+                    stream_url = profile_url
+            else:
+                stream_id = user_id
+                stream_url = profile_url
         
         # Get username
         final_username = live_result.get("username") or username
@@ -217,7 +259,7 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         if profile_id:
             print(f"[AUTO] profile_id={profile_id}")
         
-        print(f"[AUTO] stream_id={stream_id}")
+        print(f"[AUTO] stream_id={stream_id} (valid={stream_id_valid})")
         print(f"[AUTO] display_name={final_username}")
         
         if is_premium:
@@ -234,7 +276,15 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
             print(f"[AUTO] reason=no_live")
             return None
         
-        # LIVE_NORMAL - candidate for recording
+        # LIVE_NORMAL - but must have valid stream_id
+        if not stream_id_valid:
+            print(f"[AUTO] ⚠️ LIVE_NORMAL but stream_id invalid ({stream_id} = user_id)")
+            print(f"[AUTO] phase=p2_invalid_stream")
+            print(f"[AUTO] status=LIVE_NORMAL_INVALID")
+            print(f"[AUTO] action=SKIP_INVALID_STREAM")
+            print(f"[AUTO] reason=invalid_stream_id")
+            return None
+        
         print(f"[AUTO] phase=phase_3_done")
         print(f"[AUTO] status=LIVE_NORMAL")
         print(f"[AUTO] action=CANDIDATE")
