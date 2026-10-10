@@ -25,6 +25,9 @@ AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+# User-Agent to avoid Cloudflare WAF blocking GitHub Actions
+USER_AGENT = "SuperLive-AutoMonitor/1.0 (GitHub Actions; +https://github.com/sakatnt66-alt/superlive-recorder)"
+
 # Debug: Print configuration status
 print(f"[DEBUG] WORKER_API_URL: {'SET' if WORKER_API_URL else 'MISSING'} (length={len(WORKER_API_URL)})")
 print(f"[DEBUG] AUTO_API_TOKEN: {'SET' if AUTO_API_TOKEN else 'MISSING'} (length={len(AUTO_API_TOKEN)})")
@@ -35,6 +38,7 @@ if WORKER_API_URL and WORKER_API_URL.endswith('/'):
 
 WATCHLIST_FILE = Path("data/watchlist.json")
 MAX_CONCURRENT = 4
+
 
 def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
     """
@@ -47,19 +51,15 @@ def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
     stream_id_str = str(stream_id)
     user_id_str = str(user_id)
     
-    # Must be different from user_id
     if stream_id_str == user_id_str:
         return False
-    
-    # Must have at least 9 digits (stream IDs are typically 9+ digits)
     if len(stream_id_str) < 9:
         return False
-    
-    # Must be numeric only (reject hashes like "95c3fb183522...")
     if not stream_id_str.isdigit():
         return False
     
     return True
+
 
 def is_valid_profile_id(profile_id: str) -> bool:
     """
@@ -71,15 +71,22 @@ def is_valid_profile_id(profile_id: str) -> bool:
     
     profile_id_str = str(profile_id)
     
-    # Must be numeric only (reject hashes)
     if not profile_id_str.isdigit():
         return False
-    
-    # Reasonable length for profile IDs (typically 8-10 digits)
     if len(profile_id_str) < 5 or len(profile_id_str) > 15:
         return False
     
     return True
+
+
+def read_error_body(error):
+    """Safely read HTTPError response body for debugging."""
+    try:
+        body = error.read().decode('utf-8', errors='replace')
+        return body[:500] if body else '(empty)'
+    except Exception:
+        return '(unreadable)'
+
 
 def send_telegram_message(text: str, parse_mode: str = "HTML"):
     """Send message to Telegram"""
@@ -94,15 +101,20 @@ def send_telegram_message(text: str, parse_mode: str = "HTML"):
     }).encode('utf-8')
     
     req = urllib.request.Request(url, data=payload, headers={
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'User-Agent': USER_AGENT,
+        'Accept': 'application/json'
     })
     
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
             if response.status != 200:
                 print(f"[TELEGRAM] Failed to send message: {response.status}")
+    except urllib.error.HTTPError as e:
+        print(f"[TELEGRAM] HTTP Error {e.code}: {e.reason}")
     except Exception as e:
         print(f"[TELEGRAM] Error sending message: {e}")
+
 
 def get_active_recordings() -> list:
     """Get active recordings from worker"""
@@ -112,7 +124,9 @@ def get_active_recordings() -> list:
     url = f"{WORKER_API_URL}/api/active-recordings"
     req = urllib.request.Request(url, headers={
         'X-Auto-Token': AUTO_API_TOKEN,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'User-Agent': USER_AGENT,
+        'Accept': 'application/json'
     })
     
     try:
@@ -123,11 +137,19 @@ def get_active_recordings() -> list:
             else:
                 print(f"[WORKER] ✗ HTTP {response.status} when fetching active recordings")
     except urllib.error.HTTPError as e:
-        print(f"[WORKER] ✗ HTTP Error {e.code}: {e.reason} - Check AUTO_API_TOKEN")
+        body = read_error_body(e)
+        print(f"[WORKER] ✗ HTTP Error {e.code}: {e.reason}")
+        print(f"[WORKER]   Response: {body}")
+        if e.code == 403:
+            print(f"[WORKER]   → Cloudflare WAF may be blocking GitHub Actions")
+            print(f"[WORKER]   → Solution: Pause WAF rules or allow GitHub Actions IPs")
+        elif e.code == 401:
+            print(f"[WORKER]   → AUTO_API_TOKEN mismatch between GitHub and Cloudflare")
     except Exception as e:
         print(f"[WORKER] ✗ Error getting active recordings: {e}")
     
     return []
+
 
 def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name: str) -> bool:
     """Trigger recording via worker"""
@@ -143,7 +165,9 @@ def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name
     
     req = urllib.request.Request(url, data=payload, headers={
         'X-Auto-Token': AUTO_API_TOKEN,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'User-Agent': USER_AGENT,
+        'Accept': 'application/json'
     })
     
     try:
@@ -161,12 +185,19 @@ def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name
                 print(f"[AUTO] ✗ HTTP {response.status} when triggering {user_id}")
                 return False
     except urllib.error.HTTPError as e:
+        body = read_error_body(e)
         print(f"[AUTO] ✗ HTTP Error {e.code}: {e.reason} when triggering {user_id}")
-        print(f"[AUTO]   → Check that AUTO_API_TOKEN matches Cloudflare Worker secret")
+        print(f"[AUTO]   Response: {body}")
+        if e.code == 403:
+            print(f"[AUTO]   → Cloudflare WAF may be blocking GitHub Actions")
+            print(f"[AUTO]   → Solution: Pause WAF rules or allow GitHub Actions IPs")
+        elif e.code == 401:
+            print(f"[AUTO]   → AUTO_API_TOKEN mismatch between GitHub and Cloudflare")
         return False
     except Exception as e:
         print(f"[AUTO] ✗ Error triggering recording for {user_id}: {e}")
         return False
+
 
 async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list) -> dict:
     """Check a single user's live state"""
@@ -303,6 +334,7 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         traceback.print_exc()
         return None
 
+
 async def main():
     """Main entry point"""
     print("[AUTO] Starting Auto Monitor (Optimized for Speed)")
@@ -378,7 +410,16 @@ async def main():
         ):
             triggered += 1
     
+    # Send Telegram notification
+    if triggered > 0:
+        names = [f"• {r['stream_name']} ({r['stream_id']})" for r in to_record[:triggered]]
+        send_telegram_message(
+            f"🤖 <b>Auto Recording بدأ ({triggered})</b>\n\n" + "\n".join(names),
+            parse_mode="HTML"
+        )
+    
     print(f"[AUTO] Monitor completed")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
