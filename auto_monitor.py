@@ -34,6 +34,7 @@ if WORKER_API_URL and WORKER_API_URL.endswith('/'):
     WORKER_API_URL = WORKER_API_URL[:-1]
 
 WATCHLIST_FILE = Path("data/watchlist.json")
+LOCAL_FALLBACK_FILE = Path("watchlist.json")
 MAX_CONCURRENT = 4
 
 
@@ -122,6 +123,24 @@ def get_watchlist() -> list:
         return []
 
 
+def get_local_names_fallback() -> dict:
+    """Load names from local files as last-resort fallback"""
+    names = {}
+    for path in [WATCHLIST_FILE, LOCAL_FALLBACK_FILE]:
+        if path.exists():
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    for entry in data.get("watchlist", []):
+                        uid = str(entry.get("stream_id"))
+                        name = entry.get("display_name")
+                        if name and name != uid and len(str(name).strip()) > 0:
+                            names[uid] = name
+            except Exception as e:
+                print(f"[LOCAL] ⚠️ Error reading {path}: {e}")
+    return names
+
+
 def get_active_recordings() -> list:
     if not WORKER_API_URL or not AUTO_API_TOKEN:
         return []
@@ -190,6 +209,8 @@ def update_display_name(user_id: str, display_name: str) -> bool:
         return False
     if not display_name or display_name == user_id:
         return False
+    if len(str(display_name).strip()) <= 1:
+        return False
     
     url = f"{WORKER_API_URL}/api/update-display-name/{user_id}"
     payload = json.dumps({"display_name": display_name}).encode('utf-8')
@@ -214,11 +235,28 @@ def update_display_name(user_id: str, display_name: str) -> bool:
     return False
 
 
-async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list) -> dict:
+async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list, local_names: dict) -> dict:
     user_id = str(user.get("stream_id"))
     print(f"[AUTO] [Phase 1] Resolving {user_id}")
     
     try:
+        # ============================================================
+        # Get existing name with priority:
+        # 1. KV (watchlist from Worker) - authoritative
+        # 2. Local file fallback
+        # ============================================================
+        existing_name = None
+        for w in watchlist:
+            if str(w.get("stream_id")) == user_id:
+                existing_name = w.get("display_name")
+                break
+        
+        if (not existing_name or existing_name == user_id) and user_id in local_names:
+            existing_name = local_names[user_id]
+            print(f"[AUTO] 📁 Found name in local file: {existing_name}")
+            # Sync to KV
+            update_display_name(user_id, existing_name)
+        
         # Phase 1: Discover profile
         profile_result = await discovery.discover_profile_id(user_id)
         
@@ -231,11 +269,7 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
             print(f"[AUTO] ✗ Invalid profile URL for {user_id}")
             return None
         
-        # ============================================================
-        # METHOD C FALLBACK DETECTION
-        # If profile_url is /livestream/{user_id}, it's a Method C fallback
-        # that won't give us a real stream_id - handle specially
-        # ============================================================
+        # Detect Method C fallback
         is_method_c_fallback = False
         if '/livestream/' in profile_url:
             match = re.search(r'/livestream/(\d+)', profile_url)
@@ -249,7 +283,6 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         if profile_id and not is_valid_profile_id(profile_id):
             profile_id = ""
         
-        # Only log Phase 1 OK for real profile URLs (not Method C fallback)
         if not is_method_c_fallback:
             print(f"[AUTO] [Phase 1] OK: {profile_url}")
             print(f"[AUTO] [Phase 2] Check live at {profile_url}")
@@ -271,94 +304,86 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         stream_id_valid = is_valid_stream_id(raw_stream_id, user_id)
         
         # ============================================================
-        # SECOND CHANCE: If OFFLINE from profile, try direct livestream
-        # This catches cases where the stream is live but profile page
-        # doesn't show the video (like the ميساء case)
+        # SECOND CHANCE: If OFFLINE, try direct livestream URL
         # ============================================================
         if not is_live and not is_premium:
             direct_url = f"https://superlivetv.com/fr/livestream/{user_id}"
-            
-            # Only try second chance if we haven't already checked this URL
             if profile_url != direct_url:
-                print(f"[AUTO] ⚠️ OFFLINE on profile - trying second chance at {direct_url}")
-                
+                print(f"[AUTO] ⚠️ OFFLINE on profile - trying second chance")
                 direct_result = await discovery.check_live_status(
                     profile_url=direct_url,
                     user_id=user_id,
                     profile_id="",
                     phase1_username=username
                 )
-                
-                if direct_result:
-                    direct_live = direct_result.get("is_live", False)
-                    direct_premium = direct_result.get("is_premium", False)
-                    direct_stream_id = direct_result.get("stream_id", user_id)
-                    direct_stream_valid = is_valid_stream_id(direct_stream_id, user_id)
-                    
-                    if direct_live:
-                        print(f"[AUTO] ✓ SECOND CHANCE SUCCESS: stream is LIVE!")
-                        is_live = True
-                        is_premium = direct_premium
-                        raw_stream_id = direct_stream_id
-                        stream_id_valid = direct_stream_valid
-                    else:
-                        print(f"[AUTO] ✗ Second chance confirmed: OFFLINE")
+                if direct_result and direct_result.get("is_live"):
+                    print(f"[AUTO] ✓ SECOND CHANCE SUCCESS!")
+                    is_live = True
+                    is_premium = direct_result.get("is_premium", False)
+                    raw_stream_id = direct_result.get("stream_id", user_id)
+                    stream_id_valid = is_valid_stream_id(raw_stream_id, user_id)
+                    direct_username = direct_result.get("username")
+                    if direct_username and direct_username != user_id:
+                        username = direct_username
         
-        # ============================================================
         # Determine final stream_id
-        # ============================================================
         if stream_id_valid and is_live:
             stream_id = str(raw_stream_id)
             stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
         else:
             stream_id = user_id
-            stream_url = ""  # Don't use invalid URL
+            stream_url = ""
         
-        # Get username
-        final_username = live_result.get("username") or username
-        if not final_username or str(final_username) == str(user_id):
-            for w in watchlist:
-                if str(w.get("stream_id")) == str(user_id) and w.get("display_name"):
-                    final_username = w.get("display_name")
-                    break
-        if not final_username:
-            final_username = user_id
+        # ============================================================
+        # NAME RESOLUTION PRIORITY:
+        # 1. Existing name from KV/local (don't overwrite trusted data)
+        # 2. Name from live_result (fresh from page)
+        # 3. Name from profile_result
+        # 4. Fallback to user_id
+        # ============================================================
+        final_username = None
+        name_source = None
         
-        # Auto-update display_name in KV
-        if final_username and final_username != user_id:
+        if existing_name and existing_name != user_id and len(str(existing_name).strip()) > 1:
+            final_username = existing_name
+            name_source = "existing"
+        else:
+            live_username = live_result.get("username")
+            if live_username and live_username != user_id and len(str(live_username).strip()) > 1:
+                final_username = live_username
+                name_source = "live_result"
+            elif username and username != user_id and len(str(username).strip()) > 1:
+                final_username = username
+                name_source = "profile_result"
+            else:
+                final_username = user_id
+                name_source = "fallback"
+        
+        # Auto-update KV if we found a new real name
+        if final_username and final_username != user_id and name_source != "existing":
             update_display_name(user_id, final_username)
         
-        # ============================================================
-        # Display results (CLEAN - only valid info)
-        # ============================================================
+        # Display results
         print(f"[AUTO] username={user_id}")
-        print(f"[AUTO] display_name={final_username}")
+        print(f"[AUTO] display_name={final_username} (source={name_source})")
         
-        # Only show profile_url for real profiles (not Method C fallback)
         if not is_method_c_fallback:
             print(f"[AUTO] profile_url={profile_url}")
             if profile_id:
                 print(f"[AUTO] profile_id={profile_id}")
         
-        # Only show stream_id if valid
         if stream_id_valid:
             print(f"[AUTO] stream_id={stream_id} ✓")
-        elif is_live:
-            print(f"[AUTO] stream_id=N/A (live but no valid ID)")
         
-        # ============================================================
         # Decision
-        # ============================================================
         if is_premium:
             print(f"[AUTO] phase=p2_premium - SKIP_PREMIUM")
             return None
-        
         if not is_live:
             print(f"[AUTO] phase=p2_offline - SKIP_OFFLINE")
             return None
-        
         if not stream_id_valid:
-            print(f"[AUTO] phase=p2_invalid_stream - SKIP (no valid stream_id)")
+            print(f"[AUTO] phase=p2_invalid_stream - SKIP")
             return None
         
         print(f"[AUTO] phase=phase_3_done - CANDIDATE ✓")
@@ -386,6 +411,11 @@ async def main():
         return
     
     print(f"[AUTO] Watchlist: {len(watchlist)} users")
+    
+    # Load local names as fallback
+    local_names = get_local_names_fallback()
+    if local_names:
+        print(f"[AUTO] Local names fallback: {len(local_names)} names available")
     
     active = get_active_recordings()
     print(f"[AUTO] Active: {len(active)}/5")
@@ -415,7 +445,7 @@ async def main():
     
     async def check_with_semaphore(user):
         async with semaphore:
-            return await check_user(discovery, user, watchlist)
+            return await check_user(discovery, user, watchlist, local_names)
     
     tasks = [check_with_semaphore(u) for u in to_check]
     results = await asyncio.gather(*tasks)
