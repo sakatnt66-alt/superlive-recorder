@@ -2,8 +2,12 @@ name: Cleanup Stuck Recordings
 
 on:
   schedule:
-    - cron: '*/5 * * * *'  # كل 5 دقائق
-  workflow_dispatch:  # تشغيل يدوي
+    - cron: '*/5 * * * *'  # يعمل تلقائياً كل 5 دقائق
+  workflow_dispatch:       # يمكن تشغيله يدوياً من تبويب Actions
+
+# ⚠️ هذا السطر هو الحل السحري لمشكلة 403: يمنح الصلاحية للكتابة
+permissions:
+  contents: write
 
 jobs:
   cleanup:
@@ -11,8 +15,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -22,16 +24,9 @@ jobs:
       - name: Install dependencies
         run: pip install requests
       
-      - name: Cleanup recordings
+      - name: Run Cleanup Script
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: python cleanup_recordings.py
-      
-      - name: Commit changes
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/recordings.json
-          git diff --staged --quiet || git commit -m "🧹 Auto cleanup stuck recordings"
-          git push
