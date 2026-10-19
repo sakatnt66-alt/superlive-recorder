@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import base64
 from datetime import datetime, timedelta
 from pathlib import Path
 import requests
@@ -18,16 +19,15 @@ RECORDINGS_FILE = DATA_DIR / "recordings.json"
 QUEUE_DIR = Path("queue")
 
 # الإعدادات
-MAX_RECORDING_HOURS = 6  # الحد الأقصى لساعات التسجيل (6 ساعات)
-STUCK_THRESHOLD_MINUTES = 10  # إذا لم يتغير حجم الملف خلال 10 دقائق = عالق
+MAX_RECORDING_HOURS = 6
+STUCK_THRESHOLD_MINUTES = 15
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY")  # owner/repo
+GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY")
+GITHUB_BRANCH = os.environ.get("GITHUB_REF_NAME", "main")
 
 def load_recordings():
-    """تحميل قائمة التسجيلات"""
     if not RECORDINGS_FILE.exists():
         return []
-    
     try:
         with open(RECORDINGS_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -37,69 +37,71 @@ def load_recordings():
         return []
 
 def save_recordings(recordings):
-    """حفظ قائمة التسجيلات"""
     try:
         DATA_DIR.mkdir(exist_ok=True)
+        content_str = json.dumps(recordings, indent=2, ensure_ascii=False)
+        
+        # 1. الحفظ المحلي
         with open(RECORDINGS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(recordings, f, indent=2, ensure_ascii=False)
-        print(f"✅ تم حفظ {len(recordings)} تسجيل")
+            f.write(content_str)
+        
+        # 2. الرفع عبر GitHub API (يتجاوز مشاكل git push)
+        if GITHUB_TOKEN and GITHUB_REPO:
+            print("🔄 جاري مزامنة التغييرات مع GitHub عبر API...")
+            api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/data/recordings.json"
+            headers = {
+                'Authorization': f'token {GITHUB_TOKEN}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+            
+            # الحصول على SHA الحالي للملف
+            sha = ""
+            res = requests.get(api_url, headers=headers)
+            if res.status_code == 200:
+                sha = res.json().get('sha', '')
+            
+            # إرسال التحديث
+            payload = {
+                "message": "🧹 Auto cleanup stuck recordings",
+                "content": base64.b64encode(content_str.encode('utf-8')).decode('utf-8'),
+                "branch": GITHUB_BRANCH
+            }
+            if sha:
+                payload["sha"] = sha
+            
+            res_put = requests.put(api_url, headers=headers, json=payload)
+            if res_put.status_code in [200, 201]:
+                print("✅ تم تحديث الملف بنجاح عبر GitHub API")
+            else:
+                print(f"⚠️ تنبيه: فشل المزامنة مع GitHub ({res_put.status_code})، لكن الملف حُفظ محلياً.")
+        else:
+            print("✅ تم حفظ الملف محلياً.")
+            
     except Exception as e:
-        print(f"❌ خطأ في حفظ التسجيلات: {e}")
-
-def check_process_alive(pid):
-    """التحقق من أن العملية ما زالت تعمل"""
-    if not pid:
-        return False
-    
-    try:
-        # على Linux/Mac
-        result = subprocess.run(
-            ['ps', '-p', str(pid)],
-            capture_output=True,
-            text=True
-        )
-        return result.returncode == 0
-    except:
-        return False
+        print(f"❌ خطأ فادح في الحفظ: {e}")
 
 def check_github_workflow(run_id):
-    """التحقق من حالة GitHub Actions workflow"""
     if not run_id or not GITHUB_TOKEN or not GITHUB_REPO:
         return None
-    
     try:
         url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/runs/{run_id}"
-        headers = {
-            'Authorization': f'token {GITHUB_TOKEN}',
-            'Accept': 'application/vnd.github.v3+json'
-        }
+        headers = {'Authorization': f'token {GITHUB_TOKEN}', 'Accept': 'application/vnd.github.v3+json'}
         response = requests.get(url, headers=headers, timeout=10)
-        
         if response.status_code == 200:
             data = response.json()
-            status = data.get('status')  # queued, in_progress, completed
-            conclusion = data.get('conclusion')  # success, failure, cancelled
-            
-            print(f"  🔍 Workflow {run_id}: status={status}, conclusion={conclusion}")
-            
-            if status == 'completed':
-                return False  # انتهى
-            elif status == 'in_progress':
-                return True  # ما زال يعمل
-            else:
-                return None  # حالة غير واضحة
+            if data.get('status') == 'completed':
+                return False # انتهى
+            elif data.get('status') == 'in_progress':
+                return True # يعمل
         return None
-    except Exception as e:
-        print(f"  ⚠️ خطأ في فحص workflow: {e}")
+    except:
         return None
 
-def check_recording_file_activity(recording):
-    """التحقق من نشاط ملف التسجيل"""
+def check_file_activity(recording):
     recording_id = recording.get('id') or recording.get('user_id')
     if not recording_id:
         return None
     
-    # ابحث عن ملف التسجيل في queue أو recordings
     possible_paths = [
         QUEUE_DIR / f"{recording_id}.mp4",
         QUEUE_DIR / f"{recording_id}.part",
@@ -111,128 +113,91 @@ def check_recording_file_activity(recording):
             try:
                 stat = file_path.stat()
                 file_age = datetime.now() - datetime.fromtimestamp(stat.st_mtime)
-                
-                # إذا الملف لم يتغير خلال 10 دقائق = عالق
                 if file_age > timedelta(minutes=STUCK_THRESHOLD_MINUTES):
-                    print(f"  📁 ملف التسجيل {file_path.name} لم يتغير منذ {file_age}")
-                    return False
+                    return False # عالق
                 else:
-                    print(f"  📁 ملف التسجيل {file_path.name} نشط (آخر تعديل: {file_age})")
-                    return True
-            except Exception as e:
-                print(f"  ⚠️ خطأ في فحص الملف: {e}")
-    
-    return None  # لا يوجد ملف
+                    return True # نشط
+            except:
+                pass
+    return None
 
 def is_recording_active(recording):
-    """
-    التحقق الشامل من أن التسجيل ما زال نشطاً
-    يرجع: True (نشط), False (منتهي), None (غير متأكد)
-    """
     username = recording.get('username', 'unknown')
-    print(f"\n🔍 فحص تسجيل: {username}")
+    print(f"🔍 فحص: {username}")
     
-    # 1. تحقق من المدة
+    # 1. فحص المدة
     started_at_str = recording.get('started_at')
     if started_at_str:
         try:
             started_at = datetime.fromisoformat(started_at_str.replace('Z', '+00:00'))
             duration = datetime.now(started_at.tzinfo) - started_at if started_at.tzinfo else datetime.now() - started_at
-            
             if duration > timedelta(hours=MAX_RECORDING_HOURS):
-                print(f"  ⏰ تجاوز الحد الأقصى ({MAX_RECORDING_HOURS} ساعات)")
+                print(f"  ⏰ تجاوز الحد الأقصى ({MAX_RECORDING_HOURS} ساعات) -> إزالة")
                 return False
-        except Exception as e:
-            print(f"  ⚠️ خطأ في حساب المدة: {e}")
+        except: pass
     
-    # 2. تحقق من العملية (PID)
-    pid = recording.get('pid')
-    if pid:
-        is_alive = check_process_alive(pid)
-        print(f"  🔧 عملية PID {pid}: {'نشطة' if is_alive else 'منتهية'}")
-        if not is_alive:
-            return False
-    
-    # 3. تحقق من GitHub Actions workflow
+    # 2. فحص Workflow
     workflow_run_id = recording.get('workflow_run_id')
     if workflow_run_id:
-        workflow_status = check_github_workflow(workflow_run_id)
-        if workflow_status is False:
-            print(f"  🔄 Workflow انتهى")
+        wf_status = check_github_workflow(workflow_run_id)
+        if wf_status is False:
+            print(f"  🔄 Workflow انتهى -> إزالة")
             return False
-        elif workflow_status is True:
-            print(f"  🔄 Workflow ما زال يعمل")
-            # لا ترجع True هنا، تحقق من حالات أخرى أيضاً
     
-    # 4. تحقق من نشاط ملف التسجيل
-    file_activity = check_recording_file_activity(recording)
+    # 3. فحص نشاط الملف
+    file_activity = check_file_activity(recording)
     if file_activity is False:
-        print(f"  📁 ملف التسجيل غير نشط")
+        print(f"  📁 الملف لم يتغير منذ {STUCK_THRESHOLD_MINUTES} دقيقة -> إزالة")
         return False
     elif file_activity is True:
-        print(f"  📁 ملف التسجيل نشط")
+        print(f"  ✅ الملف نشط")
         return True
     
-    # 5. إذا لم نتأكد من أي شيء، اعتبره عالق إذا مر وقت طويل
+    # 4. فحص احتياطي: إذا مر وقت طويل بدون أي دليل نشاط
     if started_at_str:
         try:
             started_at = datetime.fromisoformat(started_at_str.replace('Z', '+00:00'))
             duration = datetime.now(started_at.tzinfo) - started_at if started_at.tzinfo else datetime.now() - started_at
-            
-            # إذا مر أكثر من ساعة ولا يوجد دليل على النشاط = عالق
-            if duration > timedelta(hours=1):
-                print(f"  ⚠️ مر {duration} بدون دليل على النشاط")
+            if duration > timedelta(hours=2) and file_activity is None:
+                print(f"  ⚠️ مر {duration} بدون ملف أو Workflow -> إزالة")
                 return False
-        except:
-            pass
+        except: pass
     
-    print(f"  ✅ التسجيل نشط")
+    print(f"  ✅ التسجيل يعتبر نشطاً")
     return True
 
-def cleanup_recordings():
-    """تنظيف التسجيلات العالقة"""
-    print("=" * 60)
-    print("🧹 بدء تنظيف التسجيلات العالقة")
-    print("=" * 60)
+def main():
+    print("=" * 50)
+    print("🧹 بدء فحص وتنظيف التسجيلات العالقة")
+    print("=" * 50)
     
     recordings = load_recordings()
-    print(f"\n📊 عدد التسجيلات الحالي: {len(recordings)}")
+    print(f"\n📊 إجمالي التسجيلات في القائمة: {len(recordings)}")
     
     if not recordings:
-        print("✅ القائمة فارغة، لا حاجة للتنظيف")
+        print("✅ القائمة فارغة، لا يوجد شيء لتنظيفه.")
         return
     
     active_recordings = []
     removed_count = 0
     
     for recording in recordings:
-        is_active = is_recording_active(recording)
-        
-        if is_active:
+        if is_recording_active(recording):
             active_recordings.append(recording)
         else:
             removed_count += 1
-            username = recording.get('username', 'unknown')
-            user_id = recording.get('user_id', 'unknown')
-            print(f"  🗑️ إزالة تسجيل عالق: {username} (ID: {user_id})")
+            print(f"  🗑️ تم إزالة: {recording.get('username')} (ID: {recording.get('user_id')})")
     
-    print(f"\n{'=' * 60}")
-    print(f"📈 النتيجة:")
-    print(f"  ✅ التسجيلات النشطة: {len(active_recordings)}")
-    print(f"  🗑️ التسجيلات المزالة: {removed_count}")
-    print(f"{'=' * 60}")
+    print(f"\n{'=' * 50}")
+    print(f"📈 النتيجة: نشط ({len(active_recordings)}) | مُزال ({removed_count})")
+    print(f"{'=' * 50}")
     
-    # احفظ القائمة المحدثة
     save_recordings(active_recordings)
-    
-    return active_recordings
+    print("\n✅ انتهت عملية التنظيف بنجاح.")
 
 if __name__ == "__main__":
     try:
-        cleanup_recordings()
-        print("\n✅ تم التنظيف بنجاح")
+        main()
     except Exception as e:
         print(f"\n❌ خطأ فادح: {e}")
-        import traceback
-        traceback.print_exc()
         sys.exit(1)
