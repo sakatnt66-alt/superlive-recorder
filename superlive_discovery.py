@@ -319,24 +319,59 @@ class SuperLiveDiscovery:
             # query parameters alone are not assumed to be supported.
             submitted = False
             if urlparse(search_url).path.rstrip("/").endswith("/search") and not urlparse(search_url).query:
-                for selector in (
+                # Prefer inputs that actually look like the site's search field. Do not
+                # silently assume the first generic input is the search box (it may be
+                # a login/newsletter field). Fall back to visible text inputs only.
+                selectors = (
                     "input[type=search]", "input[name=search]", "input[name=query]",
-                    "input[name=q]", "input[placeholder*='search' i]",
-                    "input[placeholder*='recherch' i]", "input[placeholder*='ID' i]",
-                    "input:not([type=hidden]):not([type=checkbox])",
-                ):
+                    "input[name=q]", "input[name=keyword]", "input[name=term]",
+                    "input[placeholder*='search' i]", "input[placeholder*='recherch' i]",
+                    "input[placeholder*='ID' i]", "input[aria-label*='search' i]",
+                    "input[aria-label*='recherch' i]", "input[type=text]",
+                )
+                for selector in selectors:
                     try:
-                        field = page.locator(selector).first
-                        if await field.count() and await field.is_visible():
-                            await field.fill(raw)
-                            await field.press("Enter")
+                        fields = page.locator(selector)
+                        count = min(await fields.count(), 8)
+                        chosen = None
+                        for field_index in range(count):
+                            field = fields.nth(field_index)
+                            if await field.is_visible() and await field.is_enabled():
+                                input_type = (await field.get_attribute("type") or "text").lower()
+                                if input_type not in {"hidden", "checkbox", "radio", "password", "email"}:
+                                    chosen = field
+                                    break
+                        if chosen is None:
+                            continue
+                        await chosen.fill(raw)
+                        submitted = True
+                        try:
+                            await chosen.press("Enter", timeout=1200)
+                        except PlaywrightError:
+                            pass
+                        try:
+                            await page.wait_for_load_state("domcontentloaded", timeout=1200)
+                        except PlaywrightTimeoutError:
+                            pass
+                        await page.wait_for_timeout(450)
+                        # Some versions of the site use a button handler instead of
+                        # submitting on Enter. If the form stayed on the empty search
+                        # route, try the form's submit control once.
+                        if urlparse(page.url).path.rstrip("/").endswith("/search") and not urlparse(page.url).query:
                             try:
-                                await page.wait_for_load_state("networkidle", timeout=900)
-                            except PlaywrightTimeoutError:
+                                form = chosen.locator("xpath=ancestor::form[1]")
+                                submit = form.locator("button[type=submit], input[type=submit], button:not([type])").first
+                                if await submit.count() and await submit.is_visible() and await submit.is_enabled():
+                                    await submit.click(timeout=1200)
+                                    try:
+                                        await page.wait_for_load_state("domcontentloaded", timeout=1200)
+                                    except PlaywrightTimeoutError:
+                                        pass
+                                    await page.wait_for_timeout(450)
+                            except PlaywrightError:
                                 pass
-                            await page.wait_for_timeout(250)
-                            submitted = True
-                            break
+                        self.log.info("Search form submitted for key %s using selector %s; url=%s", raw, selector, page.url)
+                        break
                     except PlaywrightError:
                         continue
             try:
@@ -348,7 +383,10 @@ class SuperLiveDiscovery:
                     }
                     return {href:a.href, text:(a.innerText||a.textContent||'').trim(), card};
                 })""")
-            except PlaywrightError:
+                profile_link_count = sum(1 for link in links if self._same_site(str(link.get("href", ""))) and self._is_public_profile_route(str(link.get("href", ""))))
+                self.log.info("Search results for key %s: submitted=%s anchors=%d profile_links=%d url=%s", raw, submitted, len(links), profile_link_count, page.url)
+            except PlaywrightError as exc:
+                self.log.warning("Could not read search results for key %s: %s", raw, type(exc).__name__)
                 continue
             for item in links:
                 href = str(item.get("href", "")).strip()
@@ -412,6 +450,7 @@ class SuperLiveDiscovery:
                 return result
 
         result["error"] = "public_profile_not_found_or_site_structure_changed"
+        self.log.warning("Profile resolution failed for key %s after %d search routes", raw, len(search_urls))
         return result
 
     async def _extract_profile_id(self, page: Page, fallback: str) -> str:
