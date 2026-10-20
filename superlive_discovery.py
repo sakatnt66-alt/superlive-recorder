@@ -155,14 +155,16 @@ class SuperLiveDiscovery:
         for attempt in range(self.retries + 1):
             try:
                 response = await page.goto(url, wait_until="domcontentloaded", timeout=self.navigation_timeout_ms)
-                # HTTP errors are not automatically fatal: some sites render useful challenge/error pages.
-                if response is not None and response.status >= 500:
-                    self.log.warning("HTTP %s while opening %s", response.status, url)
+                # Treat 4xx/5xx as failed navigation. In particular, a branded 404
+                # page can still contain text and must never be accepted as a profile.
+                if response is not None and response.status >= 400:
+                    self.log.debug("HTTP %s while opening %s", response.status, url)
+                    return False
                 try:
                     await page.wait_for_load_state("networkidle", timeout=min(2500, self.timeout_ms))
                 except PlaywrightTimeoutError:
                     pass
-                return response is None or response.status < 500
+                return True
             except PlaywrightTimeoutError:
                 self.log.debug("Navigation timeout (%d/%d): %s", attempt + 1, self.retries + 1, url)
             except PlaywrightError as exc:
@@ -208,10 +210,18 @@ class SuperLiveDiscovery:
         )
         excerpt = (title + " " + text[:3500]).lower()
         error = any(term in excerpt for term in self.ERROR_TERMS)
-        # A valid SPA profile may have a blank title; require rendered body text or
-        # a recognizable profile route. Do not require the ID to be repeated in text.
         has_content = bool(title.strip() or text.strip())
         return bool((route_match or legacy_match) and not error and has_content)
+
+    @staticmethod
+    def _is_public_profile_route(url: str) -> bool:
+        """Recognize both /fr/profile/52275791 and /fr/nina1 profile routes."""
+        path = urlparse(url).path.lower().rstrip("/")
+        segments = [segment for segment in path.split("/") if segment]
+        if len(segments) >= 3 and segments[-2] == "profile":
+            return True
+        reserved = {"discover", "search", "livestream", "login", "signup", "register", "settings", "notifications"}
+        return len(segments) == 2 and segments[0] in {"fr", "en", "ar"} and segments[1] not in reserved
 
     async def discover_profile_id(self, user_id: Any) -> dict[str, Any]:
         """Resolve an account ID to a public profile URL.
@@ -249,7 +259,9 @@ class SuperLiveDiscovery:
             # Canonical route first; include the locale and discover/search routes
             # used by the live site, followed by conservative legacy fallbacks.
             candidates = [
+                f"{self.base_url}/fr/profile/{encoded}?isFromSearch=true",
                 f"{self.base_url}/fr/profile/{encoded}",
+                f"{self.base_url}/en/profile/{encoded}?isFromSearch=true",
                 f"{self.base_url}/en/profile/{encoded}",
                 f"{self.base_url}/profile/{encoded}",
                 f"{self.base_url}/fr/user/{encoded}",
@@ -289,46 +301,64 @@ class SuperLiveDiscovery:
             })
             return result
 
-        # Search fallback: inspect same-site profile links. The site's search page
-        # may be a client-rendered SPA, so try its real /fr/search route as well.
+        # Search fallback: search results may point to either /fr/profile/{id}
+        # or a username route such as /fr/nina1?isFromSearch=true. Do not match
+        # only visible link text: numeric watchlist IDs often differ from usernames.
         search_urls = [
-            f"{self.base_url}/fr/search?q={quote(username, safe='')}",
             f"{self.base_url}/fr/search?query={quote(username, safe='')}",
+            f"{self.base_url}/fr/search?q={quote(username, safe='')}",
+            f"{self.base_url}/fr/search?search={quote(username, safe='')}",
+            f"{self.base_url}/fr/search?keyword={quote(username, safe='')}",
             f"{self.base_url}/search?q={quote(username, safe='')}",
         ]
+        inspected: set[str] = set()
         for search_url in search_urls:
             if not await self._goto(search_url):
                 continue
             try:
                 links = await page.locator("a[href]").evaluate_all(
-                    "els => els.slice(0,1000).map(a => ({href:a.href, text:(a.innerText||a.textContent||'').trim()}))"
+                    "els => els.slice(0,1500).map(a => ({href:a.href, text:(a.innerText||a.textContent||'').trim()}))"
                 )
             except PlaywrightError:
                 continue
             for item in links:
-                href = self._norm_url(str(item.get("href", "")))
-                label = str(item.get("text", "")).lower()
+                href = str(item.get("href", "")).strip()
+                label = self._clean(str(item.get("text", ""))).lower()
                 if not href or not self._same_site(href):
                     continue
-                path = urlparse(href).path.lower().rstrip("/")
-                is_profile_route = bool(re.search(r"/profile/" + re.escape(username.lower()) + r"$", path))
-                identity_match = username.lower() in label or is_profile_route
-                if not identity_match:
+                href = self._norm_url(href)
+                if href in inspected or not self._is_public_profile_route(href):
                     continue
+                inspected.add(href)
+                candidate_path = urlparse(href).path.lower().rstrip("/")
+                candidate_slug = candidate_path.rsplit("/", 1)[-1]
+                # A direct username match is safe. For numeric account IDs, require
+                # the profile page's embedded metadata to identify the requested ID.
+                direct_identity_match = candidate_slug == username.lower() or username.lower() in label
                 if not await self._goto(href):
                     continue
                 current = self._norm_url(page.url)
                 text = await self._text(page)
                 title = await self._title(page)
-                if await self._looks_profile(username, current, title, text):
-                    profile_id = await self._extract_profile_id(page, username)
-                    result.update({
-                        "success": True, "ok": True, "profile_id": profile_id,
-                        "profile_url": current,
-                        "profile_id_source": "page_metadata" if profile_id != username else "url_or_input",
-                        "error": None,
-                    })
-                    return result
+                excerpt = (title + " " + text[:3500]).lower()
+                if any(term in excerpt for term in self.ERROR_TERMS):
+                    continue
+                if not self._is_public_profile_route(current) or not (title or text):
+                    continue
+                profile_id = await self._extract_profile_id(page, "")
+                path_id_match = bool(re.search(r"/profile/" + re.escape(username.lower()) + r"/?$", urlparse(current).path.lower()))
+                metadata_match = bool(profile_id and profile_id.lower() == username.lower())
+                if not (direct_identity_match or path_id_match or metadata_match):
+                    continue
+                result.update({
+                    "success": True, "ok": True,
+                    "profile_id": profile_id or (username if candidate_slug == username.lower() else None),
+                    "username": candidate_slug if candidate_slug != username.lower() else username,
+                    "profile_url": current,
+                    "profile_id_source": "page_metadata" if profile_id else "matched_search_result",
+                    "error": None,
+                })
+                return result
 
         result["error"] = "public_profile_not_found_or_site_structure_changed"
         return result
