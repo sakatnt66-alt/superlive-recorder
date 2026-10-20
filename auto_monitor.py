@@ -34,6 +34,9 @@ PER_USER_TIMEOUT_SECONDS = 10
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
+import logging
+logging.basicConfig(level=logging.INFO, format="[DISCOVERY] %(levelname)s %(message)s", stream=sys.stdout)
+
 print(f"[DEBUG] WORKER_API_URL: {'SET' if WORKER_API_URL else 'MISSING'} (length={len(WORKER_API_URL)})", flush=True)
 print(f"[DEBUG] AUTO_API_TOKEN: {'SET' if AUTO_API_TOKEN else 'MISSING'} (length={len(AUTO_API_TOKEN)})", flush=True)
 
@@ -170,12 +173,17 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
             discovery.discover_profile_id(user_id), timeout=PER_USER_TIMEOUT_SECONDS
         )
         if not isinstance(profile_result, dict) or not profile_result:
-            print(f"[AUTO] Resolve failed for {user_id}")
+            print(f"[AUTO] Resolve failed for {user_id}: empty_or_invalid_response", flush=True)
+            return None
+        if profile_result.get("success") is False or profile_result.get("ok") is False:
+            reason = profile_result.get("error") or "profile_resolution_failed"
+            print(f"[AUTO] Resolve failed for {user_id}: {reason}", flush=True)
             return None
 
         profile_url = str(profile_result.get("profile_url") or "").strip()
         if not profile_url or "/profile/None" in profile_url or profile_url.endswith("/None"):
-            print(f"[AUTO] Invalid profile URL for {user_id}: {profile_url!r}")
+            reason = profile_result.get("error") or "profile_url_missing"
+            print(f"[AUTO] Invalid profile URL for {user_id}: {profile_url!r}; reason={reason}", flush=True)
             return None
 
         username = str(profile_result.get("username") or "").strip()
