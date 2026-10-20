@@ -466,6 +466,25 @@ class SuperLiveDiscovery:
                         stream_id = m.group(1) if m else None
                 except PlaywrightError:
                     pass
+                # If the profile itself does not prove a live stream, inspect the
+                # discovered livestream page too. A link alone is not proof of live.
+                stream_title = ""
+                if stream_url and not live:
+                    try:
+                        if await self._goto(stream_url):
+                            stream_page = await self._page()
+                            stream_title = await self._title(stream_page)
+                            stream_live, stream_evidence = await self.is_live_page(stream_page)
+                            stream_premium, stream_premium_evidence = await self.detect_premium(stream_page)
+                            if stream_live:
+                                live = True
+                                live_evidence = ["livestream_page"] + stream_evidence
+                            if stream_premium:
+                                premium = True
+                                premium_evidence = stream_premium_evidence
+                    except Exception as stream_exc:
+                        self.log.debug("Livestream page inspection failed for %s: %s", stream_url, stream_exc)
+
                 # Avoid treating a generic loaded page as a successful live check.
                 has_page = bool(current_url and (title or text))
                 return {
@@ -475,7 +494,8 @@ class SuperLiveDiscovery:
                     "live": bool(live), "status": "live" if live else "not_live_or_unconfirmed",
                     "is_premium": bool(premium), "premium": bool(premium),
                     "stream_url": stream_url, "stream_id": stream_id,
-                    "title": title, "live_evidence": live_evidence,
+                    "title": title, "stream_title": stream_title,
+                    "live_evidence": live_evidence,
                     "premium_evidence": premium_evidence,
                     "error": None if has_page else "empty_profile_page",
                 }
