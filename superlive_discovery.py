@@ -9,6 +9,7 @@ paywalls, access controls, or DRM. Website URL patterns and markup may change.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -322,12 +323,22 @@ class SuperLiveDiscovery:
                 # Prefer inputs that actually look like the site's search field. Do not
                 # silently assume the first generic input is the search box (it may be
                 # a login/newsletter field). Fall back to visible text inputs only.
+                # Record the actual rendered controls first. This is important because
+                # the site's search widget may use type=number/tel or a framework
+                # component rather than input[type=text].
+                try:
+                    control_snapshot = await page.locator("input, textarea, [role=searchbox], button").evaluate_all("""els => els.slice(0,80).map(el => ({tag:el.tagName.toLowerCase(), type:el.getAttribute('type')||'', name:el.getAttribute('name')||'', placeholder:el.getAttribute('placeholder')||'', aria:el.getAttribute('aria-label')||'', role:el.getAttribute('role')||'', text:(el.innerText||el.value||'').trim().slice(0,100), visible:!!(el.getClientRects().length)}))""")
+                    self.log.info("Search controls for key %s: %s", raw, json.dumps(control_snapshot, ensure_ascii=False)[:5000])
+                except PlaywrightError:
+                    pass
                 selectors = (
                     "input[type=search]", "input[name=search]", "input[name=query]",
                     "input[name=q]", "input[name=keyword]", "input[name=term]",
                     "input[placeholder*='search' i]", "input[placeholder*='recherch' i]",
                     "input[placeholder*='ID' i]", "input[aria-label*='search' i]",
                     "input[aria-label*='recherch' i]", "input[type=text]",
+                    "input:not([type=hidden]):not([type=password]):not([type=email]):not([type=checkbox]):not([type=radio])",
+                    "textarea", "[role=searchbox]",
                 )
                 for selector in selectors:
                     try:
