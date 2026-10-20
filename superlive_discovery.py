@@ -27,7 +27,7 @@ except ImportError as exc:  # clear actionable message rather than obscure impor
         "then run: playwright install chromium"
     ) from exc
 
-VERSION = "11.1"
+VERSION = "11.2"
 DEFAULT_BASE_URL = "https://superlivetv.com"
 DEFAULT_LOCALE = "fr"
 LOG = logging.getLogger("SuperLiveDiscovery")
@@ -78,6 +78,9 @@ class SuperLiveDiscovery:
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self._start_lock = asyncio.Lock()
+        # Playwright Page is not safe for concurrent navigations. auto_monitor.py
+        # runs multiple users concurrently, so serialize operations that use it.
+        self._operation_lock = asyncio.Lock()
 
     async def open(self) -> "SuperLiveDiscovery":
         async with self._start_lock:
@@ -211,6 +214,14 @@ class SuperLiveDiscovery:
         return bool((route_match or legacy_match) and not error and has_content)
 
     async def discover_profile_id(self, user_id: Any) -> dict[str, Any]:
+        """Resolve an account ID to a public profile URL.
+
+        The shared Playwright page is protected from concurrent navigation races.
+        """
+        async with self._operation_lock:
+            return await self._discover_profile_id_unlocked(user_id)
+
+    async def _discover_profile_id_unlocked(self, user_id: Any) -> dict[str, Any]:
         """Resolve an account ID to a public profile URL.
 
         For SuperLive numeric IDs, the canonical URL is /fr/profile/{id}.
@@ -378,7 +389,111 @@ class SuperLiveDiscovery:
         evidence = [term for term in self.PREMIUM_TERMS if term in text]
         return bool(evidence), evidence
 
+    async def check_live_status(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Compatibility API used by auto_monitor.py to inspect a profile.
+
+        Accepts a profile URL or user ID positionally, or common keyword names
+        (profile_url, url, user_id, username). Returns a stable dictionary rather
+        than raising when a page cannot be inspected.
+        """
+        profile_url = str(kwargs.get("profile_url") or kwargs.get("url") or kwargs.get("profile") or "").strip()
+        user_id = str(kwargs.get("user_id") or kwargs.get("username") or kwargs.get("profile_id") or "").strip()
+        for value in args:
+            if not isinstance(value, (str, int)):
+                continue
+            text = str(value).strip()
+            if text.startswith(("https://", "http://")) and not profile_url:
+                profile_url = text
+            elif text and not user_id:
+                user_id = text
+        if not profile_url and user_id:
+            resolved = await self.discover_profile_id(user_id)
+            profile_url = str(resolved.get("profile_url") or "")
+            if not profile_url:
+                return {
+                    "success": False, "ok": False, "user_id": user_id,
+                    "profile_url": None, "is_live": False, "is_premium": False,
+                    "stream_url": None, "stream_id": None,
+                    "error": resolved.get("error") or "profile_not_found",
+                    "live_evidence": [], "premium_evidence": [],
+                }
+        if not profile_url or not self._same_site(profile_url):
+            return {
+                "success": False, "ok": False, "user_id": user_id or None,
+                "profile_url": profile_url or None, "is_live": False,
+                "is_premium": False, "stream_url": None, "stream_id": None,
+                "error": "missing_or_external_profile_url",
+                "live_evidence": [], "premium_evidence": [],
+            }
+
+        async with self._operation_lock:
+            try:
+                if not await self._goto(profile_url):
+                    return {
+                        "success": False, "ok": False, "user_id": user_id or None,
+                        "profile_url": profile_url, "is_live": False,
+                        "is_premium": False, "stream_url": None, "stream_id": None,
+                        "error": "profile_navigation_failed",
+                        "live_evidence": [], "premium_evidence": [],
+                    }
+                page = await self._page()
+                current_url = self._norm_url(page.url)
+                title = await self._title(page)
+                text = await self._text(page)
+                live, live_evidence = await self.is_live_page(page)
+                premium, premium_evidence = await self.detect_premium(page)
+                # Profile pages often link to their active livestream. Collect only
+                # canonical livestream routes; a link alone is not treated as proof
+                # that the stream is live unless the page itself gives live evidence.
+                stream_url = None
+                stream_id = None
+                try:
+                    links = await page.locator("a[href]").evaluate_all(
+                        "els => els.slice(0,1500).map(a => a.href)"
+                    )
+                    candidates = []
+                    for link in links:
+                        absolute = self._norm_url(str(link or ""))
+                        if not self._same_site(absolute):
+                            continue
+                        path = urlparse(absolute).path
+                        match = re.search(r"/livestream/([A-Za-z0-9_-]+)(?:/|$)", path, re.I)
+                        if match and absolute not in candidates:
+                            candidates.append(absolute)
+                    if candidates:
+                        stream_url = candidates[0]
+                        m = re.search(r"/livestream/([A-Za-z0-9_-]+)(?:/|$)", urlparse(stream_url).path, re.I)
+                        stream_id = m.group(1) if m else None
+                except PlaywrightError:
+                    pass
+                # Avoid treating a generic loaded page as a successful live check.
+                has_page = bool(current_url and (title or text))
+                return {
+                    "success": has_page, "ok": has_page,
+                    "user_id": user_id or self._slug(urlparse(current_url).path.rsplit("/", 1)[-1]),
+                    "profile_url": current_url, "is_live": bool(live),
+                    "live": bool(live), "status": "live" if live else "not_live_or_unconfirmed",
+                    "is_premium": bool(premium), "premium": bool(premium),
+                    "stream_url": stream_url, "stream_id": stream_id,
+                    "title": title, "live_evidence": live_evidence,
+                    "premium_evidence": premium_evidence,
+                    "error": None if has_page else "empty_profile_page",
+                }
+            except Exception as exc:
+                self.log.warning("Live-status check failed for %s: %s", profile_url, exc)
+                return {
+                    "success": False, "ok": False, "user_id": user_id or None,
+                    "profile_url": profile_url, "is_live": False,
+                    "is_premium": False, "stream_url": None, "stream_id": None,
+                    "error": f"inspection_error:{type(exc).__name__}",
+                    "live_evidence": [], "premium_evidence": [],
+                }
+
     async def inspect_url(self, url: str, fallback_username: str = "") -> dict[str, Any]:
+        async with self._operation_lock:
+            return await self._inspect_url_unlocked(url, fallback_username)
+
+    async def _inspect_url_unlocked(self, url: str, fallback_username: str = "") -> dict[str, Any]:
         if not self._same_site(url):
             return {"success": False, "ok": False, "error": "external_url_rejected", "stream_url": url}
         if not await self._goto(url):
