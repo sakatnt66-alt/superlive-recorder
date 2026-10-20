@@ -27,7 +27,7 @@ except ImportError as exc:  # clear actionable message rather than obscure impor
         "then run: playwright install chromium"
     ) from exc
 
-VERSION = "11.2"
+VERSION = "11.1"
 DEFAULT_BASE_URL = "https://superlivetv.com"
 DEFAULT_LOCALE = "fr"
 LOG = logging.getLogger("SuperLiveDiscovery")
@@ -78,9 +78,6 @@ class SuperLiveDiscovery:
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self._start_lock = asyncio.Lock()
-        # Playwright Page is not safe for concurrent navigations. auto_monitor.py
-        # runs multiple users concurrently, so serialize operations that use it.
-        self._operation_lock = asyncio.Lock()
 
     async def open(self) -> "SuperLiveDiscovery":
         async with self._start_lock:
@@ -155,16 +152,14 @@ class SuperLiveDiscovery:
         for attempt in range(self.retries + 1):
             try:
                 response = await page.goto(url, wait_until="domcontentloaded", timeout=self.navigation_timeout_ms)
-                # Treat 4xx/5xx as failed navigation. In particular, a branded 404
-                # page can still contain text and must never be accepted as a profile.
-                if response is not None and response.status >= 400:
-                    self.log.debug("HTTP %s while opening %s", response.status, url)
-                    return False
+                # HTTP errors are not automatically fatal: some sites render useful challenge/error pages.
+                if response is not None and response.status >= 500:
+                    self.log.warning("HTTP %s while opening %s", response.status, url)
                 try:
                     await page.wait_for_load_state("networkidle", timeout=min(2500, self.timeout_ms))
                 except PlaywrightTimeoutError:
                     pass
-                return True
+                return response is None or response.status < 500
             except PlaywrightTimeoutError:
                 self.log.debug("Navigation timeout (%d/%d): %s", attempt + 1, self.retries + 1, url)
             except PlaywrightError as exc:
@@ -210,28 +205,12 @@ class SuperLiveDiscovery:
         )
         excerpt = (title + " " + text[:3500]).lower()
         error = any(term in excerpt for term in self.ERROR_TERMS)
+        # A valid SPA profile may have a blank title; require rendered body text or
+        # a recognizable profile route. Do not require the ID to be repeated in text.
         has_content = bool(title.strip() or text.strip())
         return bool((route_match or legacy_match) and not error and has_content)
 
-    @staticmethod
-    def _is_public_profile_route(url: str) -> bool:
-        """Recognize both /fr/profile/52275791 and /fr/nina1 profile routes."""
-        path = urlparse(url).path.lower().rstrip("/")
-        segments = [segment for segment in path.split("/") if segment]
-        if len(segments) >= 3 and segments[-2] == "profile":
-            return True
-        reserved = {"discover", "search", "livestream", "login", "signup", "register", "settings", "notifications"}
-        return len(segments) == 2 and segments[0] in {"fr", "en", "ar"} and segments[1] not in reserved
-
     async def discover_profile_id(self, user_id: Any) -> dict[str, Any]:
-        """Resolve an account ID to a public profile URL.
-
-        The shared Playwright page is protected from concurrent navigation races.
-        """
-        async with self._operation_lock:
-            return await self._discover_profile_id_unlocked(user_id)
-
-    async def _discover_profile_id_unlocked(self, user_id: Any) -> dict[str, Any]:
         """Resolve an account ID to a public profile URL.
 
         For SuperLive numeric IDs, the canonical URL is /fr/profile/{id}.
@@ -258,18 +237,16 @@ class SuperLiveDiscovery:
             encoded = quote(username, safe="")
             # Canonical route first; include the locale and discover/search routes
             # used by the live site, followed by conservative legacy fallbacks.
-            # Numeric IDs supplied by Telegram are search keys, NOT necessarily
-            # SuperLive profile IDs. Never infer /profile/{input_id} for numeric input.
-            # Resolve those through the site's own search results first.
-            if username.isdigit():
-                candidates = []
-            else:
-                candidates = [
-                    f"{self.base_url}/fr/{encoded}?isFromSearch=true",
-                    f"{self.base_url}/fr/{encoded}",
-                    f"{self.base_url}/en/{encoded}?isFromSearch=true",
-                    f"{self.base_url}/en/{encoded}",
-                ]
+            candidates = [
+                f"{self.base_url}/fr/profile/{encoded}",
+                f"{self.base_url}/en/profile/{encoded}",
+                f"{self.base_url}/profile/{encoded}",
+                f"{self.base_url}/fr/user/{encoded}",
+                f"{self.base_url}/user/{encoded}",
+                f"{self.base_url}/users/{encoded}",
+                f"{self.base_url}/@{encoded}",
+                f"{self.base_url}/{encoded}",
+            ]
 
         page = await self._page()
         seen: set[str] = set()
@@ -301,118 +278,46 @@ class SuperLiveDiscovery:
             })
             return result
 
-        # Search-driven resolution. Numeric Telegram IDs can map to a different
-        # platform profile ID (e.g. 21421785 -> /fr/profile/19868298). Therefore
-        # the identity evidence is the result returned by the site's own search,
-        # not equality between the input ID and the profile URL.
+        # Search fallback: inspect same-site profile links. The site's search page
+        # may be a client-rendered SPA, so try its real /fr/search route as well.
         search_urls = [
-            f"{self.base_url}/fr/search",
-            f"{self.base_url}/en/search",
-            f"{self.base_url}/fr/search?query={quote(username, safe='')}",
             f"{self.base_url}/fr/search?q={quote(username, safe='')}",
-            f"{self.base_url}/fr/search?search={quote(username, safe='')}",
-            f"{self.base_url}/fr/search?keyword={quote(username, safe='')}",
+            f"{self.base_url}/fr/search?query={quote(username, safe='')}",
             f"{self.base_url}/search?q={quote(username, safe='')}",
         ]
-        inspected: set[str] = set()
         for search_url in search_urls:
             if not await self._goto(search_url):
                 continue
-            # The public search page may require using its client-side form; URL
-            # query parameters alone are not assumed to be supported.
-            submitted = False
-            if urlparse(search_url).path.rstrip("/").endswith("/search") and not urlparse(search_url).query:
-                for selector in (
-                    "input[type=search]", "input[name=search]", "input[name=query]",
-                    "input[name=q]", "input[placeholder*='search' i]",
-                    "input[placeholder*='recherch' i]", "input[placeholder*='ID' i]",
-                    "input:not([type=hidden]):not([type=checkbox])",
-                ):
-                    try:
-                        field = page.locator(selector).first
-                        if await field.count() and await field.is_visible():
-                            await field.fill(raw)
-                            await field.press("Enter")
-                            try:
-                                await page.wait_for_load_state("networkidle", timeout=2500)
-                            except PlaywrightTimeoutError:
-                                pass
-                            await page.wait_for_timeout(700)
-                            submitted = True
-                            break
-                    except PlaywrightError:
-                        continue
             try:
-                links = await page.locator("a[href]").evaluate_all("""els => els.slice(0,2000).map(a => {
-                    let n = a, card = '';
-                    for (let i=0; i<5 && n; i++, n=n.parentElement) {
-                      const t = (n.innerText || n.textContent || '').trim();
-                      if (t.length >= 2 && t.length <= 1200) { card = t; if (i >= 1) break; }
-                    }
-                    return {href:a.href, text:(a.innerText||a.textContent||'').trim(), card};
-                })""")
+                links = await page.locator("a[href]").evaluate_all(
+                    "els => els.slice(0,1000).map(a => ({href:a.href, text:(a.innerText||a.textContent||'').trim()}))"
+                )
             except PlaywrightError:
                 continue
             for item in links:
-                href = str(item.get("href", "")).strip()
-                label = self._clean(str(item.get("text", ""))).lower()
-                card_text = self._clean(str(item.get("card", "")))
+                href = self._norm_url(str(item.get("href", "")))
+                label = str(item.get("text", "")).lower()
                 if not href or not self._same_site(href):
                     continue
-                href = self._norm_url(href)
-                if href in inspected or not self._is_public_profile_route(href):
-                    continue
-                inspected.add(href)
-                candidate_path = urlparse(href).path.lower().rstrip("/")
-                candidate_slug = candidate_path.rsplit("/", 1)[-1]
-                # Reject obvious navigation links; prefer links attached to an actual
-                # result card. If search submission ran, the returned profile links
-                # are treated as candidates even when their numeric ID differs.
-                if candidate_slug in {"profile", "search", "discover", "login", "signup"}:
-                    continue
-                card_lower = card_text.lower()
-                result_card_evidence = bool(card_text and len(card_text) > len(label) and (
-                    submitted or username.lower() in card_lower or label
-                ))
-                direct_identity_match = (
-                    candidate_slug == username.lower()
-                    or username.lower() in label
-                    or username.lower() in card_lower
-                    or (submitted and result_card_evidence)
-                )
-                if not direct_identity_match:
+                path = urlparse(href).path.lower().rstrip("/")
+                is_profile_route = bool(re.search(r"/profile/" + re.escape(username.lower()) + r"$", path))
+                identity_match = username.lower() in label or is_profile_route
+                if not identity_match:
                     continue
                 if not await self._goto(href):
                     continue
                 current = self._norm_url(page.url)
                 text = await self._text(page)
                 title = await self._title(page)
-                excerpt = (title + " " + text[:3500]).lower()
-                if any(term in excerpt for term in self.ERROR_TERMS):
-                    continue
-                if not self._is_public_profile_route(current) or not (title or text):
-                    continue
-                # A profile reached from the platform's filtered search result is
-                # the mapping. Keep input_id and platform profile_id separate.
-                profile_id = await self._extract_profile_id(page, "")
-                match = re.search(r"/profile/([^/]+)$", urlparse(current).path, re.I)
-                route_profile_id = match.group(1) if match else candidate_slug
-                if not profile_id:
-                    profile_id = route_profile_id
-                self.log.info(
-                    "Resolved watchlist key %s to profile %s via site search (%s)",
-                    raw, profile_id, current,
-                )
-                result.update({
-                    "success": True, "ok": True,
-                    "profile_id": profile_id,
-                    "username": candidate_slug,
-                    "profile_url": current,
-                    "profile_id_source": "site_search_result",
-                    "input_user_id": raw,
-                    "error": None,
-                })
-                return result
+                if await self._looks_profile(username, current, title, text):
+                    profile_id = await self._extract_profile_id(page, username)
+                    result.update({
+                        "success": True, "ok": True, "profile_id": profile_id,
+                        "profile_url": current,
+                        "profile_id_source": "page_metadata" if profile_id != username else "url_or_input",
+                        "error": None,
+                    })
+                    return result
 
         result["error"] = "public_profile_not_found_or_site_structure_changed"
         return result
@@ -473,131 +378,7 @@ class SuperLiveDiscovery:
         evidence = [term for term in self.PREMIUM_TERMS if term in text]
         return bool(evidence), evidence
 
-    async def check_live_status(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """Compatibility API used by auto_monitor.py to inspect a profile.
-
-        Accepts a profile URL or user ID positionally, or common keyword names
-        (profile_url, url, user_id, username). Returns a stable dictionary rather
-        than raising when a page cannot be inspected.
-        """
-        profile_url = str(kwargs.get("profile_url") or kwargs.get("url") or kwargs.get("profile") or "").strip()
-        user_id = str(kwargs.get("user_id") or kwargs.get("username") or kwargs.get("profile_id") or "").strip()
-        for value in args:
-            if not isinstance(value, (str, int)):
-                continue
-            text = str(value).strip()
-            if text.startswith(("https://", "http://")) and not profile_url:
-                profile_url = text
-            elif text and not user_id:
-                user_id = text
-        if not profile_url and user_id:
-            resolved = await self.discover_profile_id(user_id)
-            profile_url = str(resolved.get("profile_url") or "")
-            if not profile_url:
-                return {
-                    "success": False, "ok": False, "user_id": user_id,
-                    "profile_url": None, "is_live": False, "is_premium": False,
-                    "stream_url": None, "stream_id": None,
-                    "error": resolved.get("error") or "profile_not_found",
-                    "live_evidence": [], "premium_evidence": [],
-                }
-        if not profile_url or not self._same_site(profile_url):
-            return {
-                "success": False, "ok": False, "user_id": user_id or None,
-                "profile_url": profile_url or None, "is_live": False,
-                "is_premium": False, "stream_url": None, "stream_id": None,
-                "error": "missing_or_external_profile_url",
-                "live_evidence": [], "premium_evidence": [],
-            }
-
-        async with self._operation_lock:
-            try:
-                if not await self._goto(profile_url):
-                    return {
-                        "success": False, "ok": False, "user_id": user_id or None,
-                        "profile_url": profile_url, "is_live": False,
-                        "is_premium": False, "stream_url": None, "stream_id": None,
-                        "error": "profile_navigation_failed",
-                        "live_evidence": [], "premium_evidence": [],
-                    }
-                page = await self._page()
-                current_url = self._norm_url(page.url)
-                title = await self._title(page)
-                text = await self._text(page)
-                live, live_evidence = await self.is_live_page(page)
-                premium, premium_evidence = await self.detect_premium(page)
-                # Profile pages often link to their active livestream. Collect only
-                # canonical livestream routes; a link alone is not treated as proof
-                # that the stream is live unless the page itself gives live evidence.
-                stream_url = None
-                stream_id = None
-                try:
-                    links = await page.locator("a[href]").evaluate_all(
-                        "els => els.slice(0,1500).map(a => a.href)"
-                    )
-                    candidates = []
-                    for link in links:
-                        absolute = self._norm_url(str(link or ""))
-                        if not self._same_site(absolute):
-                            continue
-                        path = urlparse(absolute).path
-                        match = re.search(r"/livestream/([A-Za-z0-9_-]+)(?:/|$)", path, re.I)
-                        if match and absolute not in candidates:
-                            candidates.append(absolute)
-                    if candidates:
-                        stream_url = candidates[0]
-                        m = re.search(r"/livestream/([A-Za-z0-9_-]+)(?:/|$)", urlparse(stream_url).path, re.I)
-                        stream_id = m.group(1) if m else None
-                except PlaywrightError:
-                    pass
-                # If the profile itself does not prove a live stream, inspect the
-                # discovered livestream page too. A link alone is not proof of live.
-                stream_title = ""
-                if stream_url and not live:
-                    try:
-                        if await self._goto(stream_url):
-                            stream_page = await self._page()
-                            stream_title = await self._title(stream_page)
-                            stream_live, stream_evidence = await self.is_live_page(stream_page)
-                            stream_premium, stream_premium_evidence = await self.detect_premium(stream_page)
-                            if stream_live:
-                                live = True
-                                live_evidence = ["livestream_page"] + stream_evidence
-                            if stream_premium:
-                                premium = True
-                                premium_evidence = stream_premium_evidence
-                    except Exception as stream_exc:
-                        self.log.debug("Livestream page inspection failed for %s: %s", stream_url, stream_exc)
-
-                # Avoid treating a generic loaded page as a successful live check.
-                has_page = bool(current_url and (title or text))
-                return {
-                    "success": has_page, "ok": has_page,
-                    "user_id": user_id or self._slug(urlparse(current_url).path.rsplit("/", 1)[-1]),
-                    "profile_url": current_url, "is_live": bool(live),
-                    "live": bool(live), "status": "live" if live else "not_live_or_unconfirmed",
-                    "is_premium": bool(premium), "premium": bool(premium),
-                    "stream_url": stream_url, "stream_id": stream_id,
-                    "title": title, "stream_title": stream_title,
-                    "live_evidence": live_evidence,
-                    "premium_evidence": premium_evidence,
-                    "error": None if has_page else "empty_profile_page",
-                }
-            except Exception as exc:
-                self.log.warning("Live-status check failed for %s: %s", profile_url, exc)
-                return {
-                    "success": False, "ok": False, "user_id": user_id or None,
-                    "profile_url": profile_url, "is_live": False,
-                    "is_premium": False, "stream_url": None, "stream_id": None,
-                    "error": f"inspection_error:{type(exc).__name__}",
-                    "live_evidence": [], "premium_evidence": [],
-                }
-
     async def inspect_url(self, url: str, fallback_username: str = "") -> dict[str, Any]:
-        async with self._operation_lock:
-            return await self._inspect_url_unlocked(url, fallback_username)
-
-    async def _inspect_url_unlocked(self, url: str, fallback_username: str = "") -> dict[str, Any]:
         if not self._same_site(url):
             return {"success": False, "ok": False, "error": "external_url_rejected", "stream_url": url}
         if not await self._goto(url):
