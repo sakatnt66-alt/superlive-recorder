@@ -27,8 +27,9 @@ except ImportError as exc:  # clear actionable message rather than obscure impor
         "then run: playwright install chromium"
     ) from exc
 
-VERSION = "11.0"
+VERSION = "11.1"
 DEFAULT_BASE_URL = "https://superlivetv.com"
+DEFAULT_LOCALE = "fr"
 LOG = logging.getLogger("SuperLiveDiscovery")
 
 
@@ -182,22 +183,38 @@ class SuperLiveDiscovery:
             return ""
 
     async def _looks_profile(self, username: str, url: str, title: str, text: str) -> bool:
-        path = urlparse(url).path.lower().strip("/")
-        user = username.lower()
-        path_match = (path == user or path.endswith("/" + user) or path.endswith("/@" + user)
-                      or f"/user/{user}" in path or f"/users/{user}" in path or f"/profile/{user}" in path)
-        excerpt = (title + " " + text[:2500]).lower()
-        identity_match = user in excerpt
-        error = any(term in text[:3000].lower() for term in self.ERROR_TERMS)
-        return bool(path_match and identity_match and not error)
+        """Validate a profile page without requiring the numeric ID in visible text.
+
+        SuperLive pages are client-rendered and numeric account IDs often appear in
+        the URL but not in the visible text. The route is therefore accepted when
+        it matches /{locale}/profile/{id}, provided the page is not an obvious error
+        page and contains some rendered content.
+        """
+        parsed = urlparse(url)
+        path = parsed.path.lower().rstrip("/")
+        user = str(username or "").lower()
+        segments = [segment for segment in path.split("/") if segment]
+        route_match = bool(
+            len(segments) >= 3
+            and segments[-2] == "profile"
+            and segments[-1] == user
+        )
+        legacy_match = bool(
+            path == user or path.endswith("/" + user) or path.endswith("/@" + user)
+            or f"/user/{user}" in path or f"/users/{user}" in path
+        )
+        excerpt = (title + " " + text[:3500]).lower()
+        error = any(term in excerpt for term in self.ERROR_TERMS)
+        # A valid SPA profile may have a blank title; require rendered body text or
+        # a recognizable profile route. Do not require the ID to be repeated in text.
+        has_content = bool(title.strip() or text.strip())
+        return bool((route_match or legacy_match) and not error and has_content)
 
     async def discover_profile_id(self, user_id: Any) -> dict[str, Any]:
-        """Resolve a username/user identifier to a public profile.
+        """Resolve an account ID to a public profile URL.
 
-        Returns a stable dictionary with success, user_id, profile_id, username,
-        profile_url, and error. profile_id is extracted from public page metadata
-        when possible; otherwise the normalized username is used only as an
-        identifier fallback and is marked with profile_id_source='username'.
+        For SuperLive numeric IDs, the canonical URL is /fr/profile/{id}.
+        The return shape is intentionally stable for auto_monitor.py callers.
         """
         raw = str(user_id or "").strip()
         username = self._slug(raw)
@@ -210,63 +227,98 @@ class SuperLiveDiscovery:
             result["error"] = "empty_or_invalid_user_id"
             return result
 
-        candidates = [
-            f"{self.base_url}/{quote(username)}",
-            f"{self.base_url}/user/{quote(username)}",
-            f"{self.base_url}/users/{quote(username)}",
-            f"{self.base_url}/profile/{quote(username)}",
-            f"{self.base_url}/@{quote(username)}",
-        ]
-        # Also allow callers to pass a URL, but only visit same-site URLs.
+        # If the watchlist already contains a full URL, accept it only on this site.
         if raw.startswith(("https://", "http://")):
-            if self._same_site(raw):
-                candidates.insert(0, raw)
-            else:
+            if not self._same_site(raw):
                 result["error"] = "external_url_rejected"
                 return result
+            candidates = [raw]
+        else:
+            encoded = quote(username, safe="")
+            # Canonical route first; include the locale and discover/search routes
+            # used by the live site, followed by conservative legacy fallbacks.
+            candidates = [
+                f"{self.base_url}/fr/profile/{encoded}",
+                f"{self.base_url}/en/profile/{encoded}",
+                f"{self.base_url}/profile/{encoded}",
+                f"{self.base_url}/fr/user/{encoded}",
+                f"{self.base_url}/user/{encoded}",
+                f"{self.base_url}/users/{encoded}",
+                f"{self.base_url}/@{encoded}",
+                f"{self.base_url}/{encoded}",
+            ]
 
         page = await self._page()
         seen: set[str] = set()
         for candidate in candidates:
             candidate = self._norm_url(candidate)
-            if candidate in seen:
+            if candidate in seen or not self._same_site(candidate):
                 continue
             seen.add(candidate)
             if not await self._goto(candidate):
                 continue
             current = self._norm_url(page.url)
+            # Redirects to login, discover, or search are not profile success.
+            if not self._same_site(current):
+                continue
+            current_path = urlparse(current).path.lower().rstrip("/")
+            requested_path = urlparse(candidate).path.lower().rstrip("/")
             text = await self._text(page)
             title = await self._title(page)
+            if current_path != requested_path and not await self._looks_profile(username, current, title, text):
+                continue
             if not await self._looks_profile(username, current, title, text):
                 continue
             profile_id = await self._extract_profile_id(page, username)
-            result.update({"success": True, "ok": True, "profile_id": profile_id,
-                           "username": username, "profile_url": current,
-                           "profile_id_source": "page_metadata" if profile_id != username else "username",
-                           "error": None})
+            result.update({
+                "success": True, "ok": True, "profile_id": profile_id,
+                "username": username, "profile_url": current,
+                "profile_id_source": "page_metadata" if profile_id != username else "url_or_input",
+                "error": None,
+            })
             return result
 
-        # Last-chance public search pages; never accept arbitrary external links.
-        for search_url in (f"{self.base_url}/search?q={quote(username)}", f"{self.base_url}/search/{quote(username)}"):
+        # Search fallback: inspect same-site profile links. The site's search page
+        # may be a client-rendered SPA, so try its real /fr/search route as well.
+        search_urls = [
+            f"{self.base_url}/fr/search?q={quote(username, safe='')}",
+            f"{self.base_url}/fr/search?query={quote(username, safe='')}",
+            f"{self.base_url}/search?q={quote(username, safe='')}",
+        ]
+        for search_url in search_urls:
             if not await self._goto(search_url):
                 continue
             try:
-                links = await page.locator("a[href]").evaluate_all("els => els.slice(0,500).map(a => ({href:a.href, text:(a.innerText||a.textContent||'').trim()}))")
+                links = await page.locator("a[href]").evaluate_all(
+                    "els => els.slice(0,1000).map(a => ({href:a.href, text:(a.innerText||a.textContent||'').trim()}))"
+                )
             except PlaywrightError:
                 continue
             for item in links:
                 href = self._norm_url(str(item.get("href", "")))
                 label = str(item.get("text", "")).lower()
-                if href and self._same_site(href) and username.lower() in (label + " " + urlparse(href).path.lower()):
-                    if await self._goto(href):
-                        current = self._norm_url(page.url)
-                        text = await self._text(page)
-                        title = await self._title(page)
-                        if await self._looks_profile(username, current, title, text):
-                            profile_id = await self._extract_profile_id(page, username)
-                            result.update({"success": True, "ok": True, "profile_id": profile_id,
-                                           "profile_url": current, "profile_id_source": "page_metadata" if profile_id != username else "username", "error": None})
-                            return result
+                if not href or not self._same_site(href):
+                    continue
+                path = urlparse(href).path.lower().rstrip("/")
+                is_profile_route = bool(re.search(r"/profile/" + re.escape(username.lower()) + r"$", path))
+                identity_match = username.lower() in label or is_profile_route
+                if not identity_match:
+                    continue
+                if not await self._goto(href):
+                    continue
+                current = self._norm_url(page.url)
+                text = await self._text(page)
+                title = await self._title(page)
+                if await self._looks_profile(username, current, title, text):
+                    profile_id = await self._extract_profile_id(page, username)
+                    result.update({
+                        "success": True, "ok": True, "profile_id": profile_id,
+                        "profile_url": current,
+                        "profile_id_source": "page_metadata" if profile_id != username else "url_or_input",
+                        "error": None,
+                    })
+                    return result
+
         result["error"] = "public_profile_not_found_or_site_structure_changed"
         return result
 
@@ -358,7 +410,7 @@ class SuperLiveDiscovery:
                 if absolute and (not same_site_only or self._same_site(absolute)) and absolute not in targets:
                     targets.append(absolute)
         else:
-            if not await self._goto(self.base_url):
+            if not await self._goto(f"{self.base_url}/fr/discover"):
                 return []
             try:
                 links = await page.locator("a[href]").evaluate_all("els => els.slice(0,1000).map(a => a.href)")
