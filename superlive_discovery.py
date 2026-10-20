@@ -258,18 +258,18 @@ class SuperLiveDiscovery:
             encoded = quote(username, safe="")
             # Canonical route first; include the locale and discover/search routes
             # used by the live site, followed by conservative legacy fallbacks.
-            candidates = [
-                f"{self.base_url}/fr/profile/{encoded}?isFromSearch=true",
-                f"{self.base_url}/fr/profile/{encoded}",
-                f"{self.base_url}/en/profile/{encoded}?isFromSearch=true",
-                f"{self.base_url}/en/profile/{encoded}",
-                f"{self.base_url}/profile/{encoded}",
-                f"{self.base_url}/fr/user/{encoded}",
-                f"{self.base_url}/user/{encoded}",
-                f"{self.base_url}/users/{encoded}",
-                f"{self.base_url}/@{encoded}",
-                f"{self.base_url}/{encoded}",
-            ]
+            # Numeric IDs supplied by Telegram are search keys, NOT necessarily
+            # SuperLive profile IDs. Never infer /profile/{input_id} for numeric input.
+            # Resolve those through the site's own search results first.
+            if username.isdigit():
+                candidates = []
+            else:
+                candidates = [
+                    f"{self.base_url}/fr/{encoded}?isFromSearch=true",
+                    f"{self.base_url}/fr/{encoded}",
+                    f"{self.base_url}/en/{encoded}?isFromSearch=true",
+                    f"{self.base_url}/en/{encoded}",
+                ]
 
         page = await self._page()
         seen: set[str] = set()
@@ -301,10 +301,13 @@ class SuperLiveDiscovery:
             })
             return result
 
-        # Search fallback: search results may point to either /fr/profile/{id}
-        # or a username route such as /fr/nina1?isFromSearch=true. Do not match
-        # only visible link text: numeric watchlist IDs often differ from usernames.
+        # Search-driven resolution. Numeric Telegram IDs can map to a different
+        # platform profile ID (e.g. 21421785 -> /fr/profile/19868298). Therefore
+        # the identity evidence is the result returned by the site's own search,
+        # not equality between the input ID and the profile URL.
         search_urls = [
+            f"{self.base_url}/fr/search",
+            f"{self.base_url}/en/search",
             f"{self.base_url}/fr/search?query={quote(username, safe='')}",
             f"{self.base_url}/fr/search?q={quote(username, safe='')}",
             f"{self.base_url}/fr/search?search={quote(username, safe='')}",
@@ -315,15 +318,45 @@ class SuperLiveDiscovery:
         for search_url in search_urls:
             if not await self._goto(search_url):
                 continue
+            # The public search page may require using its client-side form; URL
+            # query parameters alone are not assumed to be supported.
+            submitted = False
+            if urlparse(search_url).path.rstrip("/").endswith("/search") and not urlparse(search_url).query:
+                for selector in (
+                    "input[type=search]", "input[name=search]", "input[name=query]",
+                    "input[name=q]", "input[placeholder*='search' i]",
+                    "input[placeholder*='recherch' i]", "input[placeholder*='ID' i]",
+                    "input:not([type=hidden]):not([type=checkbox])",
+                ):
+                    try:
+                        field = page.locator(selector).first
+                        if await field.count() and await field.is_visible():
+                            await field.fill(raw)
+                            await field.press("Enter")
+                            try:
+                                await page.wait_for_load_state("networkidle", timeout=2500)
+                            except PlaywrightTimeoutError:
+                                pass
+                            await page.wait_for_timeout(700)
+                            submitted = True
+                            break
+                    except PlaywrightError:
+                        continue
             try:
-                links = await page.locator("a[href]").evaluate_all(
-                    "els => els.slice(0,1500).map(a => ({href:a.href, text:(a.innerText||a.textContent||'').trim()}))"
-                )
+                links = await page.locator("a[href]").evaluate_all("""els => els.slice(0,2000).map(a => {
+                    let n = a, card = '';
+                    for (let i=0; i<5 && n; i++, n=n.parentElement) {
+                      const t = (n.innerText || n.textContent || '').trim();
+                      if (t.length >= 2 && t.length <= 1200) { card = t; if (i >= 1) break; }
+                    }
+                    return {href:a.href, text:(a.innerText||a.textContent||'').trim(), card};
+                })""")
             except PlaywrightError:
                 continue
             for item in links:
                 href = str(item.get("href", "")).strip()
                 label = self._clean(str(item.get("text", ""))).lower()
+                card_text = self._clean(str(item.get("card", "")))
                 if not href or not self._same_site(href):
                     continue
                 href = self._norm_url(href)
@@ -332,9 +365,23 @@ class SuperLiveDiscovery:
                 inspected.add(href)
                 candidate_path = urlparse(href).path.lower().rstrip("/")
                 candidate_slug = candidate_path.rsplit("/", 1)[-1]
-                # A direct username match is safe. For numeric account IDs, require
-                # the profile page's embedded metadata to identify the requested ID.
-                direct_identity_match = candidate_slug == username.lower() or username.lower() in label
+                # Reject obvious navigation links; prefer links attached to an actual
+                # result card. If search submission ran, the returned profile links
+                # are treated as candidates even when their numeric ID differs.
+                if candidate_slug in {"profile", "search", "discover", "login", "signup"}:
+                    continue
+                card_lower = card_text.lower()
+                result_card_evidence = bool(card_text and len(card_text) > len(label) and (
+                    submitted or username.lower() in card_lower or label
+                ))
+                direct_identity_match = (
+                    candidate_slug == username.lower()
+                    or username.lower() in label
+                    or username.lower() in card_lower
+                    or (submitted and result_card_evidence)
+                )
+                if not direct_identity_match:
+                    continue
                 if not await self._goto(href):
                     continue
                 current = self._norm_url(page.url)
@@ -345,17 +392,24 @@ class SuperLiveDiscovery:
                     continue
                 if not self._is_public_profile_route(current) or not (title or text):
                     continue
+                # A profile reached from the platform's filtered search result is
+                # the mapping. Keep input_id and platform profile_id separate.
                 profile_id = await self._extract_profile_id(page, "")
-                path_id_match = bool(re.search(r"/profile/" + re.escape(username.lower()) + r"/?$", urlparse(current).path.lower()))
-                metadata_match = bool(profile_id and profile_id.lower() == username.lower())
-                if not (direct_identity_match or path_id_match or metadata_match):
-                    continue
+                match = re.search(r"/profile/([^/]+)$", urlparse(current).path, re.I)
+                route_profile_id = match.group(1) if match else candidate_slug
+                if not profile_id:
+                    profile_id = route_profile_id
+                self.log.info(
+                    "Resolved watchlist key %s to profile %s via site search (%s)",
+                    raw, profile_id, current,
+                )
                 result.update({
                     "success": True, "ok": True,
-                    "profile_id": profile_id or (username if candidate_slug == username.lower() else None),
-                    "username": candidate_slug if candidate_slug != username.lower() else username,
+                    "profile_id": profile_id,
+                    "username": candidate_slug,
                     "profile_url": current,
-                    "profile_id_source": "page_metadata" if profile_id else "matched_search_result",
+                    "profile_id_source": "site_search_result",
+                    "input_user_id": raw,
                     "error": None,
                 })
                 return result
