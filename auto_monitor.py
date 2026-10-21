@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """SuperLive Auto Monitor: discover confirmed live streams and trigger recording."""
-
 import asyncio
 import html
 import json
@@ -11,7 +10,6 @@ import time
 import urllib.request
 import urllib.error
 from pathlib import Path
-
 from superlive_discovery import SuperLiveDiscovery
 
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")
@@ -22,6 +20,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 USER_AGENT = "SuperLive-AutoMonitor/1.1 (GitHub Actions; +https://github.com/sakatnt66-alt/superlive-recorder)"
 WATCHLIST_FILE = Path("data/watchlist.json")
+
 # The GitHub Actions job has a hard five-minute limit. Leave room for cleanup
 # and result submission instead of letting browser discovery consume the whole job.
 MAX_CONCURRENT = 1  # One shared Playwright page must not be navigated concurrently.
@@ -40,18 +39,17 @@ logging.basicConfig(level=logging.INFO, format="[DISCOVERY] %(levelname)s %(mess
 print(f"[DEBUG] WORKER_API_URL: {'SET' if WORKER_API_URL else 'MISSING'} (length={len(WORKER_API_URL)})", flush=True)
 print(f"[DEBUG] AUTO_API_TOKEN: {'SET' if AUTO_API_TOKEN else 'MISSING'} (length={len(AUTO_API_TOKEN)})", flush=True)
 
-
 def is_valid_stream_id(stream_id, user_id) -> bool:
     """Only accept an explicit numeric livestream ID, never the profile ID fallback."""
     sid = str(stream_id or "").strip()
     uid = str(user_id or "").strip()
-    return sid.isdigit() and len(sid) >= 9 and sid != uid
-
+    # FIX: Relaxed length requirement from >= 9 to >= 5 to match profile ID lengths
+    # and prevent false negatives on valid 8-digit stream IDs.
+    return sid.isdigit() and len(sid) >= 5 and sid != uid
 
 def is_valid_profile_id(profile_id) -> bool:
     value = str(profile_id or "").strip()
     return value.isdigit() and 5 <= len(value) <= 15
-
 
 def read_error_body(error):
     try:
@@ -59,7 +57,6 @@ def read_error_body(error):
         return body[:500] if body else "(empty)"
     except Exception:
         return "(unreadable)"
-
 
 def _request_json(url, *, headers=None, payload=None, timeout=8):
     data = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -75,7 +72,6 @@ def _request_json(url, *, headers=None, payload=None, timeout=8):
         raw = response.read().decode("utf-8", errors="replace")
         return response.status, (json.loads(raw) if raw else {})
 
-
 def send_telegram_message(text: str, parse_mode: str = "HTML"):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -86,7 +82,6 @@ def send_telegram_message(text: str, parse_mode: str = "HTML"):
         )
     except Exception as exc:
         print(f"[TELEGRAM] Error sending message: {exc}")
-
 
 def get_watchlist() -> list:
     headers = {"X-Auto-Token": AUTO_API_TOKEN}
@@ -100,19 +95,18 @@ def get_watchlist() -> list:
             print(f"[WATCHLIST] HTTP {exc.code}: {read_error_body(exc)}")
         except Exception as exc:
             print(f"[WATCHLIST] Worker API error: {exc}")
-
+            
     print("[WATCHLIST] Falling back to local watchlist.json")
     try:
         with WATCHLIST_FILE.open("r", encoding="utf-8") as file:
             data = json.load(file)
-        watchlist = data.get("watchlist", [])
-        return watchlist if isinstance(watchlist, list) else []
+            watchlist = data.get("watchlist", [])
+            return watchlist if isinstance(watchlist, list) else []
     except FileNotFoundError:
         print("[WATCHLIST] Local watchlist.json not found")
     except Exception as exc:
         print(f"[WATCHLIST] Error loading local watchlist: {exc}")
     return []
-
 
 def get_active_recordings() -> list:
     if not WORKER_API_URL or not AUTO_API_TOKEN:
@@ -129,7 +123,6 @@ def get_active_recordings() -> list:
     except Exception as exc:
         print(f"[WORKER] Error getting active recordings: {exc}")
     return []
-
 
 def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name: str) -> bool:
     if not WORKER_API_URL or not AUTO_API_TOKEN:
@@ -160,13 +153,12 @@ def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name
         print(f"[AUTO] Error triggering recording for {user_id}: {exc}")
     return False
 
-
 async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list):
     user_id = str(user.get("stream_id") or user.get("user_id") or "").strip()
     if not user_id:
         print(f"[AUTO] Skip malformed watchlist entry: {user!r}")
         return None
-
+        
     print(f"[AUTO] [Phase 1] Resolving {user_id}")
     try:
         profile_result = await asyncio.wait_for(
@@ -175,25 +167,27 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         if not isinstance(profile_result, dict) or not profile_result:
             print(f"[AUTO] Resolve failed for {user_id}: empty_or_invalid_response", flush=True)
             return None
+            
         if profile_result.get("success") is False or profile_result.get("ok") is False:
             reason = profile_result.get("error") or "profile_resolution_failed"
             print(f"[AUTO] Resolve failed for {user_id}: {reason}", flush=True)
             return None
-
+            
         profile_url = str(profile_result.get("profile_url") or "").strip()
         if not profile_url or "/profile/None" in profile_url or profile_url.endswith("/None"):
             reason = profile_result.get("error") or "profile_url_missing"
             print(f"[AUTO] Invalid profile URL for {user_id}: {profile_url!r}; reason={reason}", flush=True)
             return None
-
+            
         username = str(profile_result.get("username") or "").strip()
         profile_id = str(profile_result.get("profile_id") or "").strip()
         if profile_id and not is_valid_profile_id(profile_id):
             print(f"[AUTO] Invalid profile_id ignored: {profile_id}")
             profile_id = ""
-
+            
         print(f"[AUTO] [Phase 1] OK: {profile_url}")
         print(f"[AUTO] [Phase 2] Check live at {profile_url}")
+        
         result = await asyncio.wait_for(
             discovery.check_live_status(
                 profile_url=profile_url,
@@ -203,21 +197,22 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
             ),
             timeout=PER_USER_TIMEOUT_SECONDS,
         )
+        
         if not isinstance(result, dict):
             print(f"[AUTO] Invalid live-check response for {user_id}")
             return None
-
+            
         # A failed page inspection is UNKNOWN, not proof that the user is offline.
         if result.get("success") is False or result.get("ok") is False:
             print(f"[AUTO] status=UNKNOWN action=SKIP_CHECK_ERROR reason={result.get('error', 'inspection_failed')}")
             return None
-
+            
         is_live = result.get("is_live") is True or result.get("live") is True
         is_premium = result.get("is_premium") is True or result.get("premium") is True
         stream_id = str(result.get("stream_id") or "").strip()
         stream_url = str(result.get("stream_url") or "").strip()
         stream_id_valid = is_valid_stream_id(stream_id, user_id)
-
+        
         final_username = str(result.get("username") or username or "").strip()
         if not final_username or final_username == user_id:
             for item in watchlist:
@@ -225,7 +220,7 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
                     final_username = str(item["display_name"]).strip()
                     break
         final_username = final_username or user_id
-
+        
         print(f"[AUTO] username={user_id}")
         print("[AUTO] source=discovery_layer")
         print(f"[AUTO] profile_url={profile_url}")
@@ -233,23 +228,27 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
             print(f"[AUTO] profile_id={profile_id}")
         print(f"[AUTO] stream_id={stream_id or '(not found)'} (valid={stream_id_valid})")
         print(f"[AUTO] display_name={final_username}")
-
+        
         if is_premium:
             print("[AUTO] phase=p2_premium status=LIVE_PREMIUM action=SKIP_PREMIUM reason=premium")
             return None
+            
         if not is_live:
             evidence = result.get("live_evidence") or []
             print(f"[AUTO] phase=p2_unconfirmed status=UNKNOWN action=SKIP_UNCONFIRMED evidence={evidence}")
             return None
+            
         if not stream_id_valid:
             print(f"[AUTO] status=LIVE_BUT_NO_VALID_STREAM_ID action=SKIP_INVALID_STREAM stream_id={stream_id or '(missing)'}")
             return None
+            
         if not stream_url or not re.fullmatch(r"https://superlivetv\.com/fr/livestream/\d+/?", stream_url):
             # Only construct the canonical URL from a validated, explicitly discovered ID.
             stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
-
+            
         print("[AUTO] phase=phase_3_done status=LIVE_NORMAL action=CANDIDATE reason=live")
         return {"user_id": user_id, "stream_id": stream_id, "stream_url": stream_url, "stream_name": final_username}
+        
     except asyncio.TimeoutError:
         print(f"[AUTO] TIMEOUT user={user_id} limit={PER_USER_TIMEOUT_SECONDS}s action=SKIP_AND_CONTINUE", flush=True)
         return None
@@ -259,39 +258,40 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         traceback.print_exc()
         return None
 
-
 async def main():
     print("[AUTO] Starting Auto Monitor")
     watchlist = get_watchlist()
     if not watchlist:
         print("[AUTO] Watchlist is empty - nothing to do")
         return
+        
     print(f"[AUTO] Watchlist: {len(watchlist)} users")
-
     active = get_active_recordings()
     print(f"[AUTO] Active: {len(active)}/{MAX_RECORDINGS}")
     if len(active) >= MAX_RECORDINGS:
         print("[AUTO] Concurrency limit reached")
         return
-
+        
     active_user_ids = {str(r.get("user_id")) for r in active if r.get("user_id") is not None}
     active_stream_ids = {str(r.get("stream_id")) for r in active if r.get("stream_id") is not None}
+    
     to_check = []
     for item in watchlist:
         uid = str(item.get("stream_id") or item.get("user_id") or "").strip()
         if not uid or uid in active_user_ids:
             continue
         to_check.append(item)
-
+        
     print(f"[AUTO] Discovery queue: {len(to_check)} users; per-user timeout={PER_USER_TIMEOUT_SECONDS}s; budget={MONITOR_BUDGET_SECONDS}s", flush=True)
     if not to_check:
         print("[AUTO] No users to check")
         return
-
+        
     candidates = []
     deadline = time.monotonic() + MONITOR_BUDGET_SECONDS
     checked = 0
     timed_out_or_unchecked = 0
+    
     # SuperLiveDiscovery intentionally shares one browser page and serializes page
     # navigation. Running gather() only queues many coroutines behind the same lock
     # and can make the workflow hit its five-minute job timeout without useful logs.
@@ -307,7 +307,7 @@ async def main():
         print(f"[AUTO] Browser startup failed: {type(exc).__name__}: {exc}", flush=True)
         await discovery.close()
         return
-
+        
     try:
         for item in to_check:
             remaining = deadline - time.monotonic()
@@ -315,6 +315,7 @@ async def main():
                 timed_out_or_unchecked += len(to_check) - checked
                 print(f"[AUTO] Global time budget exhausted; leaving {len(to_check) - checked} user(s) unchecked", flush=True)
                 break
+                
             uid = str(item.get("stream_id") or item.get("user_id") or "").strip() or "(invalid)"
             print(f"[AUTO] Queue progress {checked + 1}/{len(to_check)} user={uid} budget_left={int(remaining)}s", flush=True)
             try:
@@ -332,9 +333,9 @@ async def main():
             checked += 1
     finally:
         await discovery.close()
-
+        
     print(f"[AUTO] Discovery summary: checked={checked}/{len(to_check)} candidates={len(candidates)} unchecked_or_timed_out={timed_out_or_unchecked}", flush=True)
-
+    
     seen = set()
     deduplicated = []
     for record in candidates:
@@ -347,28 +348,28 @@ async def main():
             continue
         seen.add(sid)
         deduplicated.append(record)
-
+        
     slots = max(0, MAX_RECORDINGS - len(active))
     to_record = deduplicated[:slots]
     print(f"[AUTO] Slots: {slots}; LIVE_NORMAL candidates: {len(to_record)}")
+    
     if not to_record:
         print("[AUTO] No new confirmed LIVE_NORMAL streams to record")
         print("[AUTO] Monitor completed")
         return
-
+        
     triggered_records = []
     for record in to_record:
         if trigger_recording(record["user_id"], record["stream_id"], record["stream_url"], record["stream_name"]):
             triggered_records.append(record)
-
+            
     if triggered_records:
         names = [f"• {html.escape(r['stream_name'])} ({html.escape(r['stream_id'])})" for r in triggered_records]
         send_telegram_message(
-            f"🤖 <b>Auto Recording بدأ ({len(triggered_records)})</b>\n\n" + "\n".join(names),
+            f"🤖 <b>Auto Recording بدأ ({len(triggered_records)})</b>\n" + "\n".join(names),
             parse_mode="HTML",
         )
     print(f"[AUTO] Monitor completed - triggered {len(triggered_records)}/{len(to_record)}")
-
 
 if __name__ == "__main__":
     try:
