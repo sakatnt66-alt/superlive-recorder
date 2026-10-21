@@ -1,6 +1,7 @@
-"""SuperLiveDiscovery 11.5 - Advanced Network Interception & Next.js Data Extraction."""
+"""SuperLiveDiscovery 11.6 - API-Driven Discovery & JSON Interception."""
 from __future__ import annotations
 import asyncio
+import json
 import logging
 import re
 import time
@@ -19,7 +20,7 @@ except ImportError as exc:
         "then run: playwright install chromium"
     ) from exc
 
-VERSION = "11.5"
+VERSION = "11.6"
 DEFAULT_BASE_URL = "https://superlivetv.com"
 DEFAULT_LOCALE = "fr"
 LOG = logging.getLogger("SuperLiveDiscovery")
@@ -146,7 +147,6 @@ class SuperLiveDiscovery:
             try:
                 response = await page.goto(url, wait_until="domcontentloaded", timeout=self.navigation_timeout_ms)
                 if response is not None and response.status >= 400:
-                    self.log.debug("HTTP %s while opening %s", response.status, url)
                     return False
                 try:
                     await page.wait_for_load_state("networkidle", timeout=min(2000, self.timeout_ms))
@@ -495,57 +495,6 @@ class SuperLiveDiscovery:
         evidence = [term for term in self.PREMIUM_TERMS if term in text]
         return bool(evidence), evidence
 
-    async def _extract_display_name(self, page: Page, fallback: str, intercepted_data: list) -> str:
-        """Extract real display name from HTML or intercepted JSON, ignoring default SEO titles."""
-        ignored_phrases = [
-            "rencontrez de nouvelles personnes",
-            "superlive", "superlivetv", "profile", "watch live",
-            "live stream", "diffusions en direct", "découvrez"
-        ]
-        
-        def is_valid_name(name: str) -> bool:
-            if not name or len(name) < 2 or len(name) > 60:
-                return False
-            name_lower = name.lower()
-            for phrase in ignored_phrases:
-                if phrase in name_lower:
-                    return False
-            # Ignore pure usernames if they match the slug exactly and we have better data
-            return True
-
-        # 1. DOM Elements (Highest priority for SPA)
-        try:
-            for sel in ["h1", "h2", ".username", ".profile-name", ".nickname", "[class*='name' i]", "[class*='user' i]"]:
-                els = page.locator(sel)
-                count = await els.count()
-                for i in range(min(count, 3)):
-                    text = (await els.nth(i).inner_text()).strip()
-                    text = text.split('\n')[0].strip()
-                    if is_valid_name(text) and text.lower() != fallback.lower() and text.lower() != "@" + fallback.lower():
-                        return text
-        except: pass
-
-        # 2. Intercepted JSON
-        for item in intercepted_data:
-            body = item.get("body", "")
-            # Look for display_name, nickname, name, username
-            m = re.search(r'["\'](?:nickname|displayName|display_name|name|username|authorName)["\']\s*:\s*["\']([^"\']{2,50})["\']', body)
-            if m:
-                val = m.group(1).strip()
-                if is_valid_name(val) and val.lower() != fallback.lower() and val.lower() != "@" + fallback.lower():
-                    return val
-                    
-        # 3. Meta tags (Fallback)
-        try:
-            og_title = await page.locator("meta[property='og:title']").get_attribute("content")
-            if og_title:
-                clean_title = og_title.split("-")[0].split("|")[0].strip()
-                if is_valid_name(clean_title) and clean_title.lower() != fallback.lower():
-                    return clean_title
-        except: pass
-        
-        return fallback
-
     async def check_live_status(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         profile_url = str(kwargs.get("profile_url") or kwargs.get("url") or kwargs.get("profile") or "").strip()
         user_id = str(kwargs.get("user_id") or kwargs.get("username") or kwargs.get("profile_id") or "").strip()
@@ -593,11 +542,7 @@ class SuperLiveDiscovery:
                             cl = response.headers.get("content-length", "0")
                             if cl.isdigit() and int(cl) < 2000000:
                                 body = await response.text()
-                                intercepted_data.append({"url": url, "body": body})
-                                # Diagnostic Trap: Log API calls related to stream/user
-                                if any(kw in url.lower() for kw in ["stream", "live", "room", "broadcast", "user", "profile", "status"]):
-                                    snippet = body[:300].replace('\n', ' ')
-                                    self.log.info(f"INTERCEPTED_API: {url} | snippet: {snippet}")
+                                intercepted_data.append({"url": url, "body": body, "ct": ct})
                 except Exception:
                     pass
 
@@ -615,7 +560,7 @@ class SuperLiveDiscovery:
                         "live_evidence": [], "premium_evidence": [],
                     }
                 
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(2500)
                 
                 current_url = self._norm_url(page.url)
                 title = await self._title(page)
@@ -623,76 +568,83 @@ class SuperLiveDiscovery:
                 
                 live, live_evidence = await self.is_live_page(page)
                 premium, premium_evidence = await self.detect_premium(page)
-                display_name = await self._extract_display_name(page, user_id, intercepted_data)
                 
+                display_name = ""
                 stream_url = None
                 stream_id = None
                 ownership_verified = False
                 
-                html_content = await page.content()
-                
-                # 1. Next.js Data Extraction
-                next_data_match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html_content, re.IGNORECASE | re.DOTALL)
-                if next_data_match:
-                    intercepted_data.append({"url": "__NEXT_DATA__", "body": next_data_match.group(1)})
-
-                # 2. Media Sources Extraction (Iframes, Videos)
-                try:
-                    media_srcs = await page.evaluate("""() => {
-                        let srcs = [];
-                        document.querySelectorAll('iframe, video, source').forEach(el => {
-                            if (el.src) srcs.push(el.src);
-                            if (el.tagName === 'VIDEO' && el.currentSrc) srcs.push(el.currentSrc);
-                        });
-                        return srcs;
-                    }""")
-                    for src in media_srcs:
-                        m = re.search(r'/livestream/(\d{5,15})', str(src))
-                        if m:
-                            val = m.group(1)
-                            if val != str(user_id) and val != str(profile_id):
-                                stream_id = val
-                                stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
-                                ownership_verified = True
-                                live_evidence.append("media_src_livestream_link")
-                                break
-                except Exception:
-                    pass
-
-                # 3. Find /livestream/ID in HTML (Profile Page)
-                if not stream_id:
-                    html_matches = re.findall(r'/livestream/(\d{5,15})', html_content)
-                    valid_html_ids = [m for m in html_matches if m != str(user_id) and m != str(profile_id)]
-                    if valid_html_ids:
-                        stream_id = valid_html_ids[0]
+                # 1. Parse intercepted API data (The Goldmine)
+                profile_api_data = {}
+                for item in intercepted_data:
+                    url = item["url"]
+                    body = item["body"]
+                    ct = item.get("ct", "")
+                    
+                    if "api.spl-live.com/api/web/users/profile" in url or "/api/web/users/profile" in url:
+                        try:
+                            data = json.loads(body)
+                            user_obj = data.get("user", {})
+                            profile_api_data = {
+                                "name": user_obj.get("name"),
+                                "user_id": user_obj.get("user_id"),
+                                "shared_id": user_obj.get("shared_id"),
+                                "is_live": user_obj.get("is_live") or user_obj.get("live") or user_obj.get("is_broadcasting"),
+                                "room_id": user_obj.get("room_id") or user_obj.get("stream_id") or user_obj.get("live_id") or user_obj.get("broadcast_id")
+                            }
+                        except Exception:
+                            pass
+                            
+                # Apply Profile API data
+                if profile_api_data:
+                    if profile_api_data.get("name"):
+                        display_name = str(profile_api_data["name"]).strip()
+                    if profile_api_data.get("user_id") and str(profile_api_data["user_id"]).isdigit():
+                        profile_id = str(profile_api_data["user_id"])
+                    if profile_api_data.get("room_id") and str(profile_api_data["room_id"]).isdigit() and not stream_id:
+                        stream_id = str(profile_api_data["room_id"])
                         stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
                         ownership_verified = True
-                        live_evidence.append("html_livestream_link")
-                
-                # 4. Check intercepted JSON (Network API & Next.js Data)
+                        live_evidence.append("api_room_id_verified")
+                        
+                # 2. Generic JSON parsing for stream_id if still not found
                 if not stream_id:
                     for item in intercepted_data:
-                        body = item.get("body", "")
-                        url = item.get("url", "")
-                        
-                        patterns = [
-                            r'["\'](?:streamId|stream_id|roomId|room_id|liveId|live_id|broadcastId|liveStreamId|channelId)["\']\s*:\s*["\']?(\d{5,15})["\']?',
-                            r'"id"\s*:\s*"?(\d{5,15})"?',
-                        ]
-                        for pat in patterns:
-                            for m in re.finditer(pat, body):
-                                val = m.group(1)
-                                if val != str(user_id) and val != str(profile_id):
-                                    if str(user_id) in body or str(profile_id) in body:
-                                        if any(kw in body.lower() for kw in ["live", "stream", "room", "broadcast", "online", "streaming"]):
+                        if "json" in item.get("ct", ""):
+                            body = item["body"]
+                            patterns = [
+                                r'"(?:streamId|stream_id|roomId|room_id|liveId|live_id|broadcastId|liveStreamId|channelId)"\s*:\s*"?(\d{5,15})"?',
+                            ]
+                            for pat in patterns:
+                                for m in re.finditer(pat, body):
+                                    val = m.group(1)
+                                    if val != str(user_id) and val != str(profile_id):
+                                        shared_id = str(profile_api_data.get("shared_id", ""))
+                                        if str(user_id) in body or str(profile_id) in body or shared_id in body:
                                             stream_id = val
                                             stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
                                             ownership_verified = True
-                                            live_evidence.append(f"json_api_verified:{url}")
+                                            live_evidence.append(f"json_api_verified:{item['url']}")
                                             break
-                        if stream_id:
-                            break
+                                if stream_id:
+                                    break
 
+                # 3. Fallback to DOM extraction for display name if API failed
+                if not display_name:
+                    ignored_phrases = ["rencontrez de nouvelles personnes", "superlive", "superlivetv", "profile", "watch live", "diffusions en direct", "découvrez", "property"]
+                    try:
+                        for sel in ["h1", "h2", ".username", ".profile-name", ".nickname", "[class*='name' i]", "[class*='user' i]"]:
+                            els = page.locator(sel)
+                            count = await els.count()
+                            for i in range(min(count, 3)):
+                                txt = (await els.nth(i).inner_text()).strip().split('\n')[0].strip()
+                                if txt and 2 <= len(txt) <= 60 and txt.lower() not in ignored_phrases and txt.lower() != user_id.lower():
+                                    display_name = txt
+                                    break
+                            if display_name:
+                                break
+                    except: pass
+                    
                 page.remove_listener("response", on_response)
                 
                 stream_title = ""
