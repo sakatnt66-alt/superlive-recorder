@@ -24,7 +24,7 @@ WATCHLIST_FILE = Path("data/watchlist.json")
 MAX_CONCURRENT = 1
 MAX_RECORDINGS = 5
 MONITOR_BUDGET_SECONDS = 185
-PER_USER_TIMEOUT_SECONDS = 14  # Increased to allow for deeper DOM/Network inspection
+PER_USER_TIMEOUT_SECONDS = 14
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
@@ -37,7 +37,6 @@ print(f"[DEBUG] AUTO_API_TOKEN: {'SET' if AUTO_API_TOKEN else 'MISSING'} (length
 
 
 def is_valid_stream_id(stream_id, user_id, profile_id) -> bool:
-    """Strict validation: Stream ID must be numeric, valid length, and MUST NOT equal user_id or profile_id."""
     sid = str(stream_id or "").strip()
     uid = str(user_id or "").strip()
     pid = str(profile_id or "").strip()
@@ -46,7 +45,6 @@ def is_valid_stream_id(stream_id, user_id, profile_id) -> bool:
         return False
     if not (5 <= len(sid) <= 15):
         return False
-    # CRITICAL FIX: Stream ID must be independent of User/Profile IDs
     if sid == uid or sid == pid:
         return False
         
@@ -225,15 +223,19 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         stream_url = str(result.get("stream_url") or "").strip()
         ownership_verified = result.get("ownership_verified", False)
         
-        # Extract Display Name
+        # Extract Display Name (Prioritize API data, fallback to watchlist)
         display_name = str(result.get("display_name") or "").strip()
-        if not display_name or display_name.lower() in ["superlive", "superlivetv", "profile", username]:
-            # Fallback to watchlist display_name if provided, or user_id
+        if not display_name or display_name.lower() in ["superlive", "superlivetv", "profile", "property", username]:
             for item in watchlist:
                 if str(item.get("stream_id") or item.get("user_id") or "") == user_id and item.get("display_name"):
                     display_name = str(item["display_name"]).strip()
                     break
         display_name = display_name or username or user_id
+        
+        # Update profile_id if the discovery layer found the real internal ID
+        real_profile_id = str(result.get("profile_id") or profile_id).strip()
+        if real_profile_id and is_valid_profile_id(real_profile_id):
+            profile_id = real_profile_id
         
         stream_id_valid = is_valid_stream_id(stream_id, user_id, profile_id)
         
