@@ -21,15 +21,11 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 USER_AGENT = "SuperLive-AutoMonitor/1.1 (GitHub Actions; +https://github.com/sakatnt66-alt/superlive-recorder)"
 WATCHLIST_FILE = Path("data/watchlist.json")
 
-# The GitHub Actions job has a hard five-minute limit. Leave room for cleanup
-# and result submission instead of letting browser discovery consume the whole job.
-MAX_CONCURRENT = 1  # One shared Playwright page must not be navigated concurrently.
+MAX_CONCURRENT = 1
 MAX_RECORDINGS = 5
 MONITOR_BUDGET_SECONDS = 185
-PER_USER_TIMEOUT_SECONDS = 10
+PER_USER_TIMEOUT_SECONDS = 12  # Increased slightly to allow network interception
 
-# GitHub Actions captures stdout; force line-buffered output so logs identify the
-# last completed phase even if the runner cancels the process.
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
@@ -40,13 +36,21 @@ print(f"[DEBUG] WORKER_API_URL: {'SET' if WORKER_API_URL else 'MISSING'} (length
 print(f"[DEBUG] AUTO_API_TOKEN: {'SET' if AUTO_API_TOKEN else 'MISSING'} (length={len(AUTO_API_TOKEN)})", flush=True)
 
 
-def is_valid_stream_id(stream_id, user_id) -> bool:
-    """Accept any explicit numeric livestream ID.
-    Removed `sid != uid` restriction because many modern platforms use the 
-    profile/user ID as the stream/room ID when the user is live."""
+def is_valid_stream_id(stream_id, user_id, profile_id) -> bool:
+    """Strict validation: Stream ID must be numeric, valid length, and MUST NOT equal user_id or profile_id."""
     sid = str(stream_id or "").strip()
-    # Accept any numeric ID between 5 and 20 digits.
-    return sid.isdigit() and 5 <= len(sid) <= 20
+    uid = str(user_id or "").strip()
+    pid = str(profile_id or "").strip()
+    
+    if not sid.isdigit():
+        return False
+    if not (5 <= len(sid) <= 15):
+        return False
+    # CRITICAL FIX: Stream ID must be independent of User/Profile IDs
+    if sid == uid or sid == pid:
+        return False
+        
+    return True
 
 
 def is_valid_profile_id(profile_id) -> bool:
@@ -143,8 +147,8 @@ def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name
             payload={"stream_url": stream_url, "stream_id": stream_id, "stream_name": stream_name},
         )
         if status == 200 and data.get("success"):
-            print(f"[AUTO] START_RECORDING user={user_id}, stream={stream_id}")
-            print(f"[AUTO] URL: {stream_url}; Name: {stream_name}")
+            print(f"[RECORDING] Starting recording for: {stream_name} (user_id={user_id})")
+            print(f"[AUTO] URL: {stream_url}; Stream ID: {stream_id}")
             return True
         print(f"[AUTO] Failed to trigger {user_id}: {data.get('error', 'unknown error')}")
     except urllib.error.HTTPError as exc:
@@ -211,7 +215,6 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
             print(f"[AUTO] Invalid live-check response for {user_id}")
             return None
             
-        # A failed page inspection is UNKNOWN, not proof that the user is offline.
         if result.get("success") is False or result.get("ok") is False:
             print(f"[AUTO] status=UNKNOWN action=SKIP_CHECK_ERROR reason={result.get('error', 'inspection_failed')}")
             return None
@@ -220,23 +223,26 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         is_premium = result.get("is_premium") is True or result.get("premium") is True
         stream_id = str(result.get("stream_id") or "").strip()
         stream_url = str(result.get("stream_url") or "").strip()
-        stream_id_valid = is_valid_stream_id(stream_id, user_id)
+        ownership_verified = result.get("ownership_verified", False)
         
-        final_username = str(result.get("username") or username or "").strip()
-        if not final_username or final_username == user_id:
+        # Extract Display Name
+        display_name = str(result.get("display_name") or "").strip()
+        if not display_name or display_name.lower() in ["superlive", "superlivetv", "profile", username]:
+            # Fallback to watchlist display_name if provided, or user_id
             for item in watchlist:
                 if str(item.get("stream_id") or item.get("user_id") or "") == user_id and item.get("display_name"):
-                    final_username = str(item["display_name"]).strip()
+                    display_name = str(item["display_name"]).strip()
                     break
-        final_username = final_username or user_id
+        display_name = display_name or username or user_id
         
-        print(f"[AUTO] username={user_id}")
+        stream_id_valid = is_valid_stream_id(stream_id, user_id, profile_id)
+        
+        print(f"[AUTO] Processing user: {display_name} (user_id={user_id})")
         print("[AUTO] source=discovery_layer")
         print(f"[AUTO] profile_url={profile_url}")
         if profile_id:
             print(f"[AUTO] profile_id={profile_id}")
-        print(f"[AUTO] stream_id={stream_id or '(not found)'} (valid={stream_id_valid})")
-        print(f"[AUTO] display_name={final_username}")
+        print(f"[AUTO] Real stream ID resolved: {stream_id or '(not found)'} (valid={stream_id_valid}, owned={ownership_verified})")
         
         if is_premium:
             print("[AUTO] phase=p2_premium status=LIVE_PREMIUM action=SKIP_PREMIUM reason=premium")
@@ -248,15 +254,24 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
             return None
             
         if not stream_id_valid:
-            print(f"[AUTO] status=LIVE_BUT_NO_VALID_STREAM_ID action=SKIP_INVALID_STREAM stream_id={stream_id or '(missing)'}")
+            print(f"[AUTO] status=LIVE_BUT_INVALID_STREAM_ID action=SKIP stream_id={stream_id or '(missing)'}")
+            return None
+            
+        if not ownership_verified:
+            print(f"[AUTO] status=LIVE_BUT_UNVERIFIED_OWNERSHIP action=SKIP stream_id={stream_id}")
             return None
             
         if not stream_url or not re.fullmatch(r"https://superlivetv\.com/fr/livestream/\d+/?", stream_url):
-            # Only construct the canonical URL from a validated, explicitly discovered ID.
             stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
             
+        print("[AUTO] Stream URL validated for the expected user")
         print("[AUTO] phase=phase_3_done status=LIVE_NORMAL action=CANDIDATE reason=live")
-        return {"user_id": user_id, "stream_id": stream_id, "stream_url": stream_url, "stream_name": final_username}
+        return {
+            "user_id": user_id, 
+            "stream_id": stream_id, 
+            "stream_url": stream_url, 
+            "stream_name": display_name
+        }
         
     except asyncio.TimeoutError:
         print(f"[AUTO] TIMEOUT user={user_id} limit={PER_USER_TIMEOUT_SECONDS}s action=SKIP_AND_CONTINUE", flush=True)
@@ -302,10 +317,7 @@ async def main():
     checked = 0
     timed_out_or_unchecked = 0
     
-    # SuperLiveDiscovery intentionally shares one browser page and serializes page
-    # navigation. Running gather() only queues many coroutines behind the same lock
-    # and can make the workflow hit its five-minute job timeout without useful logs.
-    discovery = SuperLiveDiscovery(timeout_ms=5000, navigation_timeout_ms=8000, retries=0)
+    discovery = SuperLiveDiscovery(timeout_ms=6000, navigation_timeout_ms=9000, retries=0)
     try:
         print("[AUTO] Starting Chromium (startup timeout=25s)", flush=True)
         await asyncio.wait_for(discovery.open(), timeout=25)
@@ -374,11 +386,14 @@ async def main():
             triggered_records.append(record)
             
     if triggered_records:
-        names = [f"• {html.escape(r['stream_name'])} ({html.escape(r['stream_id'])})" for r in triggered_records]
-        send_telegram_message(
-            f"🤖 <b>Auto Recording بدأ ({len(triggered_records)})</b>\n" + "\n".join(names),
-            parse_mode="HTML",
-        )
+        for r in triggered_records:
+            msg = f"🔴 <b>بدأ تسجيل بث جديد</b>\n\n"
+            msg += f"👤 <b>الاسم:</b> {html.escape(r['stream_name'])}\n"
+            msg += f"🆔 <b>المستخدم:</b> {html.escape(r['user_id'])}\n"
+            msg += f"📡 <b>معرّف البث:</b> {html.escape(r['stream_id'])}\n\n"
+            msg += f"🔗 <b>رابط البث:</b>\n{html.escape(r['stream_url'])}"
+            send_telegram_message(msg, parse_mode="HTML")
+            
     print(f"[AUTO] Monitor completed - triggered {len(triggered_records)}/{len(to_record)}")
 
 
