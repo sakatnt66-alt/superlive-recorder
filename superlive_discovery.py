@@ -454,23 +454,40 @@ class SuperLiveDiscovery:
                     card_text and len(card_text) > len(label)
                     and (username.lower() in card_lower or username.lower() in label or results_heading)
                 )
+                # A verified search page can return a profile link whose anchor
+                # has no visible text (common with avatar-only result cards). When
+                # exactly one public-profile link is present, the site's own query
+                # result is sufficient mapping evidence; do not require the platform
+                # profile ID to equal the submitted Telegram/search key.
+                unique_verified_result = bool(results_heading and profile_link_count == 1)
                 direct_identity_match = (
                     candidate_slug == username.lower()
                     or username.lower() in label
                     or username.lower() in card_lower
                     or (results_heading and result_card_evidence)
+                    or unique_verified_result
                 )
                 if not direct_identity_match:
+                    self.log.debug(
+                        "Reject search candidate for key %s: no identity evidence href=%s label=%r card=%r",
+                        raw, href, label[:120], card_text[:180],
+                    )
                     continue
                 if not await self._goto(href):
+                    self.log.debug("Could not open profile candidate for key %s: %s", raw, href)
                     continue
                 current = self._norm_url(page.url)
                 text = await self._text(page)
                 title = await self._title(page)
                 excerpt = (title + " " + text[:3500]).lower()
                 if any(term in excerpt for term in self.ERROR_TERMS):
+                    self.log.debug("Reject profile candidate for key %s: error-page evidence url=%s title=%r", raw, current, title[:120])
                     continue
                 if not self._is_public_profile_route(current) or not (title or text):
+                    self.log.debug(
+                        "Reject profile candidate for key %s: invalid/empty profile page url=%s title_present=%s text_len=%d",
+                        raw, current, bool(title), len(text),
+                    )
                     continue
                 # A profile reached from the platform's filtered search result is
                 # the mapping. Keep input_id and platform profile_id separate.
