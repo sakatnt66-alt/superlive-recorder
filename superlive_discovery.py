@@ -1,13 +1,10 @@
 """SuperLiveDiscovery 11.0 - async-first defensive public-page discovery.
-
 Designed for callers that use ``await discovery.discover_profile_id(user_id)``.
 Requires: pip install playwright && playwright install chromium
-
 This module only inspects publicly accessible pages. It does not bypass login,
 paywalls, access controls, or DRM. Website URL patterns and markup may change.
 """
 from __future__ import annotations
-
 import asyncio
 import logging
 import re
@@ -32,7 +29,6 @@ DEFAULT_BASE_URL = "https://superlivetv.com"
 DEFAULT_LOCALE = "fr"
 LOG = logging.getLogger("SuperLiveDiscovery")
 
-
 @dataclass
 class StreamRecord:
     username: str = ""
@@ -52,13 +48,12 @@ class StreamRecord:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
-
 class SuperLiveDiscovery:
     """Async Playwright discovery class. Public methods are awaitable."""
-
-    LIVE_TERMS = ("live now", "is live", "live stream", "watch live", "currently live", "مباشر", "بث مباشر")
-    NON_LIVE_TERMS = ("replay", "recorded", "offline", "not live", "ended", "past stream", "إعادة", "مسجل", "غير متصل", "انتهى البث")
-    PREMIUM_TERMS = ("premium", "paid stream", "subscriber only", "subscribers only", "members only", "exclusive stream", "vip", "مدفوع", "للمشتركين", "حصري")
+    # FIX: Added French/Spanish terms to correctly identify live/premium/offline states
+    LIVE_TERMS = ("live now", "is live", "live stream", "watch live", "currently live", "مباشر", "بث مباشر", "en direct", "direct", "en vivo", "vivo")
+    NON_LIVE_TERMS = ("replay", "recorded", "offline", "not live", "ended", "past stream", "إعادة", "مسجل", "غير متصل", "انتهى البث", "hors ligne", "terminé", "rediffusion", "passé")
+    PREMIUM_TERMS = ("premium", "paid stream", "subscriber only", "subscribers only", "members only", "exclusive stream", "vip", "مدفوع", "للمشتركين", "حصري", "privé", "exclusive", "abonnés", "réservé")
     ERROR_TERMS = ("page not found", "user not found", "profile not found", "404 not found", "account does not exist")
 
     def __init__(self, base_url: str = DEFAULT_BASE_URL, headless: bool = True,
@@ -115,7 +110,7 @@ class SuperLiveDiscovery:
                     await obj.close()
                 except Exception as exc:
                     self.log.debug("Cleanup %s: %s", attr, exc)
-                setattr(self, attr, None)
+            setattr(self, attr, None)
         if self._playwright is not None:
             try:
                 await self._playwright.stop()
@@ -195,7 +190,6 @@ class SuperLiveDiscovery:
 
     async def _looks_profile(self, username: str, url: str, title: str, text: str) -> bool:
         """Validate a profile page without requiring the numeric ID in visible text.
-
         SuperLive pages are client-rendered and numeric account IDs often appear in
         the URL but not in the visible text. The route is therefore accepted when
         it matches /{locale}/profile/{id}, provided the page is not an obvious error
@@ -231,7 +225,6 @@ class SuperLiveDiscovery:
 
     async def discover_profile_id(self, user_id: Any) -> dict[str, Any]:
         """Resolve an account ID to a public profile URL.
-
         The shared Playwright page is protected from concurrent navigation races.
         """
         async with self._operation_lock:
@@ -239,7 +232,6 @@ class SuperLiveDiscovery:
 
     async def _discover_profile_id_unlocked(self, user_id: Any) -> dict[str, Any]:
         """Resolve an account ID to a public profile URL.
-
         For SuperLive numeric IDs, the canonical URL is /fr/profile/{id}.
         The return shape is intentionally stable for auto_monitor.py callers.
         """
@@ -320,6 +312,7 @@ class SuperLiveDiscovery:
         search_control_found = False
         search_action_attempted = False
         verified_results_seen = False
+
         for search_index, search_url in enumerate(search_urls, start=1):
             self.log.info("Search attempt %d/%d for key %s: %s", search_index, len(search_urls), raw, search_url)
             if not await self._goto(search_url):
@@ -354,9 +347,9 @@ class SuperLiveDiscovery:
                                 continue
                             if visible:
                                 visible_count += 1
-                            if visible and enabled and input_type not in {"hidden", "checkbox", "radio", "password", "email"}:
-                                chosen = field
-                                break
+                                if visible and enabled and input_type not in {"hidden", "checkbox", "radio", "password", "email"}:
+                                    chosen = field
+                                    break
                         if chosen is None:
                             if count:
                                 self.log.info(
@@ -396,12 +389,13 @@ class SuperLiveDiscovery:
                         break
                     except PlaywrightError:
                         continue
+
             try:
                 links = await page.locator("a[href]").evaluate_all("""els => els.slice(0,2000).map(a => {
                     let n = a, card = '';
                     for (let i=0; i<5 && n; i++, n=n.parentElement) {
-                      const t = (n.innerText || n.textContent || '').trim();
-                      if (t.length >= 2 && t.length <= 1200) { card = t; if (i >= 1) break; }
+                        const t = (n.innerText || n.textContent || '').trim();
+                        if (t.length >= 2 && t.length <= 1200) { card = t; if (i >= 1) break; }
                     }
                     return {href:a.href, text:(a.innerText||a.textContent||'').trim(), card};
                 })""")
@@ -423,6 +417,7 @@ class SuperLiveDiscovery:
             except PlaywrightError as exc:
                 self.log.warning("Could not read search results for key %s: %s", raw, type(exc).__name__)
                 continue
+
             # Never treat generic navigation/profile links as search results. A
             # result heading tied to the exact query is the minimum evidence that
             # this page is displaying the site's response to our search.
@@ -432,6 +427,7 @@ class SuperLiveDiscovery:
                     raw, search_control_found, search_action_attempted,
                 )
                 continue
+
             for item in links:
                 href = str(item.get("href", "")).strip()
                 label = self._clean(str(item.get("text", ""))).lower()
@@ -571,7 +567,7 @@ class SuperLiveDiscovery:
             pass
         # Require explicit live evidence; a video element alone is not proof of live status.
         explicit = [x for x in positive if x != "video_element_present"]
-        if negative and not any(x in combined for x in ("live now", "currently live", "بث مباشر")):
+        if negative and not any(x in combined for x in ("live now", "currently live", "بث مباشر", "en direct", "direct")):
             return False, ["negative_status:" + x for x in negative]
         return bool(explicit), explicit or negative
 
@@ -583,7 +579,6 @@ class SuperLiveDiscovery:
 
     async def check_live_status(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Compatibility API used by auto_monitor.py to inspect a profile.
-
         Accepts a profile URL or user ID positionally, or common keyword names
         (profile_url, url, user_id, username). Returns a stable dictionary rather
         than raising when a page cannot be inspected.
@@ -598,6 +593,7 @@ class SuperLiveDiscovery:
                 profile_url = text
             elif text and not user_id:
                 user_id = text
+
         if not profile_url and user_id:
             resolved = await self.discover_profile_id(user_id)
             profile_url = str(resolved.get("profile_url") or "")
@@ -609,6 +605,7 @@ class SuperLiveDiscovery:
                     "error": resolved.get("error") or "profile_not_found",
                     "live_evidence": [], "premium_evidence": [],
                 }
+
         if not profile_url or not self._same_site(profile_url):
             return {
                 "success": False, "ok": False, "user_id": user_id or None,
@@ -632,8 +629,10 @@ class SuperLiveDiscovery:
                 current_url = self._norm_url(page.url)
                 title = await self._title(page)
                 text = await self._text(page)
+                
                 live, live_evidence = await self.is_live_page(page)
                 premium, premium_evidence = await self.detect_premium(page)
+
                 # Profile pages often link to their active livestream. Collect only
                 # canonical livestream routes; a link alone is not treated as proof
                 # that the stream is live unless the page itself gives live evidence.
@@ -658,6 +657,68 @@ class SuperLiveDiscovery:
                         stream_id = m.group(1) if m else None
                 except PlaywrightError:
                     pass
+
+                # --- FIX: FALLBACK EXTRACTION FOR SPA/JSON EMBEDDED STATES ---
+                try:
+                    html = (await page.content())[:2_000_000]
+                    
+                    # 1. Extract stream_id from JSON/HTML if not found in <a> tags
+                    if not stream_id:
+                        id_patterns = [
+                            r'"streamId"\s*:\s*"?(\d{5,15})"?',
+                            r'"stream_id"\s*:\s*"?(\d{5,15})"?',
+                            r'"liveStreamId"\s*:\s*"?(\d{5,15})"?',
+                            r'"broadcastId"\s*:\s*"?(\d{5,15})"?',
+                            r'"roomId"\s*:\s*"?(\d{5,15})"?',
+                            r'/livestream/(\d{5,15})',
+                        ]
+                        for pat in id_patterns:
+                            m = re.search(pat, html, re.I)
+                            if m:
+                                val = m.group(1)
+                                if val != str(user_id) and val != str(kwargs.get("profile_id") or ""):
+                                    stream_id = val
+                                    stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
+                                    live_evidence.append("html_json_stream_id")
+                                    break
+                                    
+                    # 2. Extract live/premium states from JSON if text matching failed
+                    if not live:
+                        if re.search(r'"isLive"\s*:\s*true', html, re.I) or \
+                           re.search(r'"is_live"\s*:\s*true', html, re.I) or \
+                           re.search(r'"live"\s*:\s*true', html, re.I) or \
+                           re.search(r'"status"\s*:\s*"live"', html, re.I) or \
+                           re.search(r'"streamStatus"\s*:\s*"live"', html, re.I) or \
+                           re.search(r'"state"\s*:\s*"live"', html, re.I):
+                            live = True
+                            live_evidence.append("html_json_live_state")
+                            
+                    if not premium:
+                        if re.search(r'"isPremium"\s*:\s*true', html, re.I) or \
+                           re.search(r'"is_premium"\s*:\s*true', html, re.I) or \
+                           re.search(r'"premium"\s*:\s*true', html, re.I) or \
+                           re.search(r'"isVip"\s*:\s*true', html, re.I):
+                            premium = True
+                            premium_evidence.append("html_json_premium_state")
+                            
+                    # 3. Check DOM for live indicators (e.g., .live-indicator)
+                    if not live:
+                        live_selectors = [
+                            "[class*='live' i]", "[class*='direct' i]",
+                            "[data-live='true']", "[data-status='live']",
+                            ".live-indicator", ".is-live", ".badge-live"
+                        ]
+                        for sel in live_selectors:
+                            count = await page.locator(sel).count()
+                            if count > 0:
+                                if await page.locator(sel).first.is_visible():
+                                    live = True
+                                    live_evidence.append(f"selector:{sel}")
+                                    break
+                except Exception as e:
+                    self.log.debug("Fallback HTML/JSON extraction failed: %s", e)
+                # --- END FALLBACK EXTRACTION ---
+
                 # If the profile itself does not prove a live stream, inspect the
                 # discovered livestream page too. A link alone is not proof of live.
                 stream_title = ""
@@ -747,10 +808,11 @@ class SuperLiveDiscovery:
                 absolute = self._norm_url(urljoin(self.base_url + "/", str(href)))
                 path = urlparse(absolute).path.lower()
                 if (absolute and (not same_site_only or self._same_site(absolute)) and path not in ("", "/")
-                    and any(term in path for term in ("live", "stream", "watch", "profile", "user")) and absolute not in targets):
+                        and any(term in path for term in ("live", "stream", "watch", "profile", "user")) and absolute not in targets):
                     targets.append(absolute)
                 if len(targets) >= max(1, min(int(max_links), 500)):
                     break
+
         results = []
         for target in targets[:max(1, min(int(max_links), 500))]:
             try:
@@ -784,9 +846,9 @@ class SuperLiveDiscovery:
                 "success": bool(data.get("title") or data.get("username") or data.get("stream_id")),
                 "reason": "record_has_identifying_fields" if (data.get("title") or data.get("username") or data.get("stream_id")) else "missing_identifying_fields"}
 
-    # Explicitly unsupported sync context managers help surface migration errors clearly.
-    def __enter__(self):
-        raise RuntimeError("SuperLiveDiscovery v11 is async. Use 'async with SuperLiveDiscovery() as discovery:'")
+# Explicitly unsupported sync context managers help surface migration errors clearly.
+def __enter__(self):
+    raise RuntimeError("SuperLiveDiscovery v11 is async. Use 'async with SuperLiveDiscovery() as discovery:'")
 
-    def __exit__(self, *args):
-        return None
+def __exit__(self, *args):
+    return None
