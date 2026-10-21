@@ -1,4 +1,4 @@
-"""SuperLiveDiscovery 11.6 - API-Driven Discovery & JSON Interception."""
+"""SuperLiveDiscovery 11.8 - API-Driven Discovery & JSON Interception."""
 from __future__ import annotations
 import asyncio
 import json
@@ -20,7 +20,7 @@ except ImportError as exc:
         "then run: playwright install chromium"
     ) from exc
 
-VERSION = "11.6"
+VERSION = "11.8"
 DEFAULT_BASE_URL = "https://superlivetv.com"
 DEFAULT_LOCALE = "fr"
 LOG = logging.getLogger("SuperLiveDiscovery")
@@ -48,7 +48,7 @@ class SuperLiveDiscovery:
     """Async Playwright discovery class. Public methods are awaitable."""
     LIVE_TERMS = ("live now", "is live", "live stream", "watch live", "currently live", "مباشر", "بث مباشر", "en direct", "direct", "en vivo", "vivo")
     NON_LIVE_TERMS = ("replay", "recorded", "offline", "not live", "ended", "past stream", "إعادة", "مسجل", "غير متصل", "انتهى البث", "hors ligne", "terminé", "rediffusion", "passé")
-    PREMIUM_TERMS = ("premium", "paid stream", "subscriber only", "subscribers only", "members only", "exclusive stream", "vip", "مدفوع", "للمشتركين", "حصري", "privé", "exclusive", "abonnés", "réservé")
+    PREMIUM_TERMS = ("premium", "paid stream", "subscriber only", "subscribers only", "members only", "exclusive stream", "vip", "مدفوع", "للمشتركين", "حصري", "privé", "exclusive", "abonnés", "réservé", "إشتراك مدفوع")
     ERROR_TERMS = ("page not found", "user not found", "profile not found", "404 not found", "account does not exist")
 
     def __init__(self, base_url: str = DEFAULT_BASE_URL, headless: bool = True,
@@ -566,32 +566,33 @@ class SuperLiveDiscovery:
                 title = await self._title(page)
                 text = await self._text(page)
                 
-                live, live_evidence = await self.is_live_page(page)
+                dom_live, dom_evidence = await self.is_live_page(page)
                 premium, premium_evidence = await self.detect_premium(page)
                 
                 display_name = ""
                 stream_url = None
                 stream_id = None
                 ownership_verified = False
+                api_found = False
                 
                 # 1. Parse intercepted API data (The Goldmine)
                 profile_api_data = {}
                 for item in intercepted_data:
                     url = item["url"]
                     body = item["body"]
-                    ct = item.get("ct", "")
                     
                     if "api.spl-live.com/api/web/users/profile" in url or "/api/web/users/profile" in url:
                         try:
                             data = json.loads(body)
-                            user_obj = data.get("user", {})
+                            user_obj = data.get("user", data)
                             profile_api_data = {
                                 "name": user_obj.get("name"),
                                 "user_id": user_obj.get("user_id"),
                                 "shared_id": user_obj.get("shared_id"),
                                 "is_live": user_obj.get("is_live") or user_obj.get("live") or user_obj.get("is_broadcasting"),
-                                "room_id": user_obj.get("room_id") or user_obj.get("stream_id") or user_obj.get("live_id") or user_obj.get("broadcast_id")
+                                "room_id": user_obj.get("room_id") or user_obj.get("stream_id") or user_obj.get("live_id") or user_obj.get("broadcast_id") or user_obj.get("live_room_id")
                             }
+                            api_found = True
                         except Exception:
                             pass
                             
@@ -601,11 +602,24 @@ class SuperLiveDiscovery:
                         display_name = str(profile_api_data["name"]).strip()
                     if profile_api_data.get("user_id") and str(profile_api_data["user_id"]).isdigit():
                         profile_id = str(profile_api_data["user_id"])
-                    if profile_api_data.get("room_id") and str(profile_api_data["room_id"]).isdigit() and not stream_id:
+                    if profile_api_data.get("room_id") and str(profile_api_data["room_id"]).isdigit():
                         stream_id = str(profile_api_data["room_id"])
                         stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
                         ownership_verified = True
-                        live_evidence.append("api_room_id_verified")
+                        dom_evidence.append("api_room_id_verified")
+                        
+                # CRITICAL FIX: API is the source of truth for Live status
+                if api_found:
+                    if profile_api_data.get("room_id") or profile_api_data.get("is_live"):
+                        live = True
+                        live_evidence = ["api_live_verified"] + dom_evidence
+                    else:
+                        live = False
+                        live_evidence = ["api_offline_verified"]
+                else:
+                    # Fallback to DOM if API interception failed
+                    live = dom_live
+                    live_evidence = dom_evidence
                         
                 # 2. Generic JSON parsing for stream_id if still not found
                 if not stream_id:
