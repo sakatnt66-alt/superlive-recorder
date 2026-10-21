@@ -25,7 +25,7 @@ WATCHLIST_FILE = Path("data/watchlist.json")
 MAX_CONCURRENT = 1
 MAX_RECORDINGS = 5
 MONITOR_BUDGET_SECONDS = 185
-PER_USER_TIMEOUT_SECONDS = 14
+PER_USER_TIMEOUT_SECONDS = 10
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
@@ -36,17 +36,10 @@ logging.basicConfig(level=logging.INFO, format="[DISCOVERY] %(levelname)s %(mess
 print(f"[DEBUG] WORKER_API_URL: {'SET' if WORKER_API_URL else 'MISSING'} (length={len(WORKER_API_URL)})", flush=True)
 print(f"[DEBUG] AUTO_API_TOKEN: {'SET' if AUTO_API_TOKEN else 'MISSING'} (length={len(AUTO_API_TOKEN)})", flush=True)
 
-def is_valid_stream_id(stream_id, user_id, profile_id) -> bool:
+def is_valid_stream_id(stream_id, user_id) -> bool:
     sid = str(stream_id or "").strip()
     uid = str(user_id or "").strip()
-    pid = str(profile_id or "").strip()
-    if not sid.isdigit():
-        return False
-    if not (5 <= len(sid) <= 15):
-        return False
-    if sid == uid or sid == pid:
-        return False
-    return True
+    return sid.isdigit() and len(sid) >= 9 and sid != uid
 
 def is_valid_profile_id(profile_id) -> bool:
     value = str(profile_id or "").strip()
@@ -136,8 +129,8 @@ def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name
             payload={"stream_url": stream_url, "stream_id": stream_id, "stream_name": stream_name},
         )
         if status == 200 and data.get("success"):
-            print(f"[RECORDING] Starting recording for: {stream_name} (user_id={user_id})")
-            print(f"[AUTO] URL: {stream_url}; Stream ID: {stream_id}")
+            print(f"[AUTO] START_RECORDING user={user_id}, stream={stream_id}")
+            print(f"[AUTO] URL: {stream_url}; Name: {stream_name}")
             return True
         print(f"[AUTO] Failed to trigger {user_id}: {data.get('error', 'unknown error')}")
     except urllib.error.HTTPError as exc:
@@ -156,17 +149,17 @@ def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name
 
 def fetch_profile_api_fast(shared_id: str) -> dict:
     """Attempt to fetch profile data directly from the backend API (Fast Path)."""
+    url = "https://api.spl-live.com/api/web/users/profile"
     for param_name in ["shared_id", "user_id", "id"]:
-        url = f"https://api.spl-live.com/api/web/users/profile?{param_name}={shared_id}"
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=5) as response:
+            req = urllib.request.Request(f"{url}?{param_name}={shared_id}", headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=4) as response:
                 if response.status == 200:
                     raw = response.read().decode("utf-8", errors="replace")
                     if raw:
                         data = json.loads(raw)
                         if data and data.get("user"):
-                            print(f"[FAST_PATH] API Success via ?{param_name}={shared_id}")
+                            print(f"[FAST_PATH] API Success via GET ?{param_name}={shared_id}")
                             return data
         except Exception:
             pass
@@ -185,8 +178,7 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
     if api_data and api_data.get("user"):
         user_obj = api_data["user"]
         name = str(user_obj.get("name") or "").strip()
-        internal_id = str(user_obj.get("user_id") or "").strip()
-        is_live = bool(user_obj.get("is_live") or user_obj.get("live") or user_obj.get("is_broadcasting"))
+        is_live = bool(user_obj.get("is_live") or user_obj.get("live") or user_obj.get("is_broadcasting") or user_obj.get("room_id"))
         room_id = str(user_obj.get("room_id") or user_obj.get("stream_id") or user_obj.get("live_room_id") or "").strip()
         bio = str(user_obj.get("bio") or "").lower()
         is_premium = any(term in bio for term in ["مدفوع", "premium", "إشتراك", "vip", "paid", "subscriber"])
@@ -210,18 +202,16 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
                 "user_id": user_id,
                 "stream_id": room_id,
                 "stream_url": stream_url,
-                "stream_name": display_name,
-                "is_premium": is_premium
+                "stream_name": display_name
             }
         elif not is_live:
-            print(f"[FAST_PATH] User {user_id} is OFFLINE according to API. Skipping Playwright.")
+            print(f"[FAST_PATH] User {user_id} is OFFLINE. Skipping Playwright.")
             return None
         elif is_premium:
-            print(f"[FAST_PATH] User {user_id} is LIVE but PREMIUM. Skipping.")
+            print(f"[FAST_PATH] User {user_id} is PREMIUM. Skipping.")
             return None
     # --- END FAST PATH ---
-    
-    # Fallback to Playwright if API failed
+
     try:
         profile_result = await asyncio.wait_for(
             discovery.discover_profile_id(user_id), timeout=PER_USER_TIMEOUT_SECONDS
@@ -272,38 +262,27 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         is_premium = result.get("is_premium") is True or result.get("premium") is True
         stream_id = str(result.get("stream_id") or "").strip()
         stream_url = str(result.get("stream_url") or "").strip()
-        ownership_verified = result.get("ownership_verified", False)
+        stream_id_valid = is_valid_stream_id(stream_id, user_id)
         
-        # Extract Display Name with strict fallbacks
-        display_name = str(result.get("display_name") or "").strip()
         ignored_names = {"property", "superlive", "superlivetv", "profile", "null", "undefined", ""}
+        final_username = str(result.get("display_name") or result.get("username") or username or "").strip()
         
-        if not display_name or display_name.lower() in ignored_names:
+        if not final_username or final_username.lower() in ignored_names or final_username == user_id:
             for item in watchlist:
-                if str(item.get("stream_id") or item.get("user_id") or "") == user_id:
-                    wl_name = str(item.get("display_name") or "").strip()
+                if str(item.get("stream_id") or item.get("user_id") or "") == user_id and item.get("display_name"):
+                    wl_name = str(item["display_name"]).strip()
                     if wl_name and wl_name.lower() not in ignored_names:
-                        display_name = wl_name
+                        final_username = wl_name
                         break
                         
-        if not display_name or display_name.lower() in ignored_names:
-            if username and username.lower() not in ignored_names:
-                display_name = username
-                
-        display_name = display_name or user_id
+        final_username = final_username or user_id
         
-        real_profile_id = str(result.get("profile_id") or profile_id).strip()
-        if real_profile_id and is_valid_profile_id(real_profile_id):
-            profile_id = real_profile_id
-        
-        stream_id_valid = is_valid_stream_id(stream_id, user_id, profile_id)
-        
-        print(f"[AUTO] Processing user: {display_name} (user_id={user_id})")
+        print(f"[AUTO] Processing user: {final_username} (user_id={user_id})")
         print("[AUTO] source=discovery_layer")
         print(f"[AUTO] profile_url={profile_url}")
         if profile_id:
             print(f"[AUTO] profile_id={profile_id}")
-        print(f"[AUTO] Real stream ID resolved: {stream_id or '(not found)'} (valid={stream_id_valid}, owned={ownership_verified})")
+        print(f"[AUTO] stream_id={stream_id or '(not found)'} (valid={stream_id_valid})")
         
         if is_premium:
             print("[AUTO] phase=p2_premium status=LIVE_PREMIUM action=SKIP_PREMIUM reason=premium")
@@ -315,24 +294,14 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
             return None
             
         if not stream_id_valid:
-            print(f"[AUTO] status=LIVE_BUT_INVALID_STREAM_ID action=SKIP stream_id={stream_id or '(missing)'}")
-            return None
-            
-        if not ownership_verified:
-            print(f"[AUTO] status=LIVE_BUT_UNVERIFIED_OWNERSHIP action=SKIP stream_id={stream_id}")
+            print(f"[AUTO] status=LIVE_BUT_NO_VALID_STREAM_ID action=SKIP_INVALID_STREAM stream_id={stream_id or '(missing)'}")
             return None
             
         if not stream_url or not re.fullmatch(r"https://superlivetv\.com/fr/livestream/\d+/?", stream_url):
             stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
             
-        print("[AUTO] Stream URL validated for the expected user")
         print("[AUTO] phase=phase_3_done status=LIVE_NORMAL action=CANDIDATE reason=live")
-        return {
-            "user_id": user_id, 
-            "stream_id": stream_id, 
-            "stream_url": stream_url, 
-            "stream_name": display_name
-        }
+        return {"user_id": user_id, "stream_id": stream_id, "stream_url": stream_url, "stream_name": final_username}
         
     except asyncio.TimeoutError:
         print(f"[AUTO] TIMEOUT user={user_id} limit={PER_USER_TIMEOUT_SECONDS}s action=SKIP_AND_CONTINUE", flush=True)
@@ -374,7 +343,7 @@ async def main():
     checked = 0
     timed_out_or_unchecked = 0
     
-    discovery = SuperLiveDiscovery(timeout_ms=7000, navigation_timeout_ms=10000, retries=0)
+    discovery = SuperLiveDiscovery(timeout_ms=5000, navigation_timeout_ms=8000, retries=0)
     try:
         print("[AUTO] Starting Chromium (startup timeout=25s)", flush=True)
         await asyncio.wait_for(discovery.open(), timeout=25)
