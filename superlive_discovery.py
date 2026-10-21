@@ -658,25 +658,31 @@ class SuperLiveDiscovery:
                 except PlaywrightError:
                     pass
 
-                # --- FIX: FALLBACK EXTRACTION FOR SPA/JSON EMBEDDED STATES ---
+                # --- ENHANCED FALLBACK EXTRACTION FOR SPA/JSON EMBEDDED STATES ---
                 try:
-                    html = (await page.content())[:2_000_000]
+                    html_content = (await page.content())[:2_000_000]
                     
                     # 1. Extract stream_id from JSON/HTML if not found in <a> tags
                     if not stream_id:
                         id_patterns = [
-                            r'"streamId"\s*:\s*"?(\d{5,15})"?',
-                            r'"stream_id"\s*:\s*"?(\d{5,15})"?',
-                            r'"liveStreamId"\s*:\s*"?(\d{5,15})"?',
-                            r'"broadcastId"\s*:\s*"?(\d{5,15})"?',
-                            r'"roomId"\s*:\s*"?(\d{5,15})"?',
-                            r'/livestream/(\d{5,15})',
+                            r'"streamId"\s*:\s*"?([A-Za-z0-9_-]{5,20})"?',
+                            r'"stream_id"\s*:\s*"?([A-Za-z0-9_-]{5,20})"?',
+                            r'"liveStreamId"\s*:\s*"?([A-Za-z0-9_-]{5,20})"?',
+                            r'"broadcastId"\s*:\s*"?([A-Za-z0-9_-]{5,20})"?',
+                            r'"roomId"\s*:\s*"?([A-Za-z0-9_-]{5,20})"?',
+                            r'"room_id"\s*:\s*"?([A-Za-z0-9_-]{5,20})"?',
+                            r'"liveId"\s*:\s*"?([A-Za-z0-9_-]{5,20})"?',
+                            r'"live_id"\s*:\s*"?([A-Za-z0-9_-]{5,20})"?',
+                            r'"id"\s*:\s*"?(\d{5,20})"?',
+                            r'/livestream/([A-Za-z0-9_-]+)',
+                            r'/live/([A-Za-z0-9_-]+)',
+                            r'/room/([A-Za-z0-9_-]+)',
                         ]
                         for pat in id_patterns:
-                            m = re.search(pat, html, re.I)
+                            m = re.search(pat, html_content, re.I)
                             if m:
                                 val = m.group(1)
-                                if val != str(user_id) and val != str(kwargs.get("profile_id") or ""):
+                                if len(val) >= 5:
                                     stream_id = val
                                     stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
                                     live_evidence.append("html_json_stream_id")
@@ -684,29 +690,32 @@ class SuperLiveDiscovery:
                                     
                     # 2. Extract live/premium states from JSON if text matching failed
                     if not live:
-                        if re.search(r'"isLive"\s*:\s*true', html, re.I) or \
-                           re.search(r'"is_live"\s*:\s*true', html, re.I) or \
-                           re.search(r'"live"\s*:\s*true', html, re.I) or \
-                           re.search(r'"status"\s*:\s*"live"', html, re.I) or \
-                           re.search(r'"streamStatus"\s*:\s*"live"', html, re.I) or \
-                           re.search(r'"state"\s*:\s*"live"', html, re.I):
+                        if re.search(r'"isLive"\s*:\s*true', html_content, re.I) or \
+                           re.search(r'"is_live"\s*:\s*true', html_content, re.I) or \
+                           re.search(r'"live"\s*:\s*true', html_content, re.I) or \
+                           re.search(r'"status"\s*:\s*"live"', html_content, re.I) or \
+                           re.search(r'"streamStatus"\s*:\s*"live"', html_content, re.I) or \
+                           re.search(r'"state"\s*:\s*"live"', html_content, re.I) or \
+                           re.search(r'"isStreaming"\s*:\s*true', html_content, re.I):
                             live = True
                             live_evidence.append("html_json_live_state")
                             
                     if not premium:
-                        if re.search(r'"isPremium"\s*:\s*true', html, re.I) or \
-                           re.search(r'"is_premium"\s*:\s*true', html, re.I) or \
-                           re.search(r'"premium"\s*:\s*true', html, re.I) or \
-                           re.search(r'"isVip"\s*:\s*true', html, re.I):
+                        if re.search(r'"isPremium"\s*:\s*true', html_content, re.I) or \
+                           re.search(r'"is_premium"\s*:\s*true', html_content, re.I) or \
+                           re.search(r'"premium"\s*:\s*true', html_content, re.I) or \
+                           re.search(r'"isVip"\s*:\s*true', html_content, re.I) or \
+                           re.search(r'"isPaid"\s*:\s*true', html_content, re.I):
                             premium = True
                             premium_evidence.append("html_json_premium_state")
                             
-                    # 3. Check DOM for live indicators (e.g., .live-indicator)
+                    # 3. Check DOM for live indicators
                     if not live:
                         live_selectors = [
                             "[class*='live' i]", "[class*='direct' i]",
                             "[data-live='true']", "[data-status='live']",
-                            ".live-indicator", ".is-live", ".badge-live"
+                            ".live-indicator", ".is-live", ".badge-live",
+                            "[class*='streaming' i]"
                         ]
                         for sel in live_selectors:
                             count = await page.locator(sel).count()
@@ -715,9 +724,27 @@ class SuperLiveDiscovery:
                                     live = True
                                     live_evidence.append(f"selector:{sel}")
                                     break
+
+                    # 4. ULTIMATE FALLBACK: If page is confirmed LIVE but no stream_id found,
+                    # use the profile_id as the stream_id. Many platforms use the same ID for room/stream.
+                    if live and not stream_id:
+                        pid = str(kwargs.get("profile_id") or "").strip()
+                        if pid and pid.isdigit() and len(pid) >= 5:
+                            stream_id = pid
+                            stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
+                            live_evidence.append("fallback_profile_id_as_stream_id")
+                            self.log.info("Used profile_id %s as fallback stream_id for live user %s", pid, user_id)
+                        
+                    # Debug log if still missing (helps diagnose future site changes)
+                    if live and not stream_id:
+                        snippet_idx = html_content.lower().find('"live"')
+                        if snippet_idx == -1: snippet_idx = html_content.lower().find('live')
+                        snippet = html_content[max(0, snippet_idx - 100):snippet_idx + 200] if snippet_idx != -1 else "No live keyword found"
+                        self.log.warning("Live detected but stream_id STILL not found. HTML snippet: %s", snippet[:300])
+
                 except Exception as e:
                     self.log.debug("Fallback HTML/JSON extraction failed: %s", e)
-                # --- END FALLBACK EXTRACTION ---
+                # --- END ENHANCED FALLBACK EXTRACTION ---
 
                 # If the profile itself does not prove a live stream, inspect the
                 # discovered livestream page too. A link alone is not proof of live.
