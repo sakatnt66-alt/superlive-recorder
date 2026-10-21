@@ -1,7 +1,4 @@
-"""SuperLiveDiscovery 11.4 - async-first defensive public-page discovery.
-Designed for callers that use ``await discovery.discover_profile_id(user_id)``.
-Requires: pip install playwright && playwright install chromium
-"""
+"""SuperLiveDiscovery 11.5 - Advanced Network Interception & Next.js Data Extraction."""
 from __future__ import annotations
 import asyncio
 import logging
@@ -22,7 +19,7 @@ except ImportError as exc:
         "then run: playwright install chromium"
     ) from exc
 
-VERSION = "11.4"
+VERSION = "11.5"
 DEFAULT_BASE_URL = "https://superlivetv.com"
 DEFAULT_LOCALE = "fr"
 LOG = logging.getLogger("SuperLiveDiscovery")
@@ -54,7 +51,7 @@ class SuperLiveDiscovery:
     ERROR_TERMS = ("page not found", "user not found", "profile not found", "404 not found", "account does not exist")
 
     def __init__(self, base_url: str = DEFAULT_BASE_URL, headless: bool = True,
-                 timeout_ms: int = 6000, navigation_timeout_ms: int = 9000,
+                 timeout_ms: int = 7000, navigation_timeout_ms: int = 10000,
                  user_agent: Optional[str] = None, logger: Optional[logging.Logger] = None,
                  retries: int = 0, **kwargs: Any) -> None:
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
@@ -152,7 +149,7 @@ class SuperLiveDiscovery:
                     self.log.debug("HTTP %s while opening %s", response.status, url)
                     return False
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=min(1500, self.timeout_ms))
+                    await page.wait_for_load_state("networkidle", timeout=min(2000, self.timeout_ms))
                 except PlaywrightTimeoutError:
                     pass
                 return True
@@ -499,45 +496,54 @@ class SuperLiveDiscovery:
         return bool(evidence), evidence
 
     async def _extract_display_name(self, page: Page, fallback: str, intercepted_data: list) -> str:
-        """Extract real display name from HTML or intercepted JSON."""
-        name = ""
-        # 1. Meta tags
-        try:
-            og_title = await page.locator("meta[property='og:title']").get_attribute("content")
-            if og_title and len(og_title) < 100:
-                name = og_title.split("-")[0].split("|")[0].strip()
-                if name and name.lower() not in ["superlive", "superlivetv", "profile"]:
-                    return name
-        except: pass
+        """Extract real display name from HTML or intercepted JSON, ignoring default SEO titles."""
+        ignored_phrases = [
+            "rencontrez de nouvelles personnes",
+            "superlive", "superlivetv", "profile", "watch live",
+            "live stream", "diffusions en direct", "découvrez"
+        ]
         
-        # 2. Title tag
-        try:
-            title = await page.title()
-            if title:
-                name = title.split("-")[0].split("|")[0].strip()
-                if name and name.lower() not in ["superlive", "superlivetv", "profile"]:
-                    return name
-        except: pass
+        def is_valid_name(name: str) -> bool:
+            if not name or len(name) < 2 or len(name) > 60:
+                return False
+            name_lower = name.lower()
+            for phrase in ignored_phrases:
+                if phrase in name_lower:
+                    return False
+            # Ignore pure usernames if they match the slug exactly and we have better data
+            return True
 
-        # 3. H1 or specific classes
+        # 1. DOM Elements (Highest priority for SPA)
         try:
-            for sel in ["h1", ".username", ".profile-name", ".nickname", "[class*='name' i]"]:
-                el = page.locator(sel).first
-                if await el.count():
-                    text = await el.inner_text()
-                    text = text.strip()
-                    if text and len(text) < 50 and text.lower() not in ["superlive", "follow", "subscribe"]:
+            for sel in ["h1", "h2", ".username", ".profile-name", ".nickname", "[class*='name' i]", "[class*='user' i]"]:
+                els = page.locator(sel)
+                count = await els.count()
+                for i in range(min(count, 3)):
+                    text = (await els.nth(i).inner_text()).strip()
+                    text = text.split('\n')[0].strip()
+                    if is_valid_name(text) and text.lower() != fallback.lower() and text.lower() != "@" + fallback.lower():
                         return text
         except: pass
-        
-        # 4. Intercepted JSON
-        for body in intercepted_data:
-            m = re.search(r'["\'](?:nickname|displayName|display_name|name|username)["\']\s*:\s*["\']([^"\']{2,50})["\']', body)
+
+        # 2. Intercepted JSON
+        for item in intercepted_data:
+            body = item.get("body", "")
+            # Look for display_name, nickname, name, username
+            m = re.search(r'["\'](?:nickname|displayName|display_name|name|username|authorName)["\']\s*:\s*["\']([^"\']{2,50})["\']', body)
             if m:
                 val = m.group(1).strip()
-                if val and val.lower() not in ["superlive", "null", "undefined", "user", fallback.lower()]:
+                if is_valid_name(val) and val.lower() != fallback.lower() and val.lower() != "@" + fallback.lower():
                     return val
                     
+        # 3. Meta tags (Fallback)
+        try:
+            og_title = await page.locator("meta[property='og:title']").get_attribute("content")
+            if og_title:
+                clean_title = og_title.split("-")[0].split("|")[0].strip()
+                if is_valid_name(clean_title) and clean_title.lower() != fallback.lower():
+                    return clean_title
+        except: pass
+        
         return fallback
 
     async def check_live_status(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -580,13 +586,18 @@ class SuperLiveDiscovery:
             
             async def on_response(response):
                 try:
+                    url = response.url
                     if response.status == 200:
                         ct = response.headers.get("content-type", "")
                         if any(t in ct for t in ["json", "javascript", "text/plain", "html"]):
                             cl = response.headers.get("content-length", "0")
                             if cl.isdigit() and int(cl) < 2000000:
                                 body = await response.text()
-                                intercepted_data.append(body)
+                                intercepted_data.append({"url": url, "body": body})
+                                # Diagnostic Trap: Log API calls related to stream/user
+                                if any(kw in url.lower() for kw in ["stream", "live", "room", "broadcast", "user", "profile", "status"]):
+                                    snippet = body[:300].replace('\n', ' ')
+                                    self.log.info(f"INTERCEPTED_API: {url} | snippet: {snippet}")
                 except Exception:
                     pass
 
@@ -604,8 +615,7 @@ class SuperLiveDiscovery:
                         "live_evidence": [], "premium_evidence": [],
                     }
                 
-                # Wait for XHRs to fire
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(2000)
                 
                 current_url = self._norm_url(page.url)
                 title = await self._title(page)
@@ -621,65 +631,77 @@ class SuperLiveDiscovery:
                 
                 html_content = await page.content()
                 
-                # 1. Find /livestream/ID in HTML (Profile Page)
-                # Matches 5 to 15 digit numbers
-                html_matches = re.findall(r'/livestream/(\d{5,15})', html_content)
-                valid_html_ids = [m for m in html_matches if m != str(user_id) and m != str(profile_id)]
-                
-                if valid_html_ids:
-                    stream_id = valid_html_ids[0]
-                    stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
-                    ownership_verified = True  # Found on their profile page
-                    live_evidence.append("html_livestream_link")
-                else:
-                    # 2. Check intercepted JSON (Network API)
-                    for body in intercepted_data:
-                        m = re.search(r'["\'](?:streamId|stream_id|roomId|room_id|liveId|live_id|broadcastId|liveStreamId)["\']\s*:\s*["\']?(\d{5,15})["\']?', body)
+                # 1. Next.js Data Extraction
+                next_data_match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html_content, re.IGNORECASE | re.DOTALL)
+                if next_data_match:
+                    intercepted_data.append({"url": "__NEXT_DATA__", "body": next_data_match.group(1)})
+
+                # 2. Media Sources Extraction (Iframes, Videos)
+                try:
+                    media_srcs = await page.evaluate("""() => {
+                        let srcs = [];
+                        document.querySelectorAll('iframe, video, source').forEach(el => {
+                            if (el.src) srcs.push(el.src);
+                            if (el.tagName === 'VIDEO' && el.currentSrc) srcs.push(el.currentSrc);
+                        });
+                        return srcs;
+                    }""")
+                    for src in media_srcs:
+                        m = re.search(r'/livestream/(\d{5,15})', str(src))
                         if m:
                             val = m.group(1)
                             if val != str(user_id) and val != str(profile_id):
-                                # CRITICAL: Verify ownership via JSON payload
-                                if str(user_id) in body or str(profile_id) in body:
-                                    stream_id = val
-                                    stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
-                                    ownership_verified = True
-                                    live_evidence.append("json_api_verified")
-                                    break
-                                    
-                # 3. Fallback to <a> tags if still not found (legacy support)
+                                stream_id = val
+                                stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
+                                ownership_verified = True
+                                live_evidence.append("media_src_livestream_link")
+                                break
+                except Exception:
+                    pass
+
+                # 3. Find /livestream/ID in HTML (Profile Page)
                 if not stream_id:
-                    try:
-                        links = await page.locator("a[href]").evaluate_all(
-                            "els => els.slice(0,1500).map(a => a.href)"
-                        )
-                        for link in links:
-                            absolute = self._norm_url(str(link or ""))
-                            if not self._same_site(absolute):
-                                continue
-                            path = urlparse(absolute).path
-                            match = re.search(r"/livestream/(\d{5,15})(?:/|$)", path, re.I)
-                            if match:
-                                val = match.group(1)
+                    html_matches = re.findall(r'/livestream/(\d{5,15})', html_content)
+                    valid_html_ids = [m for m in html_matches if m != str(user_id) and m != str(profile_id)]
+                    if valid_html_ids:
+                        stream_id = valid_html_ids[0]
+                        stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
+                        ownership_verified = True
+                        live_evidence.append("html_livestream_link")
+                
+                # 4. Check intercepted JSON (Network API & Next.js Data)
+                if not stream_id:
+                    for item in intercepted_data:
+                        body = item.get("body", "")
+                        url = item.get("url", "")
+                        
+                        patterns = [
+                            r'["\'](?:streamId|stream_id|roomId|room_id|liveId|live_id|broadcastId|liveStreamId|channelId)["\']\s*:\s*["\']?(\d{5,15})["\']?',
+                            r'"id"\s*:\s*"?(\d{5,15})"?',
+                        ]
+                        for pat in patterns:
+                            for m in re.finditer(pat, body):
+                                val = m.group(1)
                                 if val != str(user_id) and val != str(profile_id):
-                                    stream_id = val
-                                    stream_url = absolute
-                                    ownership_verified = True # Found in DOM
-                                    break
-                    except PlaywrightError:
-                        pass
+                                    if str(user_id) in body or str(profile_id) in body:
+                                        if any(kw in body.lower() for kw in ["live", "stream", "room", "broadcast", "online", "streaming"]):
+                                            stream_id = val
+                                            stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
+                                            ownership_verified = True
+                                            live_evidence.append(f"json_api_verified:{url}")
+                                            break
+                        if stream_id:
+                            break
 
                 page.remove_listener("response", on_response)
                 
-                # If the profile itself does not prove a live stream, inspect the
-                # discovered livestream page too.
                 stream_title = ""
                 if stream_url and not live:
                     try:
-                        # Re-register listener for stream page
                         page.on("response", on_response)
                         if await self._goto(stream_url):
                             stream_page = await self._page()
-                            await stream_page.wait_for_timeout(1000)
+                            await stream_page.wait_for_timeout(1500)
                             stream_title = await self._title(stream_page)
                             stream_live, stream_evidence = await self.is_live_page(stream_page)
                             stream_premium, stream_premium_evidence = await self.detect_premium(stream_page)
