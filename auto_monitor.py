@@ -24,7 +24,7 @@ WATCHLIST_FILE = Path("data/watchlist.json")
 MAX_CONCURRENT = 1
 MAX_RECORDINGS = 5
 MONITOR_BUDGET_SECONDS = 185
-PER_USER_TIMEOUT_SECONDS = 12  # Increased slightly to allow network interception
+PER_USER_TIMEOUT_SECONDS = 14  # Increased to allow for deeper DOM/Network inspection
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
@@ -317,7 +317,7 @@ async def main():
     checked = 0
     timed_out_or_unchecked = 0
     
-    discovery = SuperLiveDiscovery(timeout_ms=6000, navigation_timeout_ms=9000, retries=0)
+    discovery = SuperLiveDiscovery(timeout_ms=7000, navigation_timeout_ms=10000, retries=0)
     try:
         print("[AUTO] Starting Chromium (startup timeout=25s)", flush=True)
         await asyncio.wait_for(discovery.open(), timeout=25)
