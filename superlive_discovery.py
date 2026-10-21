@@ -1,4 +1,4 @@
-"""SuperLiveDiscovery 11.8 - API-Driven Discovery & JSON Interception."""
+"""SuperLiveDiscovery 11.9 - API-Driven Discovery & JSON Interception."""
 from __future__ import annotations
 import asyncio
 import json
@@ -20,7 +20,7 @@ except ImportError as exc:
         "then run: playwright install chromium"
     ) from exc
 
-VERSION = "11.8"
+VERSION = "11.9"
 DEFAULT_BASE_URL = "https://superlivetv.com"
 DEFAULT_LOCALE = "fr"
 LOG = logging.getLogger("SuperLiveDiscovery")
@@ -52,7 +52,7 @@ class SuperLiveDiscovery:
     ERROR_TERMS = ("page not found", "user not found", "profile not found", "404 not found", "account does not exist")
 
     def __init__(self, base_url: str = DEFAULT_BASE_URL, headless: bool = True,
-                 timeout_ms: int = 7000, navigation_timeout_ms: int = 10000,
+                 timeout_ms: int = 5000, navigation_timeout_ms: int = 8000,
                  user_agent: Optional[str] = None, logger: Optional[logging.Logger] = None,
                  retries: int = 0, **kwargs: Any) -> None:
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
@@ -147,9 +147,10 @@ class SuperLiveDiscovery:
             try:
                 response = await page.goto(url, wait_until="domcontentloaded", timeout=self.navigation_timeout_ms)
                 if response is not None and response.status >= 400:
+                    self.log.debug("HTTP %s while opening %s", response.status, url)
                     return False
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=min(2000, self.timeout_ms))
+                    await page.wait_for_load_state("networkidle", timeout=min(900, self.timeout_ms))
                 except PlaywrightTimeoutError:
                     pass
                 return True
@@ -260,10 +261,10 @@ class SuperLiveDiscovery:
             })
             return result
 
+        # Removed en/search to avoid 404 errors and save time
         search_urls = [
             f"{self.base_url}/fr/search",
             f"{self.base_url}/fr/search?q={quote(username, safe='')}",
-            f"{self.base_url}/en/search",
         ]
         inspected: set[str] = set()
         search_control_found = False
@@ -574,16 +575,13 @@ class SuperLiveDiscovery:
                 stream_id = None
                 ownership_verified = False
                 api_found = False
-                
-                # 1. Parse intercepted API data (The Goldmine)
                 profile_api_data = {}
+                
+                # 1. Parse intercepted API data (Source of Truth)
                 for item in intercepted_data:
-                    url = item["url"]
-                    body = item["body"]
-                    
-                    if "api.spl-live.com/api/web/users/profile" in url or "/api/web/users/profile" in url:
+                    if "api.spl-live.com/api/web/users/profile" in item["url"] or "/api/web/users/profile" in item["url"]:
                         try:
-                            data = json.loads(body)
+                            data = json.loads(item["body"])
                             user_obj = data.get("user", data)
                             profile_api_data = {
                                 "name": user_obj.get("name"),
@@ -596,7 +594,6 @@ class SuperLiveDiscovery:
                         except Exception:
                             pass
                             
-                # Apply Profile API data
                 if profile_api_data:
                     if profile_api_data.get("name"):
                         display_name = str(profile_api_data["name"]).strip()
@@ -617,71 +614,11 @@ class SuperLiveDiscovery:
                         live = False
                         live_evidence = ["api_offline_verified"]
                 else:
-                    # Fallback to DOM if API interception failed
                     live = dom_live
                     live_evidence = dom_evidence
-                        
-                # 2. Generic JSON parsing for stream_id if still not found
-                if not stream_id:
-                    for item in intercepted_data:
-                        if "json" in item.get("ct", ""):
-                            body = item["body"]
-                            patterns = [
-                                r'"(?:streamId|stream_id|roomId|room_id|liveId|live_id|broadcastId|liveStreamId|channelId)"\s*:\s*"?(\d{5,15})"?',
-                            ]
-                            for pat in patterns:
-                                for m in re.finditer(pat, body):
-                                    val = m.group(1)
-                                    if val != str(user_id) and val != str(profile_id):
-                                        shared_id = str(profile_api_data.get("shared_id", ""))
-                                        if str(user_id) in body or str(profile_id) in body or shared_id in body:
-                                            stream_id = val
-                                            stream_url = f"https://superlivetv.com/fr/livestream/{stream_id}"
-                                            ownership_verified = True
-                                            live_evidence.append(f"json_api_verified:{item['url']}")
-                                            break
-                                if stream_id:
-                                    break
-
-                # 3. Fallback to DOM extraction for display name if API failed
-                if not display_name:
-                    ignored_phrases = ["rencontrez de nouvelles personnes", "superlive", "superlivetv", "profile", "watch live", "diffusions en direct", "découvrez", "property"]
-                    try:
-                        for sel in ["h1", "h2", ".username", ".profile-name", ".nickname", "[class*='name' i]", "[class*='user' i]"]:
-                            els = page.locator(sel)
-                            count = await els.count()
-                            for i in range(min(count, 3)):
-                                txt = (await els.nth(i).inner_text()).strip().split('\n')[0].strip()
-                                if txt and 2 <= len(txt) <= 60 and txt.lower() not in ignored_phrases and txt.lower() != user_id.lower():
-                                    display_name = txt
-                                    break
-                            if display_name:
-                                break
-                    except: pass
                     
                 page.remove_listener("response", on_response)
                 
-                stream_title = ""
-                if stream_url and not live:
-                    try:
-                        page.on("response", on_response)
-                        if await self._goto(stream_url):
-                            stream_page = await self._page()
-                            await stream_page.wait_for_timeout(1500)
-                            stream_title = await self._title(stream_page)
-                            stream_live, stream_evidence = await self.is_live_page(stream_page)
-                            stream_premium, stream_premium_evidence = await self.detect_premium(stream_page)
-                            if stream_live:
-                                live = True
-                                live_evidence = ["livestream_page"] + stream_evidence
-                            if stream_premium:
-                                premium = True
-                                premium_evidence = stream_premium_evidence
-                    except Exception as stream_exc:
-                        self.log.debug("Livestream page inspection failed for %s: %s", stream_url, stream_exc)
-                    finally:
-                        page.remove_listener("response", on_response)
-
                 has_page = bool(current_url and (title or text))
                 return {
                     "success": has_page, "ok": has_page,
@@ -692,7 +629,7 @@ class SuperLiveDiscovery:
                     "stream_url": stream_url, "stream_id": stream_id,
                     "ownership_verified": ownership_verified,
                     "display_name": display_name,
-                    "title": title, "stream_title": stream_title,
+                    "title": title, "stream_title": "",
                     "live_evidence": live_evidence,
                     "premium_evidence": premium_evidence,
                     "error": None if has_page else "empty_profile_page",
