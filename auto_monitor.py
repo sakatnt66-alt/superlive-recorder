@@ -39,17 +39,20 @@ logging.basicConfig(level=logging.INFO, format="[DISCOVERY] %(levelname)s %(mess
 print(f"[DEBUG] WORKER_API_URL: {'SET' if WORKER_API_URL else 'MISSING'} (length={len(WORKER_API_URL)})", flush=True)
 print(f"[DEBUG] AUTO_API_TOKEN: {'SET' if AUTO_API_TOKEN else 'MISSING'} (length={len(AUTO_API_TOKEN)})", flush=True)
 
+
 def is_valid_stream_id(stream_id, user_id) -> bool:
-    """Only accept an explicit numeric livestream ID, never the profile ID fallback."""
+    """Accept any explicit numeric livestream ID.
+    Removed `sid != uid` restriction because many modern platforms use the 
+    profile/user ID as the stream/room ID when the user is live."""
     sid = str(stream_id or "").strip()
-    uid = str(user_id or "").strip()
-    # FIX: Relaxed length requirement from >= 9 to >= 5 to match profile ID lengths
-    # and prevent false negatives on valid 8-digit stream IDs.
-    return sid.isdigit() and len(sid) >= 5 and sid != uid
+    # Accept any numeric ID between 5 and 20 digits.
+    return sid.isdigit() and 5 <= len(sid) <= 20
+
 
 def is_valid_profile_id(profile_id) -> bool:
     value = str(profile_id or "").strip()
     return value.isdigit() and 5 <= len(value) <= 15
+
 
 def read_error_body(error):
     try:
@@ -57,6 +60,7 @@ def read_error_body(error):
         return body[:500] if body else "(empty)"
     except Exception:
         return "(unreadable)"
+
 
 def _request_json(url, *, headers=None, payload=None, timeout=8):
     data = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -72,6 +76,7 @@ def _request_json(url, *, headers=None, payload=None, timeout=8):
         raw = response.read().decode("utf-8", errors="replace")
         return response.status, (json.loads(raw) if raw else {})
 
+
 def send_telegram_message(text: str, parse_mode: str = "HTML"):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -82,6 +87,7 @@ def send_telegram_message(text: str, parse_mode: str = "HTML"):
         )
     except Exception as exc:
         print(f"[TELEGRAM] Error sending message: {exc}")
+
 
 def get_watchlist() -> list:
     headers = {"X-Auto-Token": AUTO_API_TOKEN}
@@ -108,6 +114,7 @@ def get_watchlist() -> list:
         print(f"[WATCHLIST] Error loading local watchlist: {exc}")
     return []
 
+
 def get_active_recordings() -> list:
     if not WORKER_API_URL or not AUTO_API_TOKEN:
         return []
@@ -123,6 +130,7 @@ def get_active_recordings() -> list:
     except Exception as exc:
         print(f"[WORKER] Error getting active recordings: {exc}")
     return []
+
 
 def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name: str) -> bool:
     if not WORKER_API_URL or not AUTO_API_TOKEN:
@@ -152,6 +160,7 @@ def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name
     except Exception as exc:
         print(f"[AUTO] Error triggering recording for {user_id}: {exc}")
     return False
+
 
 async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list):
     user_id = str(user.get("stream_id") or user.get("user_id") or "").strip()
@@ -257,6 +266,7 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         import traceback
         traceback.print_exc()
         return None
+
 
 async def main():
     print("[AUTO] Starting Auto Monitor")
@@ -370,6 +380,7 @@ async def main():
             parse_mode="HTML",
         )
     print(f"[AUTO] Monitor completed - triggered {len(triggered_records)}/{len(to_record)}")
+
 
 if __name__ == "__main__":
     try:
