@@ -9,6 +9,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from datetime import datetime
 from pathlib import Path
 from superlive_discovery import SuperLiveDiscovery
 
@@ -35,26 +36,21 @@ logging.basicConfig(level=logging.INFO, format="[DISCOVERY] %(levelname)s %(mess
 print(f"[DEBUG] WORKER_API_URL: {'SET' if WORKER_API_URL else 'MISSING'} (length={len(WORKER_API_URL)})", flush=True)
 print(f"[DEBUG] AUTO_API_TOKEN: {'SET' if AUTO_API_TOKEN else 'MISSING'} (length={len(AUTO_API_TOKEN)})", flush=True)
 
-
 def is_valid_stream_id(stream_id, user_id, profile_id) -> bool:
     sid = str(stream_id or "").strip()
     uid = str(user_id or "").strip()
     pid = str(profile_id or "").strip()
-    
     if not sid.isdigit():
         return False
     if not (5 <= len(sid) <= 15):
         return False
     if sid == uid or sid == pid:
         return False
-        
     return True
-
 
 def is_valid_profile_id(profile_id) -> bool:
     value = str(profile_id or "").strip()
     return value.isdigit() and 5 <= len(value) <= 15
-
 
 def read_error_body(error):
     try:
@@ -62,7 +58,6 @@ def read_error_body(error):
         return body[:500] if body else "(empty)"
     except Exception:
         return "(unreadable)"
-
 
 def _request_json(url, *, headers=None, payload=None, timeout=8):
     data = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -78,7 +73,6 @@ def _request_json(url, *, headers=None, payload=None, timeout=8):
         raw = response.read().decode("utf-8", errors="replace")
         return response.status, (json.loads(raw) if raw else {})
 
-
 def send_telegram_message(text: str, parse_mode: str = "HTML"):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -89,7 +83,6 @@ def send_telegram_message(text: str, parse_mode: str = "HTML"):
         )
     except Exception as exc:
         print(f"[TELEGRAM] Error sending message: {exc}")
-
 
 def get_watchlist() -> list:
     headers = {"X-Auto-Token": AUTO_API_TOKEN}
@@ -116,7 +109,6 @@ def get_watchlist() -> list:
         print(f"[WATCHLIST] Error loading local watchlist: {exc}")
     return []
 
-
 def get_active_recordings() -> list:
     if not WORKER_API_URL or not AUTO_API_TOKEN:
         return []
@@ -132,7 +124,6 @@ def get_active_recordings() -> list:
     except Exception as exc:
         print(f"[WORKER] Error getting active recordings: {exc}")
     return []
-
 
 def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name: str) -> bool:
     if not WORKER_API_URL or not AUTO_API_TOKEN:
@@ -163,6 +154,23 @@ def trigger_recording(user_id: str, stream_id: str, stream_url: str, stream_name
         print(f"[AUTO] Error triggering recording for {user_id}: {exc}")
     return False
 
+def fetch_profile_api_fast(shared_id: str) -> dict:
+    """Attempt to fetch profile data directly from the backend API (Fast Path)."""
+    for param_name in ["shared_id", "user_id", "id"]:
+        url = f"https://api.spl-live.com/api/web/users/profile?{param_name}={shared_id}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                if response.status == 200:
+                    raw = response.read().decode("utf-8", errors="replace")
+                    if raw:
+                        data = json.loads(raw)
+                        if data and data.get("user"):
+                            print(f"[FAST_PATH] API Success via ?{param_name}={shared_id}")
+                            return data
+        except Exception:
+            pass
+    return {}
 
 async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list):
     user_id = str(user.get("stream_id") or user.get("user_id") or "").strip()
@@ -171,6 +179,49 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         return None
         
     print(f"[AUTO] [Phase 1] Resolving {user_id}")
+    
+    # --- FAST PATH: Direct API Call ---
+    api_data = fetch_profile_api_fast(user_id)
+    if api_data and api_data.get("user"):
+        user_obj = api_data["user"]
+        name = str(user_obj.get("name") or "").strip()
+        internal_id = str(user_obj.get("user_id") or "").strip()
+        is_live = bool(user_obj.get("is_live") or user_obj.get("live") or user_obj.get("is_broadcasting"))
+        room_id = str(user_obj.get("room_id") or user_obj.get("stream_id") or user_obj.get("live_room_id") or "").strip()
+        bio = str(user_obj.get("bio") or "").lower()
+        is_premium = any(term in bio for term in ["مدفوع", "premium", "إشتراك", "vip", "paid", "subscriber"])
+        
+        print(f"[FAST_PATH] User {user_id}: name={name}, is_live={is_live}, room_id={room_id}, premium={is_premium}")
+        
+        if is_live and room_id.isdigit() and len(room_id) >= 5:
+            stream_url = f"https://superlivetv.com/fr/livestream/{room_id}"
+            display_name = name
+            ignored_names = {"property", "superlive", "superlivetv", "profile", "null", "undefined", ""}
+            if not display_name or display_name.lower() in ignored_names:
+                for item in watchlist:
+                    if str(item.get("stream_id") or item.get("user_id") or "") == user_id:
+                        wl_name = str(item.get("display_name") or "").strip()
+                        if wl_name and wl_name.lower() not in ignored_names:
+                            display_name = wl_name
+                            break
+            display_name = display_name or user_id
+            
+            return {
+                "user_id": user_id,
+                "stream_id": room_id,
+                "stream_url": stream_url,
+                "stream_name": display_name,
+                "is_premium": is_premium
+            }
+        elif not is_live:
+            print(f"[FAST_PATH] User {user_id} is OFFLINE according to API. Skipping Playwright.")
+            return None
+        elif is_premium:
+            print(f"[FAST_PATH] User {user_id} is LIVE but PREMIUM. Skipping.")
+            return None
+    # --- END FAST PATH ---
+    
+    # Fallback to Playwright if API failed
     try:
         profile_result = await asyncio.wait_for(
             discovery.discover_profile_id(user_id), timeout=PER_USER_TIMEOUT_SECONDS
@@ -223,16 +274,24 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         stream_url = str(result.get("stream_url") or "").strip()
         ownership_verified = result.get("ownership_verified", False)
         
-        # Extract Display Name (Prioritize API data, fallback to watchlist)
+        # Extract Display Name with strict fallbacks
         display_name = str(result.get("display_name") or "").strip()
-        if not display_name or display_name.lower() in ["superlive", "superlivetv", "profile", "property", username]:
-            for item in watchlist:
-                if str(item.get("stream_id") or item.get("user_id") or "") == user_id and item.get("display_name"):
-                    display_name = str(item["display_name"]).strip()
-                    break
-        display_name = display_name or username or user_id
+        ignored_names = {"property", "superlive", "superlivetv", "profile", "null", "undefined", ""}
         
-        # Update profile_id if the discovery layer found the real internal ID
+        if not display_name or display_name.lower() in ignored_names:
+            for item in watchlist:
+                if str(item.get("stream_id") or item.get("user_id") or "") == user_id:
+                    wl_name = str(item.get("display_name") or "").strip()
+                    if wl_name and wl_name.lower() not in ignored_names:
+                        display_name = wl_name
+                        break
+                        
+        if not display_name or display_name.lower() in ignored_names:
+            if username and username.lower() not in ignored_names:
+                display_name = username
+                
+        display_name = display_name or user_id
+        
         real_profile_id = str(result.get("profile_id") or profile_id).strip()
         if real_profile_id and is_valid_profile_id(real_profile_id):
             profile_id = real_profile_id
@@ -284,7 +343,6 @@ async def check_user(discovery: SuperLiveDiscovery, user: dict, watchlist: list)
         traceback.print_exc()
         return None
 
-
 async def main():
     print("[AUTO] Starting Auto Monitor")
     watchlist = get_watchlist()
@@ -295,21 +353,18 @@ async def main():
     print(f"[AUTO] Watchlist: {len(watchlist)} users")
     active = get_active_recordings()
     print(f"[AUTO] Active: {len(active)}/{MAX_RECORDINGS}")
-    if len(active) >= MAX_RECORDINGS:
-        print("[AUTO] Concurrency limit reached")
-        return
-        
-    active_user_ids = {str(r.get("user_id")) for r in active if r.get("user_id") is not None}
+    
     active_stream_ids = {str(r.get("stream_id")) for r in active if r.get("stream_id") is not None}
     
+    # FORCED CHECK: Check all users in watchlist, ignoring active status
     to_check = []
     for item in watchlist:
         uid = str(item.get("stream_id") or item.get("user_id") or "").strip()
-        if not uid or uid in active_user_ids:
+        if not uid:
             continue
         to_check.append(item)
         
-    print(f"[AUTO] Discovery queue: {len(to_check)} users; per-user timeout={PER_USER_TIMEOUT_SECONDS}s; budget={MONITOR_BUDGET_SECONDS}s", flush=True)
+    print(f"[AUTO] Discovery queue: {len(to_check)} users (FORCED); per-user timeout={PER_USER_TIMEOUT_SECONDS}s; budget={MONITOR_BUDGET_SECONDS}s", flush=True)
     if not to_check:
         print("[AUTO] No users to check")
         return
@@ -389,15 +444,14 @@ async def main():
             
     if triggered_records:
         for r in triggered_records:
-            msg = f"🔴 <b>بدأ تسجيل بث جديد</b>\n\n"
+            now_str = datetime.now().strftime("%H:%M:%S")
+            msg = f"✋ <b>بدأ التسجيل</b>\n\n"
             msg += f"👤 <b>الاسم:</b> {html.escape(r['stream_name'])}\n"
-            msg += f"🆔 <b>المستخدم:</b> {html.escape(r['user_id'])}\n"
-            msg += f"📡 <b>معرّف البث:</b> {html.escape(r['stream_id'])}\n\n"
-            msg += f"🔗 <b>رابط البث:</b>\n{html.escape(r['stream_url'])}"
+            msg += f"🆔 <b>ID:</b> {html.escape(r['user_id'])}\n"
+            msg += f"🕒 <b>الوقت:</b> {now_str}"
             send_telegram_message(msg, parse_mode="HTML")
             
     print(f"[AUTO] Monitor completed - triggered {len(triggered_records)}/{len(to_record)}")
-
 
 if __name__ == "__main__":
     try:
