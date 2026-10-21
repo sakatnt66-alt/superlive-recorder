@@ -9,7 +9,6 @@ paywalls, access controls, or DRM. Website URL patterns and markup may change.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 import time
@@ -90,7 +89,13 @@ class SuperLiveDiscovery:
             self._playwright = await async_playwright().start()
             try:
                 self.browser = await self._playwright.chromium.launch(headless=self.headless)
-                opts: dict[str, Any] = {"java_script_enabled": True, "ignore_https_errors": False}
+                opts: dict[str, Any] = {
+                    "java_script_enabled": True,
+                    "ignore_https_errors": False,
+                    # The documented public search UI is mobile-shaped; the desktop
+                    # viewport can leave its search input in the DOM but CSS-hidden.
+                    "viewport": {"width": 430, "height": 932},
+                }
                 if self.user_agent:
                     opts["user_agent"] = self.user_agent
                 self.context = await self.browser.new_context(**opts)
@@ -312,50 +317,56 @@ class SuperLiveDiscovery:
             f"{self.base_url}/en/search",
         ]
         inspected: set[str] = set()
+        search_control_found = False
+        search_action_attempted = False
+        verified_results_seen = False
         for search_index, search_url in enumerate(search_urls, start=1):
             self.log.info("Search attempt %d/%d for key %s: %s", search_index, len(search_urls), raw, search_url)
             if not await self._goto(search_url):
                 continue
             # The public search page may require using its client-side form; URL
             # query parameters alone are not assumed to be supported.
-            submitted = False
             if urlparse(search_url).path.rstrip("/").endswith("/search") and not urlparse(search_url).query:
                 # Prefer inputs that actually look like the site's search field. Do not
                 # silently assume the first generic input is the search box (it may be
                 # a login/newsletter field). Fall back to visible text inputs only.
-                # Record the actual rendered controls first. This is important because
-                # the site's search widget may use type=number/tel or a framework
-                # component rather than input[type=text].
-                try:
-                    control_snapshot = await page.locator("input, textarea, [role=searchbox], button").evaluate_all("""els => els.slice(0,80).map(el => ({tag:el.tagName.toLowerCase(), type:el.getAttribute('type')||'', name:el.getAttribute('name')||'', placeholder:el.getAttribute('placeholder')||'', aria:el.getAttribute('aria-label')||'', role:el.getAttribute('role')||'', text:(el.innerText||el.value||'').trim().slice(0,100), visible:!!(el.getClientRects().length)}))""")
-                    self.log.info("Search controls for key %s: %s", raw, json.dumps(control_snapshot, ensure_ascii=False)[:5000])
-                except PlaywrightError:
-                    pass
                 selectors = (
                     "input[type=search]", "input[name=search]", "input[name=query]",
                     "input[name=q]", "input[name=keyword]", "input[name=term]",
                     "input[placeholder*='search' i]", "input[placeholder*='recherch' i]",
-                    "input[placeholder*='ID' i]", "input[aria-label*='search' i]",
-                    "input[aria-label*='recherch' i]", "input[type=text]",
-                    "input:not([type=hidden]):not([type=password]):not([type=email]):not([type=checkbox]):not([type=radio])",
-                    "textarea", "[role=searchbox]",
+                    "input[placeholder*='utilisateur' i]", "input[placeholder*='ID' i]",
+                    "input[aria-label*='search' i]", "input[aria-label*='recherch' i]",
+                    "input[type=text]",
                 )
                 for selector in selectors:
                     try:
                         fields = page.locator(selector)
                         count = min(await fields.count(), 8)
                         chosen = None
+                        visible_count = 0
                         for field_index in range(count):
                             field = fields.nth(field_index)
-                            if await field.is_visible() and await field.is_enabled():
+                            try:
+                                visible = await field.is_visible()
+                                enabled = await field.is_enabled()
                                 input_type = (await field.get_attribute("type") or "text").lower()
-                                if input_type not in {"hidden", "checkbox", "radio", "password", "email"}:
-                                    chosen = field
-                                    break
+                            except PlaywrightError:
+                                continue
+                            if visible:
+                                visible_count += 1
+                            if visible and enabled and input_type not in {"hidden", "checkbox", "radio", "password", "email"}:
+                                chosen = field
+                                break
                         if chosen is None:
+                            if count:
+                                self.log.info(
+                                    "Search selector diagnostic for key %s: selector=%s matches=%d visible=%d",
+                                    raw, selector, count, visible_count,
+                                )
                             continue
+                        search_control_found = True
                         await chosen.fill(raw)
-                        submitted = True
+                        search_action_attempted = True
                         try:
                             await chosen.press("Enter", timeout=1200)
                         except PlaywrightError:
@@ -381,7 +392,7 @@ class SuperLiveDiscovery:
                                     await page.wait_for_timeout(450)
                             except PlaywrightError:
                                 pass
-                        self.log.info("Search form submitted for key %s using selector %s; url=%s", raw, selector, page.url)
+                        self.log.info("Search form action attempted for key %s using selector %s; url=%s", raw, selector, page.url)
                         break
                     except PlaywrightError:
                         continue
@@ -395,9 +406,31 @@ class SuperLiveDiscovery:
                     return {href:a.href, text:(a.innerText||a.textContent||'').trim(), card};
                 })""")
                 profile_link_count = sum(1 for link in links if self._same_site(str(link.get("href", ""))) and self._is_public_profile_route(str(link.get("href", ""))))
-                self.log.info("Search results for key %s: submitted=%s anchors=%d profile_links=%d url=%s", raw, submitted, len(links), profile_link_count, page.url)
+                page_text = (await self._text(page))[:12000]
+                normalized_page_text = self._clean(page_text).casefold()
+                normalized_query = self._clean(raw).casefold()
+                results_heading = bool(
+                    normalized_query
+                    and normalized_query in normalized_page_text
+                    and re.search(r"(?:résultats?\s+pour|resultats?\s+pour|results?\s+for|search\s+results?)", normalized_page_text, re.I)
+                )
+                verified_results_seen = verified_results_seen or results_heading
+                self.log.info(
+                    "Search results for key %s: control_found=%s action_attempted=%s results_heading=%s anchors=%d profile_links=%d url=%s",
+                    raw, search_control_found, search_action_attempted, results_heading,
+                    len(links), profile_link_count, page.url,
+                )
             except PlaywrightError as exc:
                 self.log.warning("Could not read search results for key %s: %s", raw, type(exc).__name__)
+                continue
+            # Never treat generic navigation/profile links as search results. A
+            # result heading tied to the exact query is the minimum evidence that
+            # this page is displaying the site's response to our search.
+            if not results_heading:
+                self.log.warning(
+                    "Search results not verified for key %s (control_found=%s action_attempted=%s); refusing candidate links",
+                    raw, search_control_found, search_action_attempted,
+                )
                 continue
             for item in links:
                 href = str(item.get("href", "")).strip()
@@ -417,14 +450,15 @@ class SuperLiveDiscovery:
                 if candidate_slug in {"profile", "search", "discover", "login", "signup"}:
                     continue
                 card_lower = card_text.lower()
-                result_card_evidence = bool(card_text and len(card_text) > len(label) and (
-                    submitted or username.lower() in card_lower or label
-                ))
+                result_card_evidence = bool(
+                    card_text and len(card_text) > len(label)
+                    and (username.lower() in card_lower or username.lower() in label or results_heading)
+                )
                 direct_identity_match = (
                     candidate_slug == username.lower()
                     or username.lower() in label
                     or username.lower() in card_lower
-                    or (submitted and result_card_evidence)
+                    or (results_heading and result_card_evidence)
                 )
                 if not direct_identity_match:
                     continue
@@ -460,8 +494,18 @@ class SuperLiveDiscovery:
                 })
                 return result
 
-        result["error"] = "public_profile_not_found_or_site_structure_changed"
-        self.log.warning("Profile resolution failed for key %s after %d search routes", raw, len(search_urls))
+        if not verified_results_seen and not search_control_found:
+            result["error"] = "SEARCH_CONTROL_NOT_FOUND"
+        elif not verified_results_seen and not search_action_attempted:
+            result["error"] = "SEARCH_NOT_SUBMITTED"
+        elif not verified_results_seen:
+            result["error"] = "SEARCH_RESULTS_NOT_VERIFIED"
+        else:
+            result["error"] = "NO_MATCHING_PROFILE"
+        self.log.warning(
+            "Profile resolution failed for key %s after %d search routes: %s",
+            raw, len(search_urls), result["error"],
+        )
         return result
 
     async def _extract_profile_id(self, page: Page, fallback: str) -> str:
