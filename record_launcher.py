@@ -3,7 +3,6 @@
 SuperLive Recorder - Launcher with Pre-flight Validation
 Passes stream name to record_once.py and attempts to rename files
 """
-
 import asyncio
 import json
 import os
@@ -15,7 +14,6 @@ import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 import re
-
 from superlive_discovery import SuperLiveDiscovery
 
 # Configuration
@@ -23,10 +21,8 @@ WORKER_API_URL = os.environ.get("WORKER_API_URL", "")
 AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-
 RECORDINGS_DIR = Path("recordings")
 TEMP_DIR = RECORDINGS_DIR / "_temp"
-
 
 def sanitize_filename(name: str) -> str:
     """Sanitize filename to be filesystem-safe"""
@@ -40,7 +36,6 @@ def sanitize_filename(name: str) -> str:
     if len(name) > 80:
         name = name[:80]
     return name or "unknown"
-
 
 def send_telegram_message(text: str, parse_mode: str = "HTML"):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -60,7 +55,6 @@ def send_telegram_message(text: str, parse_mode: str = "HTML"):
     except Exception as e:
         print(f"[TELEGRAM] Error: {e}")
 
-
 def update_worker_state(stream_id: str, state: dict):
     if not WORKER_API_URL or not AUTO_API_TOKEN:
         return
@@ -76,7 +70,6 @@ def update_worker_state(stream_id: str, state: dict):
     except Exception as e:
         print(f"[WORKER] Error: {e}")
 
-
 def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
     stream_id_str = str(stream_id)
     user_id_str = str(user_id)
@@ -87,7 +80,6 @@ def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
     if not stream_id_str.isdigit():
         return False
     return True
-
 
 async def verify_stream_is_accessible(stream_url: str) -> dict:
     try:
@@ -115,8 +107,8 @@ async def verify_stream_is_accessible(stream_url: str) -> dict:
                 return {"accessible": False, "error": f"Navigation failed: {e}"}
             
             await page.wait_for_timeout(5000)
-            videos = await page.query_selector_all('video')
             
+            videos = await page.query_selector_all('video')
             if not videos:
                 await browser.close()
                 return {"accessible": False, "error": "No video elements"}
@@ -126,6 +118,7 @@ async def verify_stream_is_accessible(stream_url: str) -> dict:
                     dims = await video.bounding_box()
                     if not dims:
                         continue
+                    
                     ready_state = await video.evaluate('v => v.readyState')
                     paused = await video.evaluate('v => v.paused')
                     width = int(dims['width'])
@@ -135,6 +128,7 @@ async def verify_stream_is_accessible(stream_url: str) -> dict:
                         continue
                     
                     is_playing = ready_state >= 3 and not paused
+                    
                     if not is_playing:
                         try:
                             can_play = await video.evaluate('''v => new Promise(r => {
@@ -161,13 +155,11 @@ async def verify_stream_is_accessible(stream_url: str) -> dict:
     except Exception as e:
         return {"accessible": False, "error": str(e)}
 
-
 async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
     print(f"[PRE-FLIGHT] Starting validation for stream {stream_id}")
     
     try:
         discovery = SuperLiveDiscovery()
-        
         profile_result = await discovery.discover_profile_id(stream_id)
         discovered_username = None
         discovered_profile_id = ""
@@ -194,8 +186,8 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                 is_premium = live_result.get("is_premium", False)
                 raw_stream_id = live_result.get("stream_id")
                 username = live_result.get("username") or discovered_username
-                
                 actual_stream_id = stream_id
+                
                 if raw_stream_id and is_valid_stream_id(raw_stream_id, stream_id):
                     actual_stream_id = str(raw_stream_id)
                 
@@ -270,8 +262,8 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
         is_premium = live_result.get("is_premium", False)
         raw_stream_id = live_result.get("stream_id")
         final_username = live_result.get("username") or username
-        
         actual_stream_id = stream_id
+        
         if raw_stream_id and is_valid_stream_id(raw_stream_id, stream_id):
             actual_stream_id = str(raw_stream_id)
         
@@ -304,14 +296,13 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
             "success": True, "status": "LIVE_NORMAL", "username": final_username,
             "actual_stream_id": actual_stream_id, "error": None
         }
-        
+    
     except Exception as e:
         print(f"[PRE-FLIGHT] Error: {e}")
         return {
             "success": False, "status": "ERROR", "username": None,
             "actual_stream_id": stream_id, "error": str(e)
         }
-
 
 def get_latest_files(before_time: float) -> list:
     """Get all video files created after a specific time."""
@@ -325,7 +316,6 @@ def get_latest_files(before_time: float) -> list:
                 except:
                     pass
     return files
-
 
 def rename_files_by_username(files: list, username: str) -> list:
     """
@@ -362,6 +352,7 @@ def rename_files_by_username(files: list, username: str) -> list:
             print(f"[RENAME] ✓ {os.path.basename(old_path)} → {new_name}")
         except Exception as e:
             print(f"[RENAME] ✗ Failed to rename {old_path}: {e}")
+        
         return renamed
     
     # Multiple files: use username_part001, username_part002, etc.
@@ -387,7 +378,6 @@ def rename_files_by_username(files: list, username: str) -> list:
     
     return renamed
 
-
 async def main():
     stream_url = os.environ.get("RECORD_URL")
     stream_id = os.environ.get("STREAM_ID")
@@ -407,7 +397,8 @@ async def main():
     print(f"Source: {recording_source}")
     print("=" * 70)
     
-    print("\n" + "=" * 70)
+    print("
+" + "=" * 70)
     print("PRE-FLIGHT VALIDATION")
     print("=" * 70)
     
@@ -429,19 +420,27 @@ async def main():
         actual_stream_id = validation["actual_stream_id"]
         
         if status == "LIVE_PREMIUM":
-            msg = f"💎 <b>بث Premium</b>\n👤 المستخدم: <code>{actual_stream_id}</code>\n👤 الاسم: <b>{username}</b>\n\n⚠️ هذا البث مدفوع ولا يمكن تسجيله."
+            msg = f"💎 <b>بث Premium</b>
+👤 المستخدم: <code>{actual_stream_id}</code>
+👤 الاسم: <b>{username}</b>
+⚠️ هذا البث مدفوع ولا يمكن تسجيله."
         elif status == "OFFLINE":
-            msg = f"⚫ <b>غير متصل</b>\n👤 المستخدم: <code>{actual_stream_id}</code>\n👤 الاسم: <b>{username}</b>\n\n⚠️ المستخدم غير متصل حالياً."
+            msg = f"⚫ <b>غير متصل</b>
+👤 المستخدم: <code>{actual_stream_id}</code>
+👤 الاسم: <b>{username}</b>
+⚠️ المستخدم غير متصل حالياً."
         else:
-            msg = f"❌ <b>فشل التحقق</b>\n👤 المستخدم: <code>{actual_stream_id}</code>\n\n⚠️ {error}"
+            msg = f"❌ <b>فشل التحقق</b>
+👤 المستخدم: <code>{actual_stream_id}</code>
+⚠️ {error}"
         
         send_telegram_message(msg)
         update_worker_state(actual_stream_id, {
             "status": "failed", "error": error,
             "failed_at": datetime.now(timezone.utc).isoformat()
         })
-        
-        print(f"\n[PRE-FLIGHT] ✗ Validation failed: {status} - {error}")
+        print(f"
+[PRE-FLIGHT] ✗ Validation failed: {status} - {error}")
         sys.exit(1)
     
     detected_username = validation["username"]
@@ -468,34 +467,52 @@ async def main():
         os.environ["RECORD_NAME"] = stream_name
         print(f"[PRE-FLIGHT] ✓ Set env vars with username: {stream_name}")
     
-    print(f"\n[PRE-FLIGHT] ✓ All checks passed - proceeding with recording")
-    
+    print(f"
+[PRE-FLIGHT] ✓ All checks passed - proceeding with recording")
     update_worker_state(stream_id, {
         "stream_name": stream_name, "status": "recording", "source": recording_source
     })
     
     source_emoji = "✋" if recording_source == "manual" else "🤖"
     start_msg = (
-        f"{source_emoji} <b>بدأ التسجيل</b>\n"
-        f"👤 الاسم: <b>{stream_name or 'Unknown'}</b>\n"
-        f"🆔 ID: <code>{stream_id}</code>\n"
+        f"{source_emoji} <b>بدأ التسجيل</b>
+"
+        f"👤 الاسم: <b>{stream_name or 'Unknown'}</b>
+"
+        f"🆔 ID: <code>{stream_id}</code>
+"
         f"🕒 الوقت: {datetime.now().strftime('%H:%M:%S')}"
     )
     send_telegram_message(start_msg)
     
-    print("\n" + "=" * 70)
+    print("
+" + "=" * 70)
     print("CALLING ORIGINAL record_once.py")
     print("=" * 70)
     
     try:
         import record_once
         await record_once.main()
-        print("\n[LAUNCHER] ✓ record_once.py completed successfully")
+        print("
+[LAUNCHER] ✓ record_once.py completed successfully")
+        
+        # ============================================================
+        # FIX: Update state to completed after successful recording
+        # ============================================================
+        update_worker_state(stream_id, {
+            "status": "completed",
+            "completed_at": datetime.now(timezone.utc).isoformat()
+        })
+        print(f"[LAUNCHER] ✓ State updated to 'completed' for stream {stream_id}")
+        
     except Exception as e:
         error_msg = (
-            f"❌ <b>فشل التسجيل</b>\n"
-            f"👤 الاسم: <b>{stream_name or 'Unknown'}</b>\n"
-            f"🆔 ID: <code>{stream_id}</code>\n\n"
+            f"❌ <b>فشل التسجيل</b>
+"
+            f"👤 الاسم: <b>{stream_name or 'Unknown'}</b>
+"
+            f"🆔 ID: <code>{stream_id}</code>
+"
             f"⚠️ {str(e)}"
         )
         send_telegram_message(error_msg)
@@ -509,7 +526,8 @@ async def main():
     # RENAME FILES: After record_once.py finishes, rename files
     # from generic names (like "recording_*.mkv") to username
     # ============================================================
-    print("\n" + "=" * 70)
+    print("
+" + "=" * 70)
     print("POST-PROCESSING: Renaming files by username")
     print("=" * 70)
     
@@ -534,15 +552,20 @@ async def main():
             
             if files_to_rename:
                 renamed = rename_files_by_username(files_to_rename, stream_name)
+                
                 if renamed:
                     print(f"[RENAME] ✓ Renamed {len(renamed)} file(s)")
                     
                     # Send notification about renamed files
-                    file_list = "\n".join([f"📁 <code>{os.path.basename(new)}</code>" for _, new in renamed[:5]])
+                    file_list = "
+".join([f"📁 <code>{os.path.basename(new)}</code>" for _, new in renamed[:5]])
                     send_telegram_message(
-                        f"📦 <b>ملفات التسجيل جاهزة</b>\n\n"
-                        f"👤 الاسم: <b>{stream_name}</b>\n"
-                        f"🆔 ID: <code>{stream_id}</code>\n\n"
+                        f"📦 <b>ملفات التسجيل جاهزة</b>
+"
+                        f"👤 الاسم: <b>{stream_name}</b>
+"
+                        f"🆔 ID: <code>{stream_id}</code>
+"
                         f"{file_list}",
                         parse_mode="HTML"
                     )
@@ -552,7 +575,6 @@ async def main():
             print(f"[RENAME] ℹ️ No new files found (record_once.py may upload & delete)")
     else:
         print(f"[RENAME] ⚠️ No username available - skipping rename")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
