@@ -2,13 +2,13 @@
 """
 cleanup_recordings.py - تنظيف التسجيلات العالقة تلقائياً
 يتحقق من حالة كل تسجيل فعلياً ويزيل المنتهي/الفشل فقط
+ويزامن الحالة مع Cloudflare Worker KV
 """
 import json
 import os
 import subprocess
 import sys
 import base64
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import requests
@@ -25,7 +25,7 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY")
 GITHUB_BRANCH = os.environ.get("GITHUB_REF_NAME", "main")
 
-# إعدادات Worker API (للمزامنة)
+# إعدادات Worker API
 WORKER_API_URL = os.environ.get("WORKER_API_URL", "").strip()
 AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "").strip()
 
@@ -76,6 +76,7 @@ def save_recordings(recordings):
 
 def update_worker_state(stream_id, state):
     if not WORKER_API_URL or not AUTO_API_TOKEN:
+        print(f"  ⚠️ [WORKER SYNC] تم التخطي: WORKER_API_URL أو AUTO_API_TOKEN غير موجودة في البيئة")
         return
     url = f"{WORKER_API_URL}/api/update-state/{stream_id}"
     headers = {
@@ -87,7 +88,7 @@ def update_worker_state(stream_id, state):
         if res.status_code == 200:
             print(f"  🔄 [WORKER SYNC] تم تحديث حالة {stream_id} بنجاح في Cloudflare KV")
         else:
-            print(f"  ⚠️ [WORKER SYNC] فشل التحديث: {res.status_code}")
+            print(f"  ⚠️ [WORKER SYNC] فشل التحديث: {res.status_code} - {res.text}")
     except Exception as e:
         print(f"  ❌ [WORKER SYNC] خطأ: {e}")
 
