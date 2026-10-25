@@ -4,15 +4,30 @@ on:
   repository_dispatch:
     types: [auto_monitor]
   schedule:
-    - cron: '*/3 * * * *'    # ✅ كل 3 دقائق (مضمون من GitHub)
+    # تشغيل تلقائي كل 3 دقائق (بتوقيت UTC)
+    - cron: '*/3 * * * *'
   workflow_dispatch:
 
-# ❌ لا يوجد concurrency - يمنع الإلغاءات
-# الحماية الفعلية موجودة بالفعل في auto_monitor.py و Worker API
+# ─────────────────────────────────────────────────────────────
+# سياسة التزامن:
+#   • مجموعة واحدة ثابتة لكل الفرع → لا تشغيلين متزامنين أبدًا
+#   • cancel-in-progress: false → التشغيل الجاري لا يُلغى أبدًا
+#   • التشغيل الجديد ينتظر حتى يكتمل الحالي
+#
+# قيد المنصة: إذا وصل تشغيل ثالث بينما هناك تشغيل يعمل + آخر
+# ينتظر، يُلغى المنتظر الأقدم. هذا قيد في GitHub Actions وليس
+# خطأً في الإعداد. بما أن التشغيل يكتمل عادةً في أقل من 3 دقائق،
+# فلا يحدث تراكم فعلي في الظروف العادية.
+# ─────────────────────────────────────────────────────────────
+concurrency:
+  group: auto-monitor-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
+    # حد أقصى 5 دقائق — يضمن عدم استمرار التشغيل لفترة طويلة
+    # مما يمنع تراكم الطلبات المنتظرة
     timeout-minutes: 5
 
     steps:
@@ -26,7 +41,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright requests
+          pip install playwright
           playwright install chromium
           playwright install-deps chromium
 
@@ -40,4 +55,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           echo "[AUTO] Starting Auto Monitor workflow"
+          echo "[AUTO] Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "[AUTO] Concurrency policy: sequential (wait for previous)"
           python auto_monitor.py
+          echo "[AUTO] Auto Monitor completed"
