@@ -4,13 +4,11 @@ on:
   repository_dispatch:
     types: [auto_monitor]
   schedule:
-    - cron: '*/3 * * * *'
+    - cron: '*/3 * * * *'    # ✅ كل 3 دقائق (مضمون من GitHub)
   workflow_dispatch:
 
-# منع التشغيل المتزامن - ينتظر حتى يكتمل السابق
-concurrency:
-  group: auto-monitor-${{ github.ref }}
-  cancel-in-progress: false
+# ❌ لا يوجد concurrency - يمنع الإلغاءات
+# الحماية الفعلية موجودة بالفعل في auto_monitor.py و Worker API
 
 jobs:
   monitor:
@@ -43,12 +41,3 @@ jobs:
         run: |
           echo "[AUTO] Starting Auto Monitor workflow"
           python auto_monitor.py
-
-      - name: Run Cleanup (60-min timeout)
-        if: always()
-        env:
-          WORKER_API_URL: ${{ secrets.WORKER_API_URL }}
-          AUTO_API_TOKEN: ${{ secrets.AUTO_API_TOKEN }}
-        run: |
-          echo "[CLEANUP] Starting automatic cleanup"
-          python cleanup_recordings.py
