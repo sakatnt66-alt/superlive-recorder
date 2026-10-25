@@ -54,12 +54,13 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg xvfb
+          sudo apt-get install -y ffmpeg xvfb fonts-dejavu-core
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install Pillow
 
       - name: Install Playwright Chromium
         if: steps.playwright-cache.outputs.cache-hit != 'true'
@@ -114,13 +115,11 @@ jobs:
           echo "========================================"
           echo "POST-PROCESSING PIPELINE"
           echo "========================================"
+          echo "--- Directory contents ---"
+          find recordings/ -type f \( -name "*.mkv" -o -name "*.mp4" -o -name "*.jpg" \) 2>/dev/null | head -20
+          echo "--- Starting postprocess ---"
           python postprocess_recording.py
 
-      # ═══════════════════════════════════════════════════
-      #  NEW STEP: Full Stream Contact Sheet Generator
-      #  Runs independently. Failure here does NOT affect
-      #  recording, splitting, or video sending.
-      # ═══════════════════════════════════════════════════
       - name: Generate Full Stream Contact Sheet
         if: always()
         continue-on-error: true
@@ -135,7 +134,7 @@ jobs:
           CS_CELL_W: "320"
           CS_CELL_H: "180"
           CS_GAP: "4"
-          CS_QUALITY: "2"
+          CS_QUALITY: "85"
         run: |
           echo "========================================"
           echo "FULL STREAM CONTACT SHEET GENERATOR"
