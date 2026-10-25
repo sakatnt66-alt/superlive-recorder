@@ -15,25 +15,110 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 from superlive_discovery import SuperLiveDiscovery
+
 # Configuration
 WORKER_API_URL = os.environ.get("WORKER_API_URL", "")
 AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
 RECORDINGS_DIR = Path("recordings")
 TEMP_DIR = RECORDINGS_DIR / "_temp"
+PRESERVED_DIR = RECORDINGS_DIR / "_preserved"
+
+
+# ═══════════════════════════════════════════════════════════
+# FILE PRESERVER — copies MKV files before record_once deletes
+# ═══════════════════════════════════════════════════════════
+class FilePreserver:
+    """
+    Background asyncio task that watches recording directories and
+    copies every new MKV file into PRESERVED_DIR before
+    record_once.py can delete it after Telegram upload.
+
+    Does NOT modify, move, or delete any file.  Read-only on source.
+    """
+
+    def __init__(self, watch_dirs, preserve_dir, poll_interval=0.5):
+        self.watch_dirs = [Path(d) for d in watch_dirs]
+        self.preserve_dir = Path(preserve_dir)
+        self.poll_interval = poll_interval
+        self._running = False
+        self._preserved = set()
+        self._task = None
+
+    async def start(self):
+        self.preserve_dir.mkdir(parents=True, exist_ok=True)
+        self._running = True
+        self._task = asyncio.create_task(self._run())
+        print(f"[PRESERVE] Started — watching {[str(d) for d in self.watch_dirs]}")
+
+    async def stop(self):
+        self._running = False
+        if self._task:
+            await asyncio.sleep(self.poll_interval)
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        print(f"[PRESERVE] Stopped — {len(self._preserved)} file(s) preserved")
+
+    async def _run(self):
+        while self._running:
+            try:
+                await self._scan()
+            except Exception as exc:
+                print(f"[PRESERVE] scan error: {exc}")
+            await asyncio.sleep(self.poll_interval)
+
+    async def _scan(self):
+        for watch_dir in self.watch_dirs:
+            if not watch_dir.exists():
+                continue
+            for f in watch_dir.glob("*.mkv"):
+                src = str(f)
+                if src in self._preserved:
+                    continue
+                try:
+                    if f.stat().st_size == 0:
+                        continue
+                except OSError:
+                    continue
+                if await self._is_stable(f):
+                    dest = self.preserve_dir / f.name
+                    if not dest.exists():
+                        try:
+                            shutil.copy2(src, str(dest))
+                            self._preserved.add(src)
+                            print(f"[PRESERVE] ✓ {f.name} → _preserved/{f.name}")
+                        except Exception as e:
+                            print(f"[PRESERVE] ✗ copy failed: {e}")
+
+    async def _is_stable(self, path, checks=2, interval=0.5):
+        try:
+            sizes = []
+            for _ in range(checks):
+                sizes.append(path.stat().st_size)
+                await asyncio.sleep(interval)
+            return len(set(sizes)) == 1 and sizes[0] > 0
+        except OSError:
+            return False
+
+
+# ═══════════════════════════════════════════════════════════
+# ORIGINAL FUNCTIONS (unchanged)
+# ═══════════════════════════════════════════════════════════
 def sanitize_filename(name: str) -> str:
-    """Sanitize filename to be filesystem-safe"""
     if not name:
         return "unknown"
-    # Remove unsafe characters
     name = re.sub(r'[<>:"/\\|?*]', '', name)
-    # Replace whitespace with underscore
     name = re.sub(r'\s+', '_', name).strip('_')
-    # Limit length
     if len(name) > 80:
         name = name[:80]
     return name or "unknown"
+
+
 def send_telegram_message(text: str, parse_mode: str = "HTML"):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -51,6 +136,8 @@ def send_telegram_message(text: str, parse_mode: str = "HTML"):
             pass
     except Exception as e:
         print(f"[TELEGRAM] Error: {e}")
+
+
 def update_worker_state(stream_id: str, state: dict):
     if not WORKER_API_URL or not AUTO_API_TOKEN:
         return
@@ -65,6 +152,8 @@ def update_worker_state(stream_id: str, state: dict):
             pass
     except Exception as e:
         print(f"[WORKER] Error: {e}")
+
+
 def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
     stream_id_str = str(stream_id)
     user_id_str = str(user_id)
@@ -75,6 +164,8 @@ def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
     if not stream_id_str.isdigit():
         return False
     return True
+
+
 async def verify_stream_is_accessible(stream_url: str) -> dict:
     try:
         from playwright.async_api import async_playwright
@@ -137,6 +228,8 @@ async def verify_stream_is_accessible(stream_url: str) -> dict:
             return {"accessible": False, "error": "No playable video"}
     except Exception as e:
         return {"accessible": False, "error": str(e)}
+
+
 async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
     print(f"[PRE-FLIGHT] Starting validation for stream {stream_id}")
     try:
@@ -201,7 +294,6 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                         "actual_stream_id": actual_stream_id,
                         "error": "User is offline"
                     }
-        # Fallback discovery flow
         if not profile_result:
             return {
                 "success": False, "status": "UNKNOWN", "username": None,
@@ -263,8 +355,9 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
             "success": False, "status": "ERROR", "username": None,
             "actual_stream_id": stream_id, "error": str(e)
         }
+
+
 def get_latest_files(before_time: float) -> list:
-    """Get all video files created after a specific time."""
     files = []
     for ext in ['*.mkv', '*.webm', '*.mp4']:
         for pattern in [str(RECORDINGS_DIR / ext), str(TEMP_DIR / ext)]:
@@ -275,25 +368,20 @@ def get_latest_files(before_time: float) -> list:
                 except:
                     pass
     return files
+
+
 def rename_files_by_username(files: list, username: str) -> list:
-    """
-    Rename video files to use username instead of generic names.
-    Handles multiple parts: username_part001.mkv, username_part002.mkv, etc.
-    """
     if not files or not username or username.startswith("user_"):
         return []
     safe_name = sanitize_filename(username)
     renamed = []
-    # Sort by modification time (oldest first)
     files_sorted = sorted(files, key=lambda f: os.path.getmtime(f))
-    # If only one file, use username directly
     if len(files_sorted) == 1:
         old_path = files_sorted[0]
         ext = os.path.splitext(old_path)[1]
         dir_path = os.path.dirname(old_path)
         new_name = f"{safe_name}{ext}"
         new_path = os.path.join(dir_path, new_name)
-        # Handle name collision
         counter = 1
         while os.path.exists(new_path):
             new_name = f"{safe_name}_{counter}{ext}"
@@ -306,7 +394,6 @@ def rename_files_by_username(files: list, username: str) -> list:
         except Exception as e:
             print(f"[RENAME] ✗ Failed to rename {old_path}: {e}")
         return renamed
-    # Multiple files: use username_part001, username_part002, etc.
     for idx, old_path in enumerate(files_sorted, start=1):
         ext = os.path.splitext(old_path)[1]
         dir_path = os.path.dirname(old_path)
@@ -325,14 +412,21 @@ def rename_files_by_username(files: list, username: str) -> list:
         except Exception as e:
             print(f"[RENAME] ✗ Failed to rename {old_path}: {e}")
     return renamed
+
+
+# ═══════════════════════════════════════════════════════════
+# MAIN — with FilePreserver integration
+# ═══════════════════════════════════════════════════════════
 async def main():
     stream_url = os.environ.get("RECORD_URL")
     stream_id = os.environ.get("STREAM_ID")
     stream_name = os.environ.get("STREAM_NAME", "")
     recording_source = os.environ.get("RECORDING_SOURCE", "manual")
+
     if not stream_url or not stream_id:
         print("[ERROR] Missing RECORD_URL or STREAM_ID")
         sys.exit(1)
+
     print("=" * 70)
     print("SUPERLIVE RECORDER - LAUNCHER (WITH PRE-FLIGHT)")
     print("=" * 70)
@@ -341,17 +435,20 @@ async def main():
     print(f"Stream Name: {stream_name or '(will be detected)'}")
     print(f"Source: {recording_source}")
     print("=" * 70)
+
     print("\n" + "=" * 70)
     print("PRE-FLIGHT VALIDATION")
     print("=" * 70)
-    # Mark time before recording to detect new files later
+
     start_time = datetime.now().timestamp()
-    # Get list of existing files before recording starts
+
     existing_files = set()
     for ext in ['*.mkv', '*.webm', '*.mp4']:
         for pattern in [str(RECORDINGS_DIR / ext), str(TEMP_DIR / ext)]:
             existing_files.update(glob.glob(pattern))
+
     validation = await pre_flight_check(stream_url, stream_id)
+
     if not validation["success"]:
         status = validation["status"]
         username = validation["username"] or "Unknown"
@@ -370,19 +467,19 @@ async def main():
         })
         print(f"\n[PRE-FLIGHT] ✗ Validation failed: {status} - {error}")
         sys.exit(1)
+
     detected_username = validation["username"]
     actual_stream_id = validation["actual_stream_id"]
+
     if detected_username and not stream_name:
         stream_name = detected_username
         print(f"[PRE-FLIGHT] ✓ Using detected username: {stream_name}")
+
     if actual_stream_id != stream_id:
         print(f"[PRE-FLIGHT] ✓ Using detected stream_id: {actual_stream_id}")
         os.environ["STREAM_ID"] = actual_stream_id
         stream_id = actual_stream_id
-    # ============================================================
-    # PASS STREAM NAME to record_once.py via multiple env vars
-    # This maximizes the chance that record_once.py uses the name
-    # ============================================================
+
     if stream_name:
         os.environ["STREAM_NAME"] = stream_name
         os.environ["VIDEO_FILENAME_PREFIX"] = sanitize_filename(stream_name)
@@ -390,10 +487,13 @@ async def main():
         os.environ["FILENAME_PREFIX"] = sanitize_filename(stream_name)
         os.environ["RECORD_NAME"] = stream_name
         print(f"[PRE-FLIGHT] ✓ Set env vars with username: {stream_name}")
+
     print(f"\n[PRE-FLIGHT] ✓ All checks passed - proceeding with recording")
+
     update_worker_state(stream_id, {
         "stream_name": stream_name, "status": "recording", "source": recording_source
     })
+
     source_emoji = "✋" if recording_source == "manual" else "🤖"
     start_msg = (
         f"{source_emoji} <b>بدأ التسجيل</b>\n"
@@ -402,34 +502,23 @@ async def main():
         f"🕒 الوقت: {datetime.now().strftime('%H:%M:%S')}"
     )
     send_telegram_message(start_msg)
+
     print("\n" + "=" * 70)
     print("CALLING ORIGINAL record_once.py")
     print("=" * 70)
+
+    # ── Start FilePreserver BEFORE record_once ──
+    preserver = FilePreserver(
+        watch_dirs=[RECORDINGS_DIR, TEMP_DIR],
+        preserve_dir=PRESERVED_DIR,
+        poll_interval=0.5,
+    )
+    await preserver.start()
+
     try:
         import record_once
-        try:
-            await record_once.main()
-            print("\n[LAUNCHER] ✓ record_once.py completed successfully")
-            # === تحديث الحالة إلى مكتمل لتحرير الخانة ===
-            update_worker_state(stream_id, {
-                "status": "completed",
-                "completed_at": datetime.now(timezone.utc).isoformat()
-            })
-        except SystemExit as e:
-            exit_code = e.code if isinstance(e.code, int) else 0
-            print(f"\n[LAUNCHER] ⚠️ record_once.py called sys.exit({exit_code})")
-            if exit_code == 0:
-                update_worker_state(stream_id, {
-                    "status": "completed",
-                    "completed_at": datetime.now(timezone.utc).isoformat()
-                })
-            else:
-                update_worker_state(stream_id, {
-                    "status": "failed",
-                    "error": f"sys.exit({exit_code})",
-                    "failed_at": datetime.now(timezone.utc).isoformat()
-                })
-            sys.exit(exit_code)
+        await record_once.main()
+        print("\n[LAUNCHER] ✓ record_once.py completed successfully")
     except Exception as e:
         error_msg = (
             f"❌ <b>فشل التسجيل</b>\n"
@@ -442,18 +531,18 @@ async def main():
             "status": "failed", "error": str(e),
             "failed_at": datetime.now(timezone.utc).isoformat()
         })
+        await preserver.stop()
         sys.exit(1)
-    # ============================================================
-    # RENAME FILES: After record_once.py finishes, rename files
-    # from generic names (like "recording_*.mkv") to username
-    # ============================================================
+    finally:
+        await preserver.stop()
+
+    # ── RENAME FILES (original logic, unchanged) ──
     print("\n" + "=" * 70)
     print("POST-PROCESSING: Renaming files by username")
     print("=" * 70)
+
     if stream_name:
-        # Wait a bit for all files to be written
         await asyncio.sleep(2)
-        # Find new files created during recording
         all_current_files = set()
         for ext in ['*.mkv', '*.webm', '*.mp4']:
             for pattern in [str(RECORDINGS_DIR / ext), str(TEMP_DIR / ext)]:
@@ -461,14 +550,12 @@ async def main():
         new_files = list(all_current_files - existing_files)
         if new_files:
             print(f"[RENAME] Found {len(new_files)} new file(s) to rename")
-            # Filter out files that already have the username in them
             safe_name = sanitize_filename(stream_name)
             files_to_rename = [f for f in new_files if safe_name not in os.path.basename(f)]
             if files_to_rename:
                 renamed = rename_files_by_username(files_to_rename, stream_name)
                 if renamed:
                     print(f"[RENAME] ✓ Renamed {len(renamed)} file(s)")
-                    # Send notification about renamed files
                     file_list = "\n".join([f"📁 <code>{os.path.basename(new)}</code>" for _, new in renamed[:5]])
                     send_telegram_message(
                         f"📦 <b>ملفات التسجيل جاهزة</b>\n"
@@ -483,5 +570,16 @@ async def main():
             print(f"[RENAME] ℹ️ No new files found (record_once.py may upload & delete)")
     else:
         print(f"[RENAME] ⚠️ No username available - skipping rename")
+
+    # ── Report preserved files ──
+    preserved = list(PRESERVED_DIR.glob("*.mkv")) if PRESERVED_DIR.exists() else []
+    if preserved:
+        print(f"\n[PRESERVE] 📦 {len(preserved)} file(s) available in _preserved/ for post-processing")
+        for p in preserved:
+            print(f"[PRESERVE]   • {p.name}  ({p.stat().st_size / 1024 / 1024:.1f} MB)")
+    else:
+        print("\n[PRESERVE] ⚠️ No preserved files found")
+
+
 if __name__ == "__main__":
     asyncio.run(main())
