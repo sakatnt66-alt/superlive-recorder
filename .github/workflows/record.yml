@@ -70,6 +70,7 @@ jobs:
         run: |
           mkdir -p recordings
           mkdir -p recordings/_temp
+          mkdir -p recordings/_preserved
           mkdir -p recordings/_state
 
       - name: Start recording (FAST MODE)
@@ -101,9 +102,6 @@ jobs:
           xvfb-run -a --server-args="-screen 0 1920x1080x24" python record_launcher.py
           exit $?
 
-      # ═══════════════════════════════════════════════════
-      #  POST-PROCESSING: MKV→MP4 + Preview + Telegram
-      # ═══════════════════════════════════════════════════
       - name: Post-process recordings
         if: always()
         env:
@@ -116,6 +114,10 @@ jobs:
           echo "========================================"
           echo "POST-PROCESSING PIPELINE"
           echo "========================================"
+          echo "Searching in:"
+          ls -la recordings/ 2>/dev/null || echo "  recordings/ empty"
+          ls -la recordings/_temp/ 2>/dev/null || echo "  _temp/ empty"
+          ls -la recordings/_preserved/ 2>/dev/null || echo "  _preserved/ empty"
           python postprocess_recording.py
 
       - name: Finalize Worker State (Always)
@@ -151,6 +153,9 @@ jobs:
             recordings/*.mp4
             recordings/*.mkv
             recordings/*_preview.jpg
+            recordings/_preserved/*.mkv
+            recordings/_preserved/*.mp4
+            recordings/_preserved/*_preview.jpg
             recordings/_state/*.json
             recordings/_temp/*.png
           if-no-files-found: warn
