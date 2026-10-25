@@ -114,10 +114,9 @@ jobs:
           echo "========================================"
           echo "POST-PROCESSING PIPELINE"
           echo "========================================"
-          echo "Searching in:"
-          ls -la recordings/ 2>/dev/null || echo "  recordings/ empty"
-          ls -la recordings/_temp/ 2>/dev/null || echo "  _temp/ empty"
-          ls -la recordings/_preserved/ 2>/dev/null || echo "  _preserved/ empty"
+          echo "--- Directory contents ---"
+          find recordings/ -type f -name "*.mkv" -o -name "*.mp4" -o -name "*.jpg" 2>/dev/null | head -20
+          echo "--- Starting postprocess ---"
           python postprocess_recording.py
 
       - name: Finalize Worker State (Always)
@@ -155,7 +154,6 @@ jobs:
             recordings/*_preview.jpg
             recordings/_preserved/*.mkv
             recordings/_preserved/*.mp4
-            recordings/_preserved/*_preview.jpg
             recordings/_state/*.json
             recordings/_temp/*.png
           if-no-files-found: warn
