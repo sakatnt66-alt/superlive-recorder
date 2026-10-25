@@ -15,26 +15,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 from superlive_discovery import SuperLiveDiscovery
-
 # Configuration
 WORKER_API_URL = os.environ.get("WORKER_API_URL", "")
 AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-
 RECORDINGS_DIR = Path("recordings")
 TEMP_DIR = RECORDINGS_DIR / "_temp"
-
 def sanitize_filename(name: str) -> str:
     """Sanitize filename to be filesystem-safe"""
     if not name:
         return "unknown"
+    # Remove unsafe characters
     name = re.sub(r'[<>:"/\\|?*]', '', name)
+    # Replace whitespace with underscore
     name = re.sub(r'\s+', '_', name).strip('_')
+    # Limit length
     if len(name) > 80:
         name = name[:80]
     return name or "unknown"
-
 def send_telegram_message(text: str, parse_mode: str = "HTML"):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -52,7 +51,6 @@ def send_telegram_message(text: str, parse_mode: str = "HTML"):
             pass
     except Exception as e:
         print(f"[TELEGRAM] Error: {e}")
-
 def update_worker_state(stream_id: str, state: dict):
     if not WORKER_API_URL or not AUTO_API_TOKEN:
         return
@@ -67,7 +65,6 @@ def update_worker_state(stream_id: str, state: dict):
             pass
     except Exception as e:
         print(f"[WORKER] Error: {e}")
-
 def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
     stream_id_str = str(stream_id)
     user_id_str = str(user_id)
@@ -78,7 +75,6 @@ def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
     if not stream_id_str.isdigit():
         return False
     return True
-
 async def verify_stream_is_accessible(stream_url: str) -> dict:
     try:
         from playwright.async_api import async_playwright
@@ -95,7 +91,7 @@ async def verify_stream_is_accessible(stream_url: str) -> dict:
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 locale='fr-FR'
             )
-            page = await browser.new_page()
+            page = await context.new_page()
             try:
                 await page.goto(stream_url, wait_until='networkidle', timeout=45000)
             except Exception as e:
@@ -141,7 +137,6 @@ async def verify_stream_is_accessible(stream_url: str) -> dict:
             return {"accessible": False, "error": "No playable video"}
     except Exception as e:
         return {"accessible": False, "error": str(e)}
-
 async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
     print(f"[PRE-FLIGHT] Starting validation for stream {stream_id}")
     try:
@@ -206,6 +201,7 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                         "actual_stream_id": actual_stream_id,
                         "error": "User is offline"
                     }
+        # Fallback discovery flow
         if not profile_result:
             return {
                 "success": False, "status": "UNKNOWN", "username": None,
@@ -267,8 +263,8 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
             "success": False, "status": "ERROR", "username": None,
             "actual_stream_id": stream_id, "error": str(e)
         }
-
 def get_latest_files(before_time: float) -> list:
+    """Get all video files created after a specific time."""
     files = []
     for ext in ['*.mkv', '*.webm', '*.mp4']:
         for pattern in [str(RECORDINGS_DIR / ext), str(TEMP_DIR / ext)]:
@@ -279,19 +275,25 @@ def get_latest_files(before_time: float) -> list:
                 except:
                     pass
     return files
-
 def rename_files_by_username(files: list, username: str) -> list:
+    """
+    Rename video files to use username instead of generic names.
+    Handles multiple parts: username_part001.mkv, username_part002.mkv, etc.
+    """
     if not files or not username or username.startswith("user_"):
         return []
     safe_name = sanitize_filename(username)
     renamed = []
+    # Sort by modification time (oldest first)
     files_sorted = sorted(files, key=lambda f: os.path.getmtime(f))
+    # If only one file, use username directly
     if len(files_sorted) == 1:
         old_path = files_sorted[0]
         ext = os.path.splitext(old_path)[1]
         dir_path = os.path.dirname(old_path)
         new_name = f"{safe_name}{ext}"
         new_path = os.path.join(dir_path, new_name)
+        # Handle name collision
         counter = 1
         while os.path.exists(new_path):
             new_name = f"{safe_name}_{counter}{ext}"
@@ -304,6 +306,7 @@ def rename_files_by_username(files: list, username: str) -> list:
         except Exception as e:
             print(f"[RENAME] ✗ Failed to rename {old_path}: {e}")
         return renamed
+    # Multiple files: use username_part001, username_part002, etc.
     for idx, old_path in enumerate(files_sorted, start=1):
         ext = os.path.splitext(old_path)[1]
         dir_path = os.path.dirname(old_path)
@@ -322,7 +325,6 @@ def rename_files_by_username(files: list, username: str) -> list:
         except Exception as e:
             print(f"[RENAME] ✗ Failed to rename {old_path}: {e}")
     return renamed
-
 async def main():
     stream_url = os.environ.get("RECORD_URL")
     stream_id = os.environ.get("STREAM_ID")
@@ -342,7 +344,9 @@ async def main():
     print("\n" + "=" * 70)
     print("PRE-FLIGHT VALIDATION")
     print("=" * 70)
+    # Mark time before recording to detect new files later
     start_time = datetime.now().timestamp()
+    # Get list of existing files before recording starts
     existing_files = set()
     for ext in ['*.mkv', '*.webm', '*.mp4']:
         for pattern in [str(RECORDINGS_DIR / ext), str(TEMP_DIR / ext)]:
@@ -375,6 +379,10 @@ async def main():
         print(f"[PRE-FLIGHT] ✓ Using detected stream_id: {actual_stream_id}")
         os.environ["STREAM_ID"] = actual_stream_id
         stream_id = actual_stream_id
+    # ============================================================
+    # PASS STREAM NAME to record_once.py via multiple env vars
+    # This maximizes the chance that record_once.py uses the name
+    # ============================================================
     if stream_name:
         os.environ["STREAM_NAME"] = stream_name
         os.environ["VIDEO_FILENAME_PREFIX"] = sanitize_filename(stream_name)
@@ -397,12 +405,12 @@ async def main():
     print("\n" + "=" * 70)
     print("CALLING ORIGINAL record_once.py")
     print("=" * 70)
-    
     try:
         import record_once
         try:
             await record_once.main()
             print("\n[LAUNCHER] ✓ record_once.py completed successfully")
+            # === تحديث الحالة إلى مكتمل لتحرير الخانة ===
             update_worker_state(stream_id, {
                 "status": "completed",
                 "completed_at": datetime.now(timezone.utc).isoformat()
@@ -411,9 +419,16 @@ async def main():
             exit_code = e.code if isinstance(e.code, int) else 0
             print(f"\n[LAUNCHER] ⚠️ record_once.py called sys.exit({exit_code})")
             if exit_code == 0:
-                update_worker_state(stream_id, {"status": "completed", "completed_at": datetime.now(timezone.utc).isoformat()})
+                update_worker_state(stream_id, {
+                    "status": "completed",
+                    "completed_at": datetime.now(timezone.utc).isoformat()
+                })
             else:
-                update_worker_state(stream_id, {"status": "failed", "error": f"sys.exit({exit_code})", "failed_at": datetime.now(timezone.utc).isoformat()})
+                update_worker_state(stream_id, {
+                    "status": "failed",
+                    "error": f"sys.exit({exit_code})",
+                    "failed_at": datetime.now(timezone.utc).isoformat()
+                })
             sys.exit(exit_code)
     except Exception as e:
         error_msg = (
@@ -428,12 +443,17 @@ async def main():
             "failed_at": datetime.now(timezone.utc).isoformat()
         })
         sys.exit(1)
-
+    # ============================================================
+    # RENAME FILES: After record_once.py finishes, rename files
+    # from generic names (like "recording_*.mkv") to username
+    # ============================================================
     print("\n" + "=" * 70)
     print("POST-PROCESSING: Renaming files by username")
     print("=" * 70)
     if stream_name:
+        # Wait a bit for all files to be written
         await asyncio.sleep(2)
+        # Find new files created during recording
         all_current_files = set()
         for ext in ['*.mkv', '*.webm', '*.mp4']:
             for pattern in [str(RECORDINGS_DIR / ext), str(TEMP_DIR / ext)]:
@@ -441,12 +461,14 @@ async def main():
         new_files = list(all_current_files - existing_files)
         if new_files:
             print(f"[RENAME] Found {len(new_files)} new file(s) to rename")
+            # Filter out files that already have the username in them
             safe_name = sanitize_filename(stream_name)
             files_to_rename = [f for f in new_files if safe_name not in os.path.basename(f)]
             if files_to_rename:
                 renamed = rename_files_by_username(files_to_rename, stream_name)
                 if renamed:
                     print(f"[RENAME] ✓ Renamed {len(renamed)} file(s)")
+                    # Send notification about renamed files
                     file_list = "\n".join([f"📁 <code>{os.path.basename(new)}</code>" for _, new in renamed[:5]])
                     send_telegram_message(
                         f"📦 <b>ملفات التسجيل جاهزة</b>\n"
@@ -461,6 +483,5 @@ async def main():
             print(f"[RENAME] ℹ️ No new files found (record_once.py may upload & delete)")
     else:
         print(f"[RENAME] ⚠️ No username available - skipping rename")
-
 if __name__ == "__main__":
     asyncio.run(main())
