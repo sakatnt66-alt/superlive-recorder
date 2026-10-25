@@ -95,7 +95,7 @@ async def verify_stream_is_accessible(stream_url: str) -> dict:
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 locale='fr-FR'
             )
-            page = await context.new_page()
+            page = await browser.new_page()
             try:
                 await page.goto(stream_url, wait_until='networkidle', timeout=45000)
             except Exception as e:
