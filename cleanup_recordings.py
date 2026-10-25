@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 cleanup_recordings.py - تنظيف التسجيلات العالقة تلقائياً من Cloudflare Worker KV
-يجلب التسجيلات النشطة من Worker API ويوقف أي تسجيل تجاوز الحد الأقصى للمدة.
+يجلب التسجيلات النشطة من Worker API ويوقف أي تسجيل تجاوز 60 دقيقة.
 """
 import json
 import os
@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 # الإعدادات
-MAX_RECORDING_HOURS = 5  # الحد الأقصى لمدة التسجيل (ساعات). أي تسجيل يتجاوز هذه المدة يعتبر عالقاً.
+MAX_RECORDING_MINUTES = 60  # الحد الأقصى: 60 دقيقة بالضبط
 WORKER_API_URL = os.environ.get("WORKER_API_URL", "").strip()
 AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "").strip()
 
@@ -53,7 +53,7 @@ def update_worker_state(stream_id, state):
         print(f"  ❌ [WORKER SYNC] خطأ: {e}")
 
 def is_recording_stuck(recording):
-    """فحص ما إذا كان التسجيل قد تجاوز الحد الأقصى للمدة"""
+    """فحص ما إذا كان التسجيل قد تجاوز 60 دقيقة"""
     stream_id = recording.get('stream_id')
     stream_name = recording.get('stream_name', 'Unknown')
     started_at_str = recording.get('started_at')
@@ -65,7 +65,6 @@ def is_recording_stuck(recording):
         return True
         
     try:
-        # التعامل مع صيغة ISO 8601
         if started_at_str.endswith('Z'):
             started_at_str = started_at_str[:-1] + '+00:00'
         started_at = datetime.fromisoformat(started_at_str)
@@ -74,12 +73,12 @@ def is_recording_stuck(recording):
             
         now = datetime.now(timezone.utc)
         duration = now - started_at
+        minutes = duration.total_seconds() / 60
         
-        hours = duration.total_seconds() / 3600
-        print(f"  ⏱️ المدة: {hours:.2f} ساعة")
+        print(f"  ⏱️ المدة: {minutes:.1f} دقيقة")
         
-        if duration > timedelta(hours=MAX_RECORDING_HOURS):
-            print(f"  ⏰ تجاوز الحد الأقصى ({MAX_RECORDING_HOURS} ساعات) -> إيقاف")
+        if duration >= timedelta(minutes=MAX_RECORDING_MINUTES):
+            print(f"  ⏰ تجاوز {MAX_RECORDING_MINUTES} دقيقة -> إيقاف فوري")
             return True
             
     except Exception as e:
@@ -91,12 +90,12 @@ def is_recording_stuck(recording):
 
 def main():
     print("=" * 60)
-    print("🧹 بدء فحص وتنظيف التسجيلات العالقة من Cloudflare KV")
+    print("🧹 بدء فحص وتنظيف التسجيلات من Cloudflare KV")
+    print(f"⏰ الحد الأقصى: {MAX_RECORDING_MINUTES} دقيقة")
     print("=" * 60)
     
     if not WORKER_API_URL or not AUTO_API_TOKEN:
-        print("❌ لا يمكن التشغيل: متغيرات البيئة WORKER_API_URL و AUTO_API_TOKEN مفقودة.")
-        print("💡 تأكد من إضافتها في ملف cleanup.yml")
+        print("❌ لا يمكن التشغيل: متغيرات البيئة مفقودة.")
         sys.exit(1)
 
     active_recordings = get_active_recordings_from_worker()
@@ -112,17 +111,16 @@ def main():
             stuck_count += 1
             stream_id = recording.get('stream_id')
             stream_name = recording.get('stream_name', 'Unknown')
-            print(f"  🛑 جاري إيقاف التسجيل العالق: {stream_name} (ID: {stream_id})")
+            print(f"  🛑 جاري إيقاف: {stream_name} (ID: {stream_id})")
             
-            # إرسال أمر الإيقاف إلى Worker KV
             update_worker_state(str(stream_id), {
                 "status": "stopped",
                 "stopped_at": datetime.now(timezone.utc).isoformat(),
-                "reason": "auto_cleanup_timeout"
+                "reason": "auto_cleanup_60min_timeout"
             })
 
     print(f"\n{'=' * 60}")
-    print(f"📈 النتيجة: تم إيقاف {stuck_count} تسجيل عالق من أصل {len(active_recordings)}")
+    print(f"📈 النتيجة: تم إيقاف {stuck_count} تسجيل من أصل {len(active_recordings)}")
     print(f"{'=' * 60}")
     print("\n✅ انتهت عملية التنظيف بنجاح.")
 
