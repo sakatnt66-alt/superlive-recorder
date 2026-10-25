@@ -23,7 +23,7 @@ jobs:
   record-test:
     name: Record livestream
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 65
 
     steps:
       - name: Checkout repository
@@ -109,20 +109,20 @@ jobs:
           JOB_STATUS: ${{ job.status }}
         run: |
           python -c "
-import os, urllib.request, json, datetime
-stream_id = os.environ.get('STREAM_ID')
-worker_url = os.environ.get('WORKER_API_URL')
-token = os.environ.get('AUTO_API_TOKEN')
-status = os.environ.get('JOB_STATUS')
-if not stream_id or not worker_url or not token: exit(0)
-state = {'stopped_at': datetime.datetime.now(datetime.timezone.utc).isoformat()}
-if status == 'success': state['status'] = 'completed'
-elif status == 'failure': state['status'] = 'failed'
-else: state['status'] = 'stopped'
-req = urllib.request.Request(f'{worker_url}/api/update-state/{stream_id}', data=json.dumps(state).encode(), headers={'X-Auto-Token': token, 'Content-Type': 'application/json'})
-try: urllib.request.urlopen(req, timeout=15)
-except: pass
-"
+          import os, urllib.request, json, datetime
+          stream_id = os.environ.get('STREAM_ID')
+          worker_url = os.environ.get('WORKER_API_URL')
+          token = os.environ.get('AUTO_API_TOKEN')
+          status = os.environ.get('JOB_STATUS')
+          if not stream_id or not worker_url or not token: exit(0)
+          state = {'stopped_at': datetime.datetime.now(datetime.timezone.utc).isoformat()}
+          if status == 'success': state['status'] = 'completed'
+          elif status == 'failure': state['status'] = 'failed'
+          else: state['status'] = 'stopped'
+          req = urllib.request.Request(f'{worker_url}/api/update-state/{stream_id}', data=json.dumps(state).encode(), headers={'X-Auto-Token': token, 'Content-Type': 'application/json'})
+          try: urllib.request.urlopen(req, timeout=15)
+          except: pass
+          "
 
       - name: Upload artifacts (fallback)
         if: always()
