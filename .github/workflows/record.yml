@@ -100,6 +100,23 @@ jobs:
           xvfb-run -a --server-args="-screen 0 1920x1080x24" python record_launcher.py
           exit $?
 
+      # ═══════════════════════════════════════════
+      #  STEP ADDED: Post-process MKV → MP4 + Preview
+      # ═══════════════════════════════════════════
+      - name: Post-process recordings (MKV→MP4 + Preview)
+        if: always()
+        env:
+          RECORDINGS_DIR: ./recordings
+          STREAM_ID: ${{ github.event.client_payload.stream_id || inputs.stream_id }}
+          STREAM_NAME: ${{ github.event.client_payload.stream_name || '' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "========================================"
+          echo "POST-PROCESSING: MKV → MP4 + Preview"
+          echo "========================================"
+          python postprocess_recording.py
+
       - name: Finalize Worker State (Always)
         if: always()
         env:
@@ -131,6 +148,8 @@ jobs:
           name: superlive-recordings-${{ github.run_id }}
           path: |
             recordings/*.mp4
+            recordings/*.mkv
+            recordings/*_preview.jpg
             recordings/_temp/*.png
           if-no-files-found: warn
           retention-days: 3
