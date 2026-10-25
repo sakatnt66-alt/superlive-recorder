@@ -70,6 +70,7 @@ jobs:
         run: |
           mkdir -p recordings
           mkdir -p recordings/_temp
+          mkdir -p recordings/_state
 
       - name: Start recording (FAST MODE)
         env:
@@ -100,10 +101,10 @@ jobs:
           xvfb-run -a --server-args="-screen 0 1920x1080x24" python record_launcher.py
           exit $?
 
-      # ═══════════════════════════════════════════
-      #  STEP ADDED: Post-process MKV → MP4 + Preview
-      # ═══════════════════════════════════════════
-      - name: Post-process recordings (MKV→MP4 + Preview)
+      # ═══════════════════════════════════════════════════
+      #  POST-PROCESSING: MKV→MP4 + Preview + Telegram
+      # ═══════════════════════════════════════════════════
+      - name: Post-process recordings
         if: always()
         env:
           RECORDINGS_DIR: ./recordings
@@ -113,7 +114,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           echo "========================================"
-          echo "POST-PROCESSING: MKV → MP4 + Preview"
+          echo "POST-PROCESSING PIPELINE"
           echo "========================================"
           python postprocess_recording.py
 
@@ -150,6 +151,7 @@ jobs:
             recordings/*.mp4
             recordings/*.mkv
             recordings/*_preview.jpg
+            recordings/_state/*.json
             recordings/_temp/*.png
           if-no-files-found: warn
           retention-days: 3
