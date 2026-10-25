@@ -9,6 +9,7 @@ import os
 import sys
 import shutil
 import glob
+import threading
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -28,51 +29,50 @@ PRESERVED_DIR = RECORDINGS_DIR / "_preserved"
 
 
 # ═══════════════════════════════════════════════════════════
-# FILE PRESERVER — copies MKV files before record_once deletes
+# FILE PRESERVER — runs in a SEPARATE OS THREAD
+# so it works even when record_once.py blocks the asyncio
+# event loop with synchronous I/O (e.g. Telegram upload).
 # ═══════════════════════════════════════════════════════════
-class FilePreserver:
+class FilePreserverThread:
     """
-    Background asyncio task that watches recording directories and
+    Background OS thread that watches recording directories and
     copies every new MKV file into PRESERVED_DIR before
     record_once.py can delete it after Telegram upload.
 
-    Does NOT modify, move, or delete any file.  Read-only on source.
+    Runs independently of the asyncio event loop.
+    Does NOT modify, move, or delete any source file.
     """
 
-    def __init__(self, watch_dirs, preserve_dir, poll_interval=0.5):
+    def __init__(self, watch_dirs, preserve_dir, poll_interval=0.2):
         self.watch_dirs = [Path(d) for d in watch_dirs]
         self.preserve_dir = Path(preserve_dir)
         self.poll_interval = poll_interval
-        self._running = False
+        self._stop_event = threading.Event()
         self._preserved = set()
-        self._task = None
+        self._thread = None
 
-    async def start(self):
+    def start(self):
         self.preserve_dir.mkdir(parents=True, exist_ok=True)
-        self._running = True
-        self._task = asyncio.create_task(self._run())
-        print(f"[PRESERVE] Started — watching {[str(d) for d in self.watch_dirs]}")
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        dirs_str = ", ".join(str(d) for d in self.watch_dirs)
+        print(f"[PRESERVE] Thread started (interval={self.poll_interval}s) — watching: {dirs_str}")
 
-    async def stop(self):
-        self._running = False
-        if self._task:
-            await asyncio.sleep(self.poll_interval)
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        print(f"[PRESERVE] Stopped — {len(self._preserved)} file(s) preserved")
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+        print(f"[PRESERVE] Thread stopped — {len(self._preserved)} file(s) preserved")
 
-    async def _run(self):
-        while self._running:
+    def _run(self):
+        while not self._stop_event.is_set():
             try:
-                await self._scan()
+                self._scan()
             except Exception as exc:
                 print(f"[PRESERVE] scan error: {exc}")
-            await asyncio.sleep(self.poll_interval)
+            self._stop_event.wait(self.poll_interval)
 
-    async def _scan(self):
+    def _scan(self):
         for watch_dir in self.watch_dirs:
             if not watch_dir.exists():
                 continue
@@ -81,35 +81,25 @@ class FilePreserver:
                 if src in self._preserved:
                     continue
                 try:
-                    if f.stat().st_size == 0:
+                    size = f.stat().st_size
+                    if size == 0:
                         continue
-                except OSError:
-                    continue
-                if await self._is_stable(f):
                     dest = self.preserve_dir / f.name
                     if not dest.exists():
-                        try:
-                            shutil.copy2(src, str(dest))
-                            self._preserved.add(src)
-                            print(f"[PRESERVE] ✓ {f.name} → _preserved/{f.name}")
-                        except Exception as e:
-                            print(f"[PRESERVE] ✗ copy failed: {e}")
-
-    async def _is_stable(self, path, checks=2, interval=0.5):
-        try:
-            sizes = []
-            for _ in range(checks):
-                sizes.append(path.stat().st_size)
-                await asyncio.sleep(interval)
-            return len(set(sizes)) == 1 and sizes[0] > 0
-        except OSError:
-            return False
+                        shutil.copy2(src, str(dest))
+                        self._preserved.add(src)
+                        print(f"[PRESERVE] ✓ {f.name} ({size / 1024 / 1024:.1f} MB) → _preserved/")
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    print(f"[PRESERVE] ✗ copy failed for {f.name}: {e}")
 
 
 # ═══════════════════════════════════════════════════════════
 # ORIGINAL FUNCTIONS (unchanged)
 # ═══════════════════════════════════════════════════════════
 def sanitize_filename(name: str) -> str:
+    """Sanitize filename to be filesystem-safe"""
     if not name:
         return "unknown"
     name = re.sub(r'[<>:"/\\|?*]', '', name)
@@ -358,6 +348,7 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
 
 
 def get_latest_files(before_time: float) -> list:
+    """Get all video files created after a specific time."""
     files = []
     for ext in ['*.mkv', '*.webm', '*.mp4']:
         for pattern in [str(RECORDINGS_DIR / ext), str(TEMP_DIR / ext)]:
@@ -371,6 +362,10 @@ def get_latest_files(before_time: float) -> list:
 
 
 def rename_files_by_username(files: list, username: str) -> list:
+    """
+    Rename video files to use username instead of generic names.
+    Handles multiple parts: username_part001.mkv, username_part002.mkv, etc.
+    """
     if not files or not username or username.startswith("user_"):
         return []
     safe_name = sanitize_filename(username)
@@ -415,7 +410,7 @@ def rename_files_by_username(files: list, username: str) -> list:
 
 
 # ═══════════════════════════════════════════════════════════
-# MAIN — with FilePreserver integration
+# MAIN
 # ═══════════════════════════════════════════════════════════
 async def main():
     stream_url = os.environ.get("RECORD_URL")
@@ -507,13 +502,15 @@ async def main():
     print("CALLING ORIGINAL record_once.py")
     print("=" * 70)
 
-    # ── Start FilePreserver BEFORE record_once ──
-    preserver = FilePreserver(
+    # ── Start FilePreserver in a SEPARATE OS THREAD ──
+    # This works even when record_once.py blocks the asyncio event loop
+    # with synchronous I/O operations (e.g. Telegram upload).
+    preserver = FilePreserverThread(
         watch_dirs=[RECORDINGS_DIR, TEMP_DIR],
         preserve_dir=PRESERVED_DIR,
-        poll_interval=0.5,
+        poll_interval=0.2,
     )
-    await preserver.start()
+    preserver.start()
 
     try:
         import record_once
@@ -531,10 +528,10 @@ async def main():
             "status": "failed", "error": str(e),
             "failed_at": datetime.now(timezone.utc).isoformat()
         })
-        await preserver.stop()
+        preserver.stop()
         sys.exit(1)
     finally:
-        await preserver.stop()
+        preserver.stop()
 
     # ── RENAME FILES (original logic, unchanged) ──
     print("\n" + "=" * 70)
@@ -574,11 +571,11 @@ async def main():
     # ── Report preserved files ──
     preserved = list(PRESERVED_DIR.glob("*.mkv")) if PRESERVED_DIR.exists() else []
     if preserved:
-        print(f"\n[PRESERVE] 📦 {len(preserved)} file(s) available in _preserved/ for post-processing")
+        print(f"\n[PRESERVE] 📦 {len(preserved)} file(s) in _preserved/ for post-processing:")
         for p in preserved:
             print(f"[PRESERVE]   • {p.name}  ({p.stat().st_size / 1024 / 1024:.1f} MB)")
     else:
-        print("\n[PRESERVE] ⚠️ No preserved files found")
+        print("\n[PRESERVE] ⚠️ No preserved MKV files found")
 
 
 if __name__ == "__main__":
