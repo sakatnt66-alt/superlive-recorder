@@ -129,7 +129,7 @@ jobs:
           STREAM_NAME: ${{ github.event.client_payload.stream_name || '' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          CS_COLS: "4"
+          CS_COLS: "2"
           CS_ROWS: "6"
           CS_CELL_W: "320"
           CS_CELL_H: "180"
@@ -137,7 +137,7 @@ jobs:
           CS_QUALITY: "85"
         run: |
           echo "========================================"
-          echo "FULL STREAM CONTACT SHEET GENERATOR"
+          echo "FULL STREAM CONTACT SHEET (PORTRAIT 2x6)"
           echo "========================================"
           python full_stream_contact_sheet.py || true
 
