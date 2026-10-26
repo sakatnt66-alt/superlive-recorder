@@ -23,7 +23,8 @@ jobs:
   record-test:
     name: Record livestream
     runs-on: ubuntu-latest
-    timeout-minutes: 65
+    # 62 minutes: 60 min recording limit + 2 min for post-processing
+    timeout-minutes: 62
 
     steps:
       - name: Checkout repository
@@ -91,6 +92,7 @@ jobs:
           AUTO_API_TOKEN: ${{ secrets.AUTO_API_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RECORDING_MAX_SECONDS: "3600"
         run: |
           echo "========================================"
           echo "SUPERLIVE RECORDER (FAST MODE)"
@@ -98,6 +100,7 @@ jobs:
           echo "URL: ${RECORD_URL}"
           echo "Stream ID: ${STREAM_ID}"
           echo "Stream Name: ${STREAM_NAME}"
+          echo "Recording limit: ${RECORDING_MAX_SECONDS}s"
           echo "Mode: Fast + Streaming"
           echo "========================================"
           xvfb-run -a --server-args="-screen 0 1920x1080x24" python record_launcher.py
