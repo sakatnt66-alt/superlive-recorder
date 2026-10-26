@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-postprocess_recording.py — Post-processing pipeline.
-Splits MKV into MP4 segments, creates preview grid, sends to Telegram.
-Uses Pillow for grid generation (avoids FFmpeg drawtext failures).
+postprocess_recording.py — A/V-safe post-processing pipeline.
+
+Changes from previous version:
+  1. discover_mkv_files() now EXCLUDES _encoded.mkv and _part_ files.
+     Only *_av.mkv originals are processed.
+  2. has_audio_stream() verifies audio presence via ffprobe before sending.
+  3. Segments without audio are NEVER sent to Telegram.
+  4. No duplicate preview image (full_stream_contact_sheet.py owns that).
 """
 
 import json
@@ -31,10 +36,6 @@ MAX_SEGMENT_BYTES  = 45 * 1024 * 1024
 TG_HARD_LIMIT      = 50 * 1024 * 1024
 MAX_TG_PHOTO_BYTES = 10 * 1024 * 1024
 
-GRID_COLS, GRID_ROWS = 4, 3
-GRID_COUNT = GRID_COLS * GRID_ROWS
-CELL_W, CELL_H = 400, 225
-JPEG_Q = 2
 MARKER_SUFFIX = ".postprocessed"
 MP4_VIDEO_OK = {"h264", "hevc", "mpeg4", "mjpeg"}
 MP4_AUDIO_OK = {"aac", "mp3", "ac3", "eac3", "alac", "mp2", "opus"}
@@ -100,6 +101,24 @@ def safe_id(sid: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════
+# AUDIO VERIFICATION — the core fix for silent videos
+# ═══════════════════════════════════════════════════════════
+def has_audio_stream(path: str) -> bool:
+    """
+    Check if a media file contains at least one audio stream.
+    Uses ffprobe to inspect actual streams, NOT the filename.
+    """
+    r = run(
+        f'ffprobe -v quiet -select_streams a '
+        f'-show_entries stream=codec_type '
+        f'-of csv=p=0 "{path}"', 30
+    )
+    if r and r.returncode == 0 and 'audio' in r.stdout:
+        return True
+    return False
+
+
+# ═══════════════════════════════════════════════════════════
 # STATE
 # ═══════════════════════════════════════════════════════════
 def state_path(sid: str) -> Path:
@@ -126,12 +145,17 @@ def save_state(sid: str, st: dict) -> None:
 
 
 # ═══════════════════════════════════════════════════════════
-# FILE DISCOVERY — EXCLUDES _part_ AND _encoded FILES
+# FILE DISCOVERY — EXCLUDES _part_, _encoded, processes only _av.mkv
 # ═══════════════════════════════════════════════════════════
 def discover_mkv_files() -> list:
     """
     Search _preserved/ FIRST, then recordings/ and _temp/.
-    EXCLUDES: *_part_*.mkv and *_encoded*.mkv (intermediate files).
+
+    EXCLUDES:
+      *_part_*.mkv   — split parts of the original, not independent recordings
+      *_encoded*.mkv  — video-only intermediate (NO audio), causes silent duplicates
+
+    ONLY processes files that are the muxed A/V originals.
     """
     files = []
     seen_names = set()
@@ -140,13 +164,17 @@ def discover_mkv_files() -> list:
             continue
         for f in sorted(d.glob("*.mkv")):
             name = f.name
-            # ── EXCLUDE intermediate files ──
+
+            # ── EXCLUDE intermediate and part files ──
             if "_part_" in name:
+                log(f"Skipping split part: {name}")
                 continue
             if "_encoded" in name:
+                log(f"Skipping video-only intermediate: {name}")
                 continue
             if name in seen_names:
                 continue
+
             try:
                 if f.stat().st_size > 0:
                     files.append(f)
@@ -157,7 +185,7 @@ def discover_mkv_files() -> list:
 
 
 # ═══════════════════════════════════════════════════════════
-# SPLIT INTO MP4 SEGMENTS
+# SPLIT INTO MP4 SEGMENTS (stream copy, keyframe boundaries)
 # ═══════════════════════════════════════════════════════════
 def calc_segment_duration(src: str, info: dict) -> float:
     fsize = os.path.getsize(src)
@@ -202,96 +230,25 @@ def verify_segment(path: str) -> bool:
     return vc is not None
 
 
-# ═══════════════════════════════════════════════════════════
-# PREVIEW GRID (12 frames, 4×3) — Pillow-based
-# ═══════════════════════════════════════════════════════════
-def extract_preview_frames(src: str, duration: float, tmpdir: str) -> list:
-    paths = []
-    margin = min(2.0, duration * 0.02)
-    span = max(duration - 2 * margin, 0.1)
-    for i in range(GRID_COUNT):
-        ts = margin + span * i / max(GRID_COUNT - 1, 1)
-        out = os.path.join(tmpdir, f"prev_{i:02d}.jpg")
-        cmd = f'ffmpeg -y -ss {ts:.3f} -i "{src}" -frames:v 1 -q:v {JPEG_Q} "{out}"'
-        r = run(cmd, timeout=30)
-        if r and r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
-            paths.append((out, ts))
-        else:
-            stderr_snippet = (r.stderr or "")[:200] if r else "timeout"
-            log(f"Preview frame {i+1}/{GRID_COUNT} at {ts:.1f}s failed: {stderr_snippet}")
-    return paths
-
-
-def build_preview_grid(frames: list, out_path: str) -> bool:
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-    except ImportError:
-        log("Pillow not installed — cannot build preview grid")
+def create_thumbnail(video_path: str, thumb_path: str) -> bool:
+    info = ffprobe_json(video_path)
+    if info is None:
         return False
-
-    n = len(frames)
-    if n == 0:
-        return False
-    n = min(n, GRID_COLS * GRID_ROWS)
-    frames = frames[:n]
-
-    text_h = 20
-    gap = 4
-    margin = 8
-    img_w = margin * 2 + GRID_COLS * CELL_W + (GRID_COLS - 1) * gap
-    img_h = margin * 2 + GRID_ROWS * (CELL_H + text_h) + (GRID_ROWS - 1) * gap
-
-    grid_img = Image.new('RGB', (img_w, img_h), color="black")
-    draw = ImageDraw.Draw(grid_img)
-
-    font = None
-    for fp in ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-               "/usr/share/fonts/truetype/freefont/FreeSans.ttf"]:
-        try:
-            font = ImageFont.truetype(fp, 16)
-            break
-        except (IOError, OSError):
-            continue
-    if font is None:
-        try:
-            font = ImageFont.load_default()
-        except Exception:
-            font = None
-
-    for i, (frame_path, ts) in enumerate(frames):
-        row, col = i // GRID_COLS, i % GRID_COLS
-        x = margin + col * (CELL_W + gap)
-        y = margin + row * (CELL_H + text_h + gap)
-
-        try:
-            with Image.open(frame_path) as img:
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
-                img.thumbnail((CELL_W, CELL_H), Image.LANCZOS)
-                offset_x = x + (CELL_W - img.width) // 2
-                offset_y = y + (CELL_H - img.height) // 2
-                grid_img.paste(img, (offset_x, offset_y))
-        except Exception:
-            continue
-
-        if font:
-            label = format_ts(ts)
-            try:
-                text_bbox = draw.textbbox((0, 0), label, font=font)
-                text_w = text_bbox[2] - text_bbox[0]
-            except AttributeError:
-                text_w = len(label) * 8
-            draw.text((x + (CELL_W - text_w) // 2, y + CELL_H + 2), label, fill="white", font=font)
-
-    try:
-        grid_img.save(out_path, "JPEG", quality=90)
-        return os.path.exists(out_path) and os.path.getsize(out_path) > 0
-    except Exception:
-        return False
+    dur = get_duration(info)
+    ts = min(dur * 0.25, dur - 0.5) if dur > 1 else 0
+    cmd = (
+        f'ffmpeg -y -ss {ts:.2f} -i "{video_path}" '
+        f'-frames:v 1 -q:v 2 '
+        f'-vf "scale=320:180:force_original_aspect_ratio=decrease,'
+        f'pad=320:180:(ow-iw)/2:(oh-ih)/2:black" '
+        f'"{thumb_path}"'
+    )
+    r = run(cmd, timeout=30)
+    return r is not None and r.returncode == 0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0
 
 
 # ═══════════════════════════════════════════════════════════
-# TELEGRAM
+# TELEGRAM — sendVideo (native inline playback)
 # ═══════════════════════════════════════════════════════════
 def tg_send_video(video_path: str, thumb_path: str, caption: str,
                   duration: int, width: int, height: int) -> dict:
@@ -332,7 +289,9 @@ def tg_send_video(video_path: str, thumb_path: str, caption: str,
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
     for attempt in range(1, 4):
         try:
-            req = urllib.request.Request(url, data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+            req = urllib.request.Request(url, data=body, headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}"
+            })
             with urllib.request.urlopen(req, timeout=300) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8"))
@@ -344,8 +303,10 @@ def tg_send_video(video_path: str, thumb_path: str, caption: str,
                 result["error"] = "HTTP 403 — NOT retrying"
                 return result
             result["error"] = f"HTTP {e.code}"
+            log(f"⚠️ sendVideo attempt {attempt}/3: HTTP {e.code}")
         except Exception as e:
             result["error"] = str(e)
+            log(f"⚠️ sendVideo attempt {attempt}/3: {e}")
         if attempt < 3:
             time.sleep(3 * attempt)
     return result
@@ -375,7 +336,9 @@ def tg_send_photo(photo_path: str, caption: str) -> dict:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     for attempt in range(1, 4):
         try:
-            req = urllib.request.Request(url, data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+            req = urllib.request.Request(url, data=body, headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}"
+            })
             with urllib.request.urlopen(req, timeout=120) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8"))
@@ -392,23 +355,6 @@ def tg_send_photo(photo_path: str, caption: str) -> dict:
         if attempt < 3:
             time.sleep(2 * attempt)
     return result
-
-
-def create_thumbnail(video_path: str, thumb_path: str) -> bool:
-    info = ffprobe_json(video_path)
-    if info is None:
-        return False
-    dur = get_duration(info)
-    ts = min(dur * 0.25, dur - 0.5) if dur > 1 else 0
-    cmd = (
-        f'ffmpeg -y -ss {ts:.2f} -i "{video_path}" '
-        f'-frames:v 1 -q:v 2 '
-        f'-vf "scale=320:180:force_original_aspect_ratio=decrease,'
-        f'pad=320:180:(ow-iw)/2:(oh-ih)/2:black" '
-        f'"{thumb_path}"'
-    )
-    r = run(cmd, timeout=30)
-    return r is not None and r.returncode == 0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0
 
 
 # ═══════════════════════════════════════════════════════════
@@ -442,6 +388,14 @@ def process_one(mkv_path: Path, sid: str) -> bool:
     log(f"📦 Size    : {human_size(src_size)}")
     log(f"🎬 Video   : {vc}  {w}x{h}")
     log(f"🔊 Audio   : {ac or 'none'}")
+
+    # ── Verify source has audio before processing ──
+    if not has_audio_stream(mkv):
+        log("✗ Source MKV has NO audio stream. Skipping (prevents silent duplicates).")
+        st["state"] = "SKIPPED_NO_AUDIO"
+        st["errors"].append("source_has_no_audio_stream")
+        save_state(sid, st)
+        return False
 
     if vc and vc not in MP4_VIDEO_OK:
         log(f"✗ Video codec '{vc}' not MP4-compatible. Keeping MKV.")
@@ -481,11 +435,19 @@ def process_one(mkv_path: Path, sid: str) -> bool:
                 log(f"  ✗ Segment {idx+1} failed verification")
                 continue
 
+            # ── AUDIO VERIFICATION: never send silent segments ──
+            if not has_audio_stream(seg_path):
+                log(f"  ✗ Segment {idx+1} has NO audio stream — NOT sent (silent duplicate prevention)")
+                st["segments"][seg_name] = {"sent": False, "error": "no_audio_stream"}
+                st["errors"].append(f"Segment {idx+1} missing audio")
+                save_state(sid, st)
+                continue
+
             thumb_path = os.path.join(segdir, f"thumb_{idx:03d}.jpg")
             thumb_ok = create_thumbnail(seg_path, thumb_path)
 
             if seg_size > MAX_SEGMENT_BYTES:
-                log(f"  ⚠️ Segment {idx+1} exceeds 45MiB. Skipping send.")
+                log(f"  ⚠️ Segment {idx+1} exceeds 45MiB ({human_size(seg_size)}). Skipping send.")
                 continue
 
             caption = (
@@ -495,11 +457,25 @@ def process_one(mkv_path: Path, sid: str) -> bool:
                 f"⏱️ {format_ts(seg_dur_actual)}"
             )
 
-            tg_res = tg_send_video(seg_path, thumb_path if thumb_ok else "", caption, int(seg_dur_actual), seg_w, seg_h)
+            tg_res = tg_send_video(
+                seg_path,
+                thumb_path if thumb_ok else "",
+                caption,
+                int(seg_dur_actual),
+                seg_w,
+                seg_h,
+            )
+
             if tg_res["ok"]:
                 log(f"  📤 Segment {idx+1} sent ✅ (msg_id={tg_res['message_id']})")
                 sent_count += 1
-                st["segments"][seg_name] = {"sent": True, "message_id": tg_res["message_id"], "size": seg_size}
+                st["segments"][seg_name] = {
+                    "sent": True,
+                    "message_id": tg_res["message_id"],
+                    "size": seg_size,
+                    "duration": round(seg_dur_actual, 1),
+                    "has_audio": True,
+                }
             else:
                 log(f"  ✗ Segment {idx+1} send failed: {tg_res['error']}")
                 st["segments"][seg_name] = {"sent": False, "error": tg_res["error"]}
@@ -508,40 +484,21 @@ def process_one(mkv_path: Path, sid: str) -> bool:
             save_state(sid, st)
             time.sleep(1)
 
-        # ── 12-frame preview grid (Pillow-based) ──
-        preview_path = os.path.join(segdir, "preview_grid.jpg")
-        preview_sent = False
-        frames = extract_preview_frames(mkv, duration, segdir)
-        log(f"🖼️  Extracted {len(frames)}/{GRID_COUNT} frames for preview")
-
-        if len(frames) >= 2:
-            if build_preview_grid(frames, preview_path):
-                log("✅ Preview grid created")
-                prev_cap = f"🖼️ معاينة: {display_name}\n🆔 {sid}\n⏱️ {format_ts(duration)}"
-                prev_res = tg_send_photo(preview_path, prev_cap)
-                if prev_res["ok"]:
-                    log(f"📤 Preview sent ✅ (msg_id={prev_res['message_id']})")
-                    preview_sent = True
-                    st["telegram"]["preview"] = {"ok": True, "message_id": prev_res["message_id"]}
-                else:
-                    log(f"⚠️ Preview send failed: {prev_res['error']}")
-            else:
-                log("⚠️ Grid creation failed")
-        else:
-            log("⚠️ Not enough frames for preview")
-
-        save_state(sid, st)
-
+    # ── Final state ──
     if sent_count > 0:
         st["state"] = "SENT"
         with open(marker, "w") as f:
-            json.dump({"sent_at": datetime.now(timezone.utc).isoformat(), "segments_sent": sent_count, "preview_sent": preview_sent}, f, indent=2)
-        log(f"✅ COMPLETE: {sent_count}/{total_segments} segments sent")
+            json.dump({
+                "sent_at": datetime.now(timezone.utc).isoformat(),
+                "segments_sent": sent_count,
+                "total_segments": total_segments,
+            }, f, indent=2)
+        log(f"✅ COMPLETE: {sent_count}/{total_segments} segments sent (all with audio)")
         return True
     else:
         st["state"] = "FAILED"
         save_state(sid, st)
-        log("✗ No segments sent successfully")
+        log("✗ No segments were sent successfully")
         return False
 
 
@@ -550,18 +507,20 @@ def process_one(mkv_path: Path, sid: str) -> bool:
 # ═══════════════════════════════════════════════════════════
 def main():
     log("=" * 60)
-    log("Post-processing pipeline started")
+    log("Post-processing pipeline started (A/V-safe)")
     log(f"  PRESERVED_DIR  : {PRESERVED_DIR}")
     log(f"  RECORDINGS_DIR : {RECORDINGS_DIR}")
+    log(f"  TEMP_DIR       : {TEMP_DIR}")
     log(f"  STREAM_ID      : {STREAM_ID}")
+    log(f"  STREAM_NAME    : {STREAM_NAME or '(not set)'}")
     log("=" * 60)
 
     mkv_files = discover_mkv_files()
     if not mkv_files:
-        log("No MKV files found (excluding _part_ and _encoded)")
+        log("No original MKV files found (parts and _encoded excluded)")
         return
 
-    log(f"Found {len(mkv_files)} original MKV file(s)")
+    log(f"Found {len(mkv_files)} original MKV file(s) to process")
     for f in mkv_files:
         log(f"  • {f.name}  ({human_size(f.stat().st_size)})")
 
