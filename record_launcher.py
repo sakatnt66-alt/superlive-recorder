@@ -2,6 +2,11 @@
 """
 SuperLive Recorder - Launcher with Pre-flight Validation
 Passes stream name to record_once.py and attempts to rename files
+
+RECORDING TIME LIMIT: Each recording is automatically stopped after
+exactly 3600 seconds (1 hour). This is enforced via asyncio.wait_for
+around record_once.main(). After the timeout, processing continues
+normally (file finalization, segmentation, Telegram delivery).
 """
 import asyncio
 import json
@@ -27,22 +32,16 @@ RECORDINGS_DIR = Path("recordings")
 TEMP_DIR = RECORDINGS_DIR / "_temp"
 PRESERVED_DIR = RECORDINGS_DIR / "_preserved"
 
+# ═══════════════════════════════════════════════════════════
+# RECORDING TIME LIMIT — exactly 1 hour (3600 seconds)
+# ═══════════════════════════════════════════════════════════
+RECORDING_MAX_SECONDS = int(os.environ.get("RECORDING_MAX_SECONDS", "3600"))
+
 
 # ═══════════════════════════════════════════════════════════
 # FILE PRESERVER — runs in a SEPARATE OS THREAD
-# so it works even when record_once.py blocks the asyncio
-# event loop with synchronous I/O (e.g. Telegram upload).
 # ═══════════════════════════════════════════════════════════
 class FilePreserverThread:
-    """
-    Background OS thread that watches recording directories and
-    copies every new MKV file into PRESERVED_DIR before
-    record_once.py can delete it after Telegram upload.
-
-    Runs independently of the asyncio event loop.
-    Does NOT modify, move, or delete any source file.
-    """
-
     def __init__(self, watch_dirs, preserve_dir, poll_interval=0.2):
         self.watch_dirs = [Path(d) for d in watch_dirs]
         self.preserve_dir = Path(preserve_dir)
@@ -55,8 +54,7 @@ class FilePreserverThread:
         self.preserve_dir.mkdir(parents=True, exist_ok=True)
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        dirs_str = ", ".join(str(d) for d in self.watch_dirs)
-        print(f"[PRESERVE] Thread started (interval={self.poll_interval}s) — watching: {dirs_str}")
+        print(f"[PRESERVE] Thread started (interval={self.poll_interval}s)")
 
     def stop(self):
         self._stop_event.set()
@@ -88,7 +86,7 @@ class FilePreserverThread:
                     if not dest.exists():
                         shutil.copy2(src, str(dest))
                         self._preserved.add(src)
-                        print(f"[PRESERVE] ✓ {f.name} ({size / 1024 / 1024:.1f} MB) → _preserved/")
+                        print(f"[PRESERVE] ✓ {f.name} ({size / 1024 / 1024:.1f} MB)")
                 except FileNotFoundError:
                     pass
                 except Exception as e:
@@ -99,7 +97,6 @@ class FilePreserverThread:
 # ORIGINAL FUNCTIONS (unchanged)
 # ═══════════════════════════════════════════════════════════
 def sanitize_filename(name: str) -> str:
-    """Sanitize filename to be filesystem-safe"""
     if not name:
         return "unknown"
     name = re.sub(r'[<>:"/\\|?*]', '', name)
@@ -348,7 +345,6 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
 
 
 def get_latest_files(before_time: float) -> list:
-    """Get all video files created after a specific time."""
     files = []
     for ext in ['*.mkv', '*.webm', '*.mp4']:
         for pattern in [str(RECORDINGS_DIR / ext), str(TEMP_DIR / ext)]:
@@ -362,10 +358,6 @@ def get_latest_files(before_time: float) -> list:
 
 
 def rename_files_by_username(files: list, username: str) -> list:
-    """
-    Rename video files to use username instead of generic names.
-    Handles multiple parts: username_part001.mkv, username_part002.mkv, etc.
-    """
     if not files or not username or username.startswith("user_"):
         return []
     safe_name = sanitize_filename(username)
@@ -410,7 +402,7 @@ def rename_files_by_username(files: list, username: str) -> list:
 
 
 # ═══════════════════════════════════════════════════════════
-# MAIN
+# MAIN — with 60-minute recording limit
 # ═══════════════════════════════════════════════════════════
 async def main():
     stream_url = os.environ.get("RECORD_URL")
@@ -424,6 +416,7 @@ async def main():
 
     print("=" * 70)
     print("SUPERLIVE RECORDER - LAUNCHER (WITH PRE-FLIGHT)")
+    print(f"RECORDING TIME LIMIT: {RECORDING_MAX_SECONDS}s ({RECORDING_MAX_SECONDS // 60} min)")
     print("=" * 70)
     print(f"URL: {stream_url}")
     print(f"Stream ID: {stream_id}")
@@ -494,17 +487,17 @@ async def main():
         f"{source_emoji} <b>بدأ التسجيل</b>\n"
         f"👤 الاسم: <b>{stream_name or 'Unknown'}</b>\n"
         f"🆔 ID: <code>{stream_id}</code>\n"
-        f"🕒 الوقت: {datetime.now().strftime('%H:%M:%S')}"
+        f"🕒 الوقت: {datetime.now().strftime('%H:%M:%S')}\n"
+        f"⏱️ الحد الأقصى: {RECORDING_MAX_SECONDS // 60} دقيقة"
     )
     send_telegram_message(start_msg)
 
     print("\n" + "=" * 70)
     print("CALLING ORIGINAL record_once.py")
+    print(f"TIME LIMIT: {RECORDING_MAX_SECONDS} seconds ({RECORDING_MAX_SECONDS // 60} minutes)")
     print("=" * 70)
 
     # ── Start FilePreserver in a SEPARATE OS THREAD ──
-    # This works even when record_once.py blocks the asyncio event loop
-    # with synchronous I/O operations (e.g. Telegram upload).
     preserver = FilePreserverThread(
         watch_dirs=[RECORDINGS_DIR, TEMP_DIR],
         preserve_dir=PRESERVED_DIR,
@@ -512,10 +505,27 @@ async def main():
     )
     preserver.start()
 
+    recording_timed_out = False
+
     try:
         import record_once
-        await record_once.main()
-        print("\n[LAUNCHER] ✓ record_once.py completed successfully")
+        # ═══════════════════════════════════════════════════════
+        # RECORDING TIME LIMIT: asyncio.wait_for enforces exactly
+        # RECORDING_MAX_SECONDS. When the timeout fires, it sends
+        # asyncio.CancelledError into record_once.main(), which
+        # triggers its cleanup (file close, mux finalize).
+        # We catch TimeoutError and proceed to post-processing.
+        # ═══════════════════════════════════════════════════════
+        await asyncio.wait_for(record_once.main(), timeout=RECORDING_MAX_SECONDS)
+        print("\n[LAUNCHER] ✓ record_once.py completed successfully (natural end)")
+    except asyncio.TimeoutError:
+        # ── Recording reached the 60-minute limit ──
+        recording_timed_out = True
+        print(f"\n[LAUNCHER] ⏰ Recording reached {RECORDING_MAX_SECONDS}s limit — stopping now")
+        print("[LAUNCHER] Proceeding to post-processing with recorded data")
+    except asyncio.CancelledError:
+        recording_timed_out = True
+        print(f"\n[LAUNCHER] ⏰ Recording cancelled at time limit")
     except Exception as e:
         error_msg = (
             f"❌ <b>فشل التسجيل</b>\n"
@@ -531,7 +541,23 @@ async def main():
         preserver.stop()
         sys.exit(1)
     finally:
+        # Give record_once.py a moment to finalize files after cancellation
+        if recording_timed_out:
+            print("[LAUNCHER] Waiting 5s for file finalization after timeout...")
+            await asyncio.sleep(5)
         preserver.stop()
+
+    # ── Notify about time-limit stop ──
+    if recording_timed_out:
+        elapsed = datetime.now().timestamp() - start_time
+        stop_msg = (
+            f"⏱️ <b>تم إيقاف التسجيل تلقائياً</b>\n"
+            f"👤 الاسم: <b>{stream_name or 'Unknown'}</b>\n"
+            f"🆔 ID: <code>{stream_id}</code>\n"
+            f"⏰ المدة المسجلة: {int(elapsed // 60)} دقيقة و {int(elapsed % 60)} ثانية\n"
+            f"📦 جارٍ المعالجة والتقسيم..."
+        )
+        send_telegram_message(stop_msg)
 
     # ── RENAME FILES (original logic, unchanged) ──
     print("\n" + "=" * 70)
