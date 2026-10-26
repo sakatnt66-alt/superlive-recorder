@@ -3,9 +3,9 @@
 SuperLive Recorder - Launcher with Pre-flight Validation
 Passes stream name to record_once.py and attempts to rename files
 
-RECORDING TIME LIMIT: 3600 seconds (1 hour) enforced via asyncio.wait_for.
-After timeout, recording is stopped and post-processing continues normally.
-State is updated to "completed" on both natural end and time-limit stop.
+STOP SIGNAL: A background checker polls /api/check-stop/{stream_id}
+every 10 seconds. When Telegram /stop sets status to 'stopped',
+this checker cancels record_once.main() and proceeds to post-processing.
 """
 import asyncio
 import json
@@ -28,10 +28,11 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 RECORDINGS_DIR = Path("recordings")
 TEMP_DIR = RECORDINGS_DIR / "_temp"
 
-# ═══════════════════════════════════════════════════════════
-# RECORDING TIME LIMIT — exactly 1 hour (3600 seconds)
-# ═══════════════════════════════════════════════════════════
+# Recording time limit: exactly 1 hour (3600 seconds)
 RECORDING_MAX_SECONDS = int(os.environ.get("RECORDING_MAX_SECONDS", "3600"))
+
+# Stop signal check interval in seconds
+STOP_CHECK_INTERVAL = 10
 
 
 def sanitize_filename(name: str) -> str:
@@ -66,7 +67,6 @@ def send_telegram_message(text: str, parse_mode: str = "HTML"):
 
 def update_worker_state(stream_id: str, state: dict):
     if not WORKER_API_URL or not AUTO_API_TOKEN:
-        print(f"[WORKER] Skipped update (credentials missing) for {stream_id}")
         return
     url = f"{WORKER_API_URL}/api/update-state/{stream_id}"
     payload = json.dumps(state).encode('utf-8')
@@ -76,9 +76,9 @@ def update_worker_state(stream_id: str, state: dict):
     })
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
-            print(f"[WORKER] State updated for {stream_id}: {state.get('status', 'unknown')}")
+            pass
     except Exception as e:
-        print(f"[WORKER] Error updating state for {stream_id}: {e}")
+        print(f"[WORKER] Error: {e}")
 
 
 def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
@@ -91,6 +91,42 @@ def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
     if not stream_id_str.isdigit():
         return False
     return True
+
+
+# ═══════════════════════════════════════════════════════════
+# STOP SIGNAL CHECKER — polls Worker API for manual stop
+# ═══════════════════════════════════════════════════════════
+async def stop_signal_checker(stream_id: str, stop_event: asyncio.Event):
+    """
+    Background task that polls /api/check-stop/{stream_id} every
+    STOP_CHECK_INTERVAL seconds. When the Worker reports should_stop=True
+    (set by Telegram /stop button), it sets stop_event to signal
+    the main recording loop to cancel.
+    """
+    print(f"[STOP-CHECK] Started monitoring for stop signal (interval={STOP_CHECK_INTERVAL}s)")
+    while not stop_event.is_set():
+        try:
+            if WORKER_API_URL and AUTO_API_TOKEN:
+                url = f"{WORKER_API_URL}/api/check-stop/{stream_id}"
+                req = urllib.request.Request(url, headers={
+                    'X-Auto-Token': AUTO_API_TOKEN,
+                    'Content-Type': 'application/json'
+                })
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: urllib.request.urlopen(req, timeout=10)
+                )
+                data = json.loads(response.read().decode('utf-8'))
+                if data.get("should_stop"):
+                    print(f"[STOP-CHECK] ⚠️ STOP SIGNAL RECEIVED for stream {stream_id}")
+                    print(f"[STOP-CHECK] Worker status: {data.get('status')}")
+                    stop_event.set()
+                    return
+        except Exception as e:
+            # Non-fatal: just log and continue checking
+            print(f"[STOP-CHECK] Poll error (non-fatal): {e}")
+        await asyncio.sleep(STOP_CHECK_INTERVAL)
 
 
 async def verify_stream_is_accessible(stream_url: str) -> dict:
@@ -341,6 +377,9 @@ def rename_files_by_username(files: list, username: str) -> list:
     return renamed
 
 
+# ═══════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════
 async def main():
     stream_url = os.environ.get("RECORD_URL")
     stream_id = os.environ.get("STREAM_ID")
@@ -354,6 +393,7 @@ async def main():
     print("=" * 70)
     print("SUPERLIVE RECORDER - LAUNCHER (WITH PRE-FLIGHT)")
     print(f"RECORDING TIME LIMIT: {RECORDING_MAX_SECONDS}s ({RECORDING_MAX_SECONDS // 60} min)")
+    print(f"STOP CHECK INTERVAL: {STOP_CHECK_INTERVAL}s")
     print("=" * 70)
     print(f"URL: {stream_url}")
     print(f"Stream ID: {stream_id}")
@@ -431,83 +471,139 @@ async def main():
 
     print("\n" + "=" * 70)
     print("CALLING ORIGINAL record_once.py")
-    print(f"TIME LIMIT: {RECORDING_MAX_SECONDS}s ({RECORDING_MAX_SECONDS // 60} min)")
+    print(f"TIME LIMIT: {RECORDING_MAX_SECONDS}s | STOP CHECK: every {STOP_CHECK_INTERVAL}s")
     print("=" * 70)
 
+    # ═══════════════════════════════════════════════════════════
+    # RECORDING WITH STOP SIGNAL + TIME LIMIT
+    #
+    # Three concurrent mechanisms:
+    # 1. record_once.main() — the actual recording
+    # 2. stop_signal_checker — polls Worker for manual stop
+    # 3. RECORDING_MAX_SECONDS timeout — enforced via asyncio.wait
+    #
+    # Whichever finishes first determines the outcome.
+    # ═══════════════════════════════════════════════════════════
+    stop_event = asyncio.Event()
+    stop_checker_task = asyncio.create_task(stop_signal_checker(stream_id, stop_event))
+    recording_task = None
+    recording_stopped_manually = False
     recording_timed_out = False
     recording_error = None
 
     try:
         import record_once
-        # ═══════════════════════════════════════════════════════
-        # RECORDING TIME LIMIT: asyncio.wait_for enforces exactly
-        # RECORDING_MAX_SECONDS (default 3600 = 1 hour).
-        # When timeout fires, CancelledError is sent into
-        # record_once.main(), triggering its cleanup.
-        # ═══════════════════════════════════════════════════════
-        await asyncio.wait_for(record_once.main(), timeout=RECORDING_MAX_SECONDS)
-        print("\n[LAUNCHER] ✓ record_once.py completed successfully (natural end)")
+        recording_task = asyncio.create_task(record_once.main())
 
-        # ═══════════════════════════════════════════════════════
-        # CRITICAL FIX: Update state to "completed" on SUCCESS
-        # Previously this was missing, leaving recordings stuck
-        # in "recording" state forever in Worker KV.
-        # ═══════════════════════════════════════════════════════
-        update_worker_state(stream_id, {
-            "status": "completed",
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-            "completed_reason": "natural_end"
-        })
-
-    except asyncio.TimeoutError:
-        # ═══════════════════════════════════════════════════════
-        # Recording reached the 60-minute limit.
-        # This is NOT a failure — the recording completed its
-        # maximum allowed duration. Treat as "completed".
-        # ═══════════════════════════════════════════════════════
-        recording_timed_out = True
-        elapsed = datetime.now().timestamp() - start_time
-        print(f"\n[LAUNCHER] ⏰ Recording reached {RECORDING_MAX_SECONDS}s limit — stopping")
-        print(f"[LAUNCHER] Elapsed: {int(elapsed)}s ({int(elapsed // 60)} min)")
-        print("[LAUNCHER] Waiting 5s for file finalization...")
-        await asyncio.sleep(5)
-
-        # Update state to "completed" with time-limit reason
-        update_worker_state(stream_id, {
-            "status": "completed",
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-            "completed_reason": "time_limit_3600s",
-            "duration_seconds": round(elapsed)
-        })
-
-        # Send notification
-        stop_msg = (
-            f"⏱️ <b>تم إيقاف التسجيل تلقائياً (حد الساعة)</b>\n"
-            f"👤 الاسم: <b>{stream_name or 'Unknown'}</b>\n"
-            f"🆔 ID: <code>{stream_id}</code>\n"
-            f"⏰ المدة المسجلة: {int(elapsed // 60)} دقيقة\n"
-            f"📦 جارٍ المعالجة والتقسيم..."
+        # Wait for: recording finishes, OR stop signal, OR timeout
+        stop_waiter = asyncio.create_task(stop_event.wait())
+        done, pending = await asyncio.wait(
+            [recording_task, stop_waiter],
+            timeout=RECORDING_MAX_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED
         )
-        send_telegram_message(stop_msg)
+
+        # ── Determine what happened ──
+        if stop_event.is_set() and recording_task not in done:
+            # MANUAL STOP from Telegram
+            recording_stopped_manually = True
+            print(f"\n[LAUNCHER] 🛑 STOP SIGNAL received — cancelling recording")
+            recording_task.cancel()
+            try:
+                # Give record_once up to 15s to clean up and close files
+                await asyncio.wait_for(asyncio.shield(recording_task), timeout=15)
+            except asyncio.CancelledError:
+                print("[LAUNCHER] Recording task cancelled successfully")
+            except asyncio.TimeoutError:
+                print("[LAUNCHER] Recording task did not finish in 15s — proceeding anyway")
+            except Exception as e:
+                print(f"[LAUNCHER] Recording task ended with: {e}")
+
+            # Update state to stopped
+            update_worker_state(stream_id, {
+                "status": "stopped",
+                "stopped_at": datetime.now(timezone.utc).isoformat(),
+                "stopped_reason": "manual_stop_from_telegram"
+            })
+
+            elapsed = datetime.now().timestamp() - start_time
+            stop_msg = (
+                f"🛑 <b>تم إيقاف التسجيل يدوياً</b>\n"
+                f"👤 الاسم: <b>{stream_name or 'Unknown'}</b>\n"
+                f"🆔 ID: <code>{stream_id}</code>\n"
+                f"⏰ المدة المسجلة: {int(elapsed // 60)} دقيقة و {int(elapsed % 60)} ثانية\n"
+                f"📦 جارٍ المعالجة والتقسيم..."
+            )
+            send_telegram_message(stop_msg)
+            print(f"[LAUNCHER] Recording stopped after {int(elapsed)}s — proceeding to post-processing")
+
+        elif recording_task in done:
+            # Recording finished naturally (or raised an exception)
+            stop_waiter.cancel()
+            try:
+                await recording_task  # Re-raise any exception
+                print("\n[LAUNCHER] ✓ record_once.py completed successfully")
+                update_worker_state(stream_id, {
+                    "status": "completed",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "completed_reason": "natural_end"
+                })
+            except asyncio.CancelledError:
+                recording_stopped_manually = True
+                print("\n[LAUNCHER] Recording was cancelled")
+                update_worker_state(stream_id, {
+                    "status": "stopped",
+                    "stopped_at": datetime.now(timezone.utc).isoformat()
+                })
+            except Exception as e:
+                recording_error = str(e)
+                raise  # Re-raise to be caught by outer except
+
+        else:
+            # TIMEOUT: neither recording finished nor stop signal received
+            recording_timed_out = True
+            print(f"\n[LAUNCHER] ⏰ Recording reached {RECORDING_MAX_SECONDS}s limit — stopping")
+            recording_task.cancel()
+            stop_waiter.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(recording_task), timeout=15)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception as e:
+                print(f"[LAUNCHER] Recording task ended during timeout cleanup: {e}")
+
+            elapsed = datetime.now().timestamp() - start_time
+            update_worker_state(stream_id, {
+                "status": "completed",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "completed_reason": "time_limit_3600s",
+                "duration_seconds": round(elapsed)
+            })
+
+            stop_msg = (
+                f"⏱️ <b>تم إيقاف التسجيل تلقائياً (حد الساعة)</b>\n"
+                f"👤 الاسم: <b>{stream_name or 'Unknown'}</b>\n"
+                f"🆔 ID: <code>{stream_id}</code>\n"
+                f"⏰ المدة المسجلة: {int(elapsed // 60)} دقيقة\n"
+                f"📦 جارٍ المعالجة والتقسيم..."
+            )
+            send_telegram_message(stop_msg)
 
     except asyncio.CancelledError:
-        recording_timed_out = True
-        print(f"\n[LAUNCHER] ⏰ Recording cancelled at time limit")
+        recording_stopped_manually = True
+        print("\n[LAUNCHER] Recording cancelled (external)")
         update_worker_state(stream_id, {
-            "status": "completed",
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-            "completed_reason": "time_limit_cancelled"
+            "status": "stopped",
+            "stopped_at": datetime.now(timezone.utc).isoformat()
         })
 
     except Exception as e:
         recording_error = str(e)
         print(f"\n[LAUNCHER] ✗ record_once.py failed: {e}")
 
-        # Check if this is a Matroska split error (rescue mode)
         error_str = str(e)
         if "Unable to split Matroska" in error_str:
             print("[LAUNCHER] Matroska split failed — entering RESCUE MODE")
-            print("[LAUNCHER] Post-processing will attempt recovery from original MKV")
             rescue_msg = (
                 f"⚠️ <b>فشل تقسيم Matroska — جارٍ الإنقاذ</b>\n"
                 f"👤 الاسم: <b>{stream_name or 'Unknown'}</b>\n"
@@ -523,7 +619,6 @@ async def main():
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "completed_reason": "split_failed_rescue_pending"
             })
-            # Exit with 0 so post-processing step runs
             sys.exit(0)
         else:
             error_msg = (
@@ -538,6 +633,20 @@ async def main():
                 "failed_at": datetime.now(timezone.utc).isoformat()
             })
             sys.exit(1)
+
+    finally:
+        # Always cancel the stop checker
+        stop_checker_task.cancel()
+        try:
+            await stop_checker_task
+        except asyncio.CancelledError:
+            pass
+        print("[STOP-CHECK] Stopped")
+
+        # Wait for files to be flushed
+        if recording_stopped_manually or recording_timed_out:
+            print("[LAUNCHER] Waiting 5s for file finalization...")
+            await asyncio.sleep(5)
 
     # ── RENAME FILES ──
     print("\n" + "=" * 70)
