@@ -23,8 +23,7 @@ jobs:
   record-test:
     name: Record livestream
     runs-on: ubuntu-latest
-    # 62 minutes: 60 min recording limit + 2 min for post-processing
-    timeout-minutes: 62
+    timeout-minutes: 75
 
     steps:
       - name: Checkout repository
@@ -101,7 +100,6 @@ jobs:
           echo "Stream ID: ${STREAM_ID}"
           echo "Stream Name: ${STREAM_NAME}"
           echo "Recording limit: ${RECORDING_MAX_SECONDS}s"
-          echo "Mode: Fast + Streaming"
           echo "========================================"
           xvfb-run -a --server-args="-screen 0 1920x1080x24" python record_launcher.py
           exit $?
@@ -118,9 +116,7 @@ jobs:
           echo "========================================"
           echo "POST-PROCESSING PIPELINE"
           echo "========================================"
-          echo "--- Directory contents ---"
-          find recordings/ -type f \( -name "*.mkv" -o -name "*.mp4" -o -name "*.jpg" \) 2>/dev/null | head -20
-          echo "--- Starting postprocess ---"
+          find recordings/ -type f \( -name "*.mkv" -o -name "*.mp4" -o -name "*.h264" -o -name "*.webm" \) 2>/dev/null | head -30
           python postprocess_recording.py
 
       - name: Generate Full Stream Contact Sheet
@@ -176,11 +172,9 @@ jobs:
           path: |
             recordings/*.mp4
             recordings/*.mkv
-            recordings/*_preview.jpg
             recordings/_preserved/*.mkv
             recordings/_preserved/*.mp4
             recordings/_preserved/*.jpg
             recordings/_state/*.json
-            recordings/_temp/*.png
           if-no-files-found: warn
           retention-days: 3
