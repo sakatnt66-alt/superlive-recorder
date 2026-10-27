@@ -1,4 +1,4 @@
-// worker.js - Version 12.2 (Add cleanup-failed endpoint)
+// worker.js - Version 12.2 (Add /api/cleanup-failed endpoint)
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -119,7 +119,6 @@ async function handleAutoTrigger(request, url, env) {
     const streamId = body.stream_id || userId;
     const streamUrl = body.stream_url || ('https://superlivetv.com/fr/livestream/' + streamId);
     const streamName = body.stream_name || '';
-
     const wlData = await getWatchlist(env);
     if (!wlData.watchlist.some(e => String(e.stream_id) === userId)) {
       return jsonResponse({
@@ -129,10 +128,8 @@ async function handleAutoTrigger(request, url, env) {
         stream_id: streamId
       }, 404);
     }
-
     const recData = await getRecordings(env);
     const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
-
     if (recordings.some(r => String(r.stream_id) === streamId && r.status === 'recording')) {
       return jsonResponse({
         success: false,
@@ -141,11 +138,9 @@ async function handleAutoTrigger(request, url, env) {
         user_id: userId
       }, 409);
     }
-
     if (recordings.filter(r => r.status === 'recording').length >= 5) {
       return jsonResponse({ success: false, error: 'concurrency_limit' }, 429);
     }
-
     recordings.push({
       stream_id: streamId,
       user_id: userId,
@@ -156,14 +151,12 @@ async function handleAutoTrigger(request, url, env) {
       source: 'auto'
     });
     await saveRecordings(env, recordings);
-
     const triggerResult = await triggerGitHubDispatch(env, 'record_stream', {
       stream_url: streamUrl,
       stream_id: streamId,
       stream_name: streamName,
       user_id: userId
     });
-
     if (triggerResult.success) {
       const nameLine = streamName ? ('\n👤 الاسم: <b>' + escapeHtml(streamName) + '</b>') : '';
       await sendTelegramMessage(env, env.TELEGRAM_CHAT_ID,
@@ -213,17 +206,29 @@ async function handleDeleteRecording(request, url, env) {
 
 // ============================================================
 // NEW: Cleanup failed recording immediately
+// Removes the stream_id from active recordings list in Worker KV
+// so /status no longer shows it as "recording"
 // ============================================================
 async function handleCleanupFailed(request, url, env) {
   if (!isAuthorized(request, env)) return unauthorizedResponse();
   try {
     const streamId = url.pathname.split('/').pop();
     const recData = await getRecordings(env);
-    const recordings = (Array.isArray(recData.recordings) ? recData.recordings : []).filter(r => String(r.stream_id) !== streamId);
-    await saveRecordings(env, recordings);
-    console.log(`[CLEANUP] Removed failed recording ${streamId}`);
-    return jsonResponse({ success: true, removed: streamId });
-  } catch (error) { return jsonResponse({ error: error.message }, 500); }
+    const before = Array.isArray(recData.recordings) ? recData.recordings : [];
+    const after = before.filter(r => String(r.stream_id) !== streamId);
+    await saveRecordings(env, after);
+    const removed = before.length - after.length;
+    console.log(`[CLEANUP] Removed failed recording ${streamId} (${removed} removed, ${after.length} remaining)`);
+    return jsonResponse({
+      success: true,
+      removed: streamId,
+      removed_count: removed,
+      remaining: after.length
+    });
+  } catch (error) {
+    console.error('[handleCleanupFailed] Error:', error);
+    return jsonResponse({ error: error.message }, 500);
+  }
 }
 
 async function handleCleanup(env) {
