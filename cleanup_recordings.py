@@ -5,7 +5,6 @@ cleanup_recordings.py - تنظيف التسجيلات العالقة تلقائ�
 
 CHANGES:
   - MAX_RECORDING_MINUTES = 60 (was MAX_RECORDING_HOURS = 6)
-  - Fallback threshold: 2 hours without any activity evidence
 """
 import json
 import os
@@ -16,12 +15,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import requests
 
-# المسارات
 DATA_DIR = Path("data")
 RECORDINGS_FILE = DATA_DIR / "recordings.json"
 QUEUE_DIR = Path("queue")
 
-# الإعدادات — CHANGED: minutes instead of hours
+# CHANGED: 60 minutes instead of 6 hours
 MAX_RECORDING_MINUTES = 60
 STUCK_THRESHOLD_MINUTES = 15
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
@@ -45,10 +43,8 @@ def save_recordings(recordings):
     try:
         DATA_DIR.mkdir(exist_ok=True)
         content_str = json.dumps(recordings, indent=2, ensure_ascii=False)
-        # 1. الحفظ المحلي
         with open(RECORDINGS_FILE, 'w', encoding='utf-8') as f:
             f.write(content_str)
-        # 2. الرفع عبر GitHub API (يتجاوز مشاكل git push)
         if GITHUB_TOKEN and GITHUB_REPO:
             print("🔄 جاري مزامنة التغييرات مع GitHub عبر API...")
             api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/data/recordings.json"
@@ -56,12 +52,10 @@ def save_recordings(recordings):
                 'Authorization': f'token {GITHUB_TOKEN}',
                 'Accept': 'application/vnd.github.v3+json'
             }
-            # الحصول على SHA الحالي للملف
             sha = ""
             res = requests.get(api_url, headers=headers)
             if res.status_code == 200:
                 sha = res.json().get('sha', '')
-            # إرسال التحديث
             payload = {
                 "message": "🧹 Auto cleanup stuck recordings",
                 "content": base64.b64encode(content_str.encode('utf-8')).decode('utf-8'),
@@ -90,9 +84,9 @@ def check_github_workflow(run_id):
         if response.status_code == 200:
             data = response.json()
             if data.get('status') == 'completed':
-                return False  # انتهى
+                return False
             elif data.get('status') == 'in_progress':
-                return True  # يعمل
+                return True
             return None
     except:
         return None
@@ -113,9 +107,9 @@ def check_file_activity(recording):
                 stat = file_path.stat()
                 file_age = datetime.now() - datetime.fromtimestamp(stat.st_mtime)
                 if file_age > timedelta(minutes=STUCK_THRESHOLD_MINUTES):
-                    return False  # عالق
+                    return False
                 else:
-                    return True  # نشط
+                    return True
             except:
                 pass
     return None
@@ -124,24 +118,22 @@ def check_file_activity(recording):
 def is_recording_active(recording):
     username = recording.get('username', 'unknown')
     print(f"🔍 فحص: {username}")
-    # 1. فحص المدة — CHANGED: minutes instead of hours
     started_at_str = recording.get('started_at')
     if started_at_str:
         try:
             started_at = datetime.fromisoformat(started_at_str.replace('Z', '+00:00'))
             duration = datetime.now(started_at.tzinfo) - started_at if started_at.tzinfo else datetime.now() - started_at
+            # CHANGED: minutes instead of hours
             if duration > timedelta(minutes=MAX_RECORDING_MINUTES):
                 print(f"  ⏰ تجاوز الحد الأقصى ({MAX_RECORDING_MINUTES} دقيقة) -> إزالة")
                 return False
         except: pass
-    # 2. فحص Workflow
     workflow_run_id = recording.get('workflow_run_id')
     if workflow_run_id:
         wf_status = check_github_workflow(workflow_run_id)
         if wf_status is False:
             print(f"  🔄 Workflow انتهى -> إزالة")
             return False
-    # 3. فحص نشاط الملف
     file_activity = check_file_activity(recording)
     if file_activity is False:
         print(f"  📁 الملف لم يتغير منذ {STUCK_THRESHOLD_MINUTES} دقيقة -> إزالة")
@@ -149,7 +141,6 @@ def is_recording_active(recording):
     elif file_activity is True:
         print(f"  ✅ الملف نشط")
         return True
-    # 4. فحص احتياطي: إذا مر وقت طويل بدون أي دليل نشاط
     if started_at_str:
         try:
             started_at = datetime.fromisoformat(started_at_str.replace('Z', '+00:00'))
