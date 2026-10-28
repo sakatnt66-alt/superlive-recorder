@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
 """
 SuperLive Recorder - Launcher with Pre-flight Validation
-Passes stream name to record_once.py and attempts to rename files
-
-ENFORCED LIMITS:
-  - Recording stops at exactly RECORDING_MAX_SECONDS (default 3600 = 1 hour)
-  - Stop signal from Telegram is checked every 10 seconds
-  - Raw files are preserved during recording via background thread
-  - After timeout/stop, raw files are recovered and muxed into MKV
-  - Failed recordings are immediately cleaned up from Worker KV
+ENFORCED: 3600s limit, stop signal, file preservation, recovery muxing
 """
 import asyncio
 import json
@@ -25,7 +18,6 @@ from pathlib import Path
 import re
 from superlive_discovery import SuperLiveDiscovery
 
-# Configuration
 WORKER_API_URL = os.environ.get("WORKER_API_URL", "")
 AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -42,7 +34,6 @@ STOP_CHECK_INTERVAL = 10
 
 
 def sanitize_filename(name: str) -> str:
-    """Sanitize filename to be filesystem-safe"""
     if not name:
         return "unknown"
     name = re.sub(r'[<>:"/\\|?*]', '', name)
@@ -61,9 +52,7 @@ def send_telegram_message(text: str, parse_mode: str = "HTML"):
         "text": text,
         "parse_mode": parse_mode
     }).encode('utf-8')
-    req = urllib.request.Request(url, data=payload, headers={
-        'Content-Type': 'application/json'
-    })
+    req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'})
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
             pass
@@ -120,11 +109,6 @@ def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
 # FILE PRESERVER — watches MKV, H264, WEBM in background thread
 # ═══════════════════════════════════════════════════════════
 class FilePreserverThread:
-    """
-    Background OS thread that copies recording files to _preserved/
-    as soon as they appear. Runs concurrently with record_once.main().
-    Watches: *.mkv, *.h264, *.webm
-    """
     def __init__(self, watch_dirs, preserve_dir, poll_interval=0.3):
         self.watch_dirs = [Path(d) for d in watch_dirs]
         self.preserve_dir = Path(preserve_dir)
@@ -217,7 +201,7 @@ def recover_and_mux_recording() -> list:
                 audio_files.append(f)
                 print(f"[RECOVERY] Found audio: {f.name} ({f.stat().st_size / 1024 / 1024:.1f} MB)")
 
-    # Check for existing MKV files (maybe muxing partially completed)
+    # Check for existing MKV files
     for d in search_dirs:
         if not d.exists():
             continue
@@ -227,14 +211,13 @@ def recover_and_mux_recording() -> list:
                 created_mkvs.append(str(f))
 
     if created_mkvs:
-        print(f"[RECOVERY] {len(created_mkvs)} MKV file(s) already exist — no muxing needed")
         return created_mkvs
 
     if not video_files and not audio_files:
-        print("[RECOVERY] No raw video or audio files found — cannot recover")
+        print("[RECOVERY] No raw files found")
         return []
 
-    # Match video and audio by timestamp in filename
+    # Match by timestamp
     video_by_ts = {}
     audio_by_ts = {}
 
@@ -259,56 +242,32 @@ def recover_and_mux_recording() -> list:
         out_path = PRESERVED_DIR / out_name
 
         if out_path.exists() and out_path.stat().st_size > 0:
-            print(f"[RECOVERY] {out_name} already exists — skipping")
             created_mkvs.append(str(out_path))
             continue
 
         if vf and af:
             print(f"[RECOVERY] Muxing video + audio → {out_name}")
-            cmd = (
-                f'ffmpeg -y '
-                f'-i "{vf}" '
-                f'-i "{af}" '
-                f'-c:v copy -c:a copy '
-                f'-movflags +faststart '
-                f'"{out_path}"'
-            )
+            cmd = f'ffmpeg -y -i "{vf}" -i "{af}" -c:v copy -c:a copy -movflags +faststart "{out_path}"'
         elif vf:
-            print(f"[RECOVERY] Muxing video only (no audio found) → {out_name}")
-            cmd = (
-                f'ffmpeg -y '
-                f'-i "{vf}" '
-                f'-c:v copy '
-                f'-movflags +faststart '
-                f'"{out_path}"'
-            )
+            print(f"[RECOVERY] Muxing video only → {out_name}")
+            cmd = f'ffmpeg -y -i "{vf}" -c:v copy -movflags +faststart "{out_path}"'
         elif af:
-            print(f"[RECOVERY] Muxing audio only (no video found) → {out_name}")
-            cmd = (
-                f'ffmpeg -y '
-                f'-i "{af}" '
-                f'-c:a copy '
-                f'"{out_path}"'
-            )
+            print(f"[RECOVERY] Muxing audio only → {out_name}")
+            cmd = f'ffmpeg -y -i "{af}" -c:a copy "{out_path}"'
         else:
             continue
 
         try:
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=300
-            )
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
             if result.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
                 print(f"[RECOVERY] ✓ Created: {out_name} ({out_path.stat().st_size / 1024 / 1024:.1f} MB)")
                 created_mkvs.append(str(out_path))
             else:
-                stderr_tail = (result.stderr or "")[-300:]
-                print(f"[RECOVERY] ✗ FFmpeg failed (rc={result.returncode}): {stderr_tail}")
-        except subprocess.TimeoutExpired:
-            print(f"[RECOVERY] ✗ FFmpeg timed out for {out_name}")
+                print(f"[RECOVERY] ✗ FFmpeg failed: {(result.stderr or '')[-200:]}")
         except Exception as e:
             print(f"[RECOVERY] ✗ Error: {e}")
 
-    print(f"[RECOVERY] Result: {len(created_mkvs)} MKV file(s) created/available")
+    print(f"[RECOVERY] Result: {len(created_mkvs)} MKV file(s) available")
     return created_mkvs
 
 
@@ -316,12 +275,8 @@ def recover_and_mux_recording() -> list:
 # STOP SIGNAL CHECKER
 # ═══════════════════════════════════════════════════════════
 async def stop_signal_checker(stream_id: str, stop_event: asyncio.Event):
-    """
-    Background task that polls /api/check-stop/{stream_id} every
-    STOP_CHECK_INTERVAL seconds. When the Worker reports should_stop=True
-    (set by Telegram /stop button), it sets stop_event.
-    """
-    print(f"[STOP-CHECK] Monitoring for stop signal (interval={STOP_CHECK_INTERVAL}s)")
+    """Polls /api/check-stop/{stream_id} for manual stop from Telegram."""
+    print(f"[STOP-CHECK] Monitoring (interval={STOP_CHECK_INTERVAL}s)")
     while not stop_event.is_set():
         try:
             if WORKER_API_URL and AUTO_API_TOKEN:
@@ -332,17 +287,15 @@ async def stop_signal_checker(stream_id: str, stop_event: asyncio.Event):
                 })
                 loop = asyncio.get_event_loop()
                 response = await loop.run_in_executor(
-                    None,
-                    lambda: urllib.request.urlopen(req, timeout=10)
+                    None, lambda: urllib.request.urlopen(req, timeout=10)
                 )
                 data = json.loads(response.read().decode('utf-8'))
                 if data.get("should_stop"):
-                    print(f"[STOP-CHECK] ⚠️ STOP SIGNAL RECEIVED for stream {stream_id}")
-                    print(f"[STOP-CHECK] Worker status: {data.get('status')}")
+                    print(f"[STOP-CHECK] ⚠️ STOP SIGNAL for {stream_id}")
                     stop_event.set()
                     return
         except Exception as e:
-            print(f"[STOP-CHECK] Poll error (non-fatal): {e}")
+            print(f"[STOP-CHECK] Poll error: {e}")
         await asyncio.sleep(STOP_CHECK_INTERVAL)
 
 
@@ -474,7 +427,6 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
                         "actual_stream_id": actual_stream_id,
                         "error": "User is offline"
                     }
-        # Fallback discovery flow
         if not profile_result:
             return {
                 "success": False, "status": "UNKNOWN", "username": None,
@@ -539,7 +491,6 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
 
 
 def get_latest_files(before_time: float) -> list:
-    """Get all video files created after a specific time."""
     files = []
     for ext in ['*.mkv', '*.webm', '*.mp4']:
         for pattern in [str(RECORDINGS_DIR / ext), str(TEMP_DIR / ext)]:
@@ -553,10 +504,6 @@ def get_latest_files(before_time: float) -> list:
 
 
 def rename_files_by_username(files: list, username: str) -> list:
-    """
-    Rename video files to use username instead of generic names.
-    Handles multiple parts: username_part001.mkv, username_part002.mkv, etc.
-    """
     if not files or not username or username.startswith("user_"):
         return []
     safe_name = sanitize_filename(username)
@@ -611,9 +558,9 @@ async def main():
         sys.exit(1)
 
     print("=" * 70)
-    print("SUPERLIVE RECORDER - LAUNCHER (WITH PRE-FLIGHT)")
-    print(f"RECORDING TIME LIMIT: {RECORDING_MAX_SECONDS}s ({RECORDING_MAX_SECONDS // 60} min)")
-    print(f"STOP CHECK INTERVAL: {STOP_CHECK_INTERVAL}s")
+    print("SUPERLIVE RECORDER - LAUNCHER")
+    print(f"TIME LIMIT: {RECORDING_MAX_SECONDS}s ({RECORDING_MAX_SECONDS // 60} min)")
+    print(f"STOP CHECK: every {STOP_CHECK_INTERVAL}s")
     print("=" * 70)
     print(f"URL: {stream_url}")
     print(f"Stream ID: {stream_id}")
@@ -646,12 +593,12 @@ async def main():
         else:
             msg = f"❌ <b>فشل التحقق</b>\n👤 المستخدم: <code>{actual_stream_id}</code>\n⚠️ {error}"
         send_telegram_message(msg)
-
+        
         # ═══════════════════════════════════════════════════════════
-        # IMMEDIATE CLEANUP: Remove from active recordings immediately
+        # IMMEDIATE CLEANUP: Remove from active recordings
         # ═══════════════════════════════════════════════════════════
         cleanup_failed_recording(actual_stream_id, f"pre_flight_{status}")
-
+        
         update_worker_state(actual_stream_id, {
             "status": "failed", "error": error,
             "failed_at": datetime.now(timezone.utc).isoformat()
@@ -671,10 +618,6 @@ async def main():
         os.environ["STREAM_ID"] = actual_stream_id
         stream_id = actual_stream_id
 
-    # ============================================================
-    # PASS STREAM NAME to record_once.py via multiple env vars
-    # This maximizes the chance that record_once.py uses the name
-    # ============================================================
     if stream_name:
         os.environ["STREAM_NAME"] = stream_name
         os.environ["VIDEO_FILENAME_PREFIX"] = sanitize_filename(stream_name)
@@ -701,11 +644,10 @@ async def main():
 
     print("\n" + "=" * 70)
     print("STARTING RECORDING")
-    print(f"TIME LIMIT: {RECORDING_MAX_SECONDS}s ({RECORDING_MAX_SECONDS // 60} min)")
-    print(f"STOP CHECK: every {STOP_CHECK_INTERVAL}s")
+    print(f"TIME LIMIT: {RECORDING_MAX_SECONDS}s | STOP CHECK: {STOP_CHECK_INTERVAL}s")
     print("=" * 70)
 
-    # ── Start FilePreserver BEFORE recording begins ──
+    # Start FilePreserver
     PRESERVED_DIR.mkdir(parents=True, exist_ok=True)
     preserver = FilePreserverThread(
         watch_dirs=[RECORDINGS_DIR, TEMP_DIR],
@@ -714,21 +656,11 @@ async def main():
     )
     preserver.start()
 
-    # ═══════════════════════════════════════════════════════════
-    # RECORDING WITH STOP SIGNAL + TIME LIMIT
-    #
-    # Three concurrent mechanisms:
-    # 1. record_once.main() — the actual recording
-    # 2. stop_signal_checker — polls Worker for manual stop
-    # 3. RECORDING_MAX_SECONDS timeout — enforced via asyncio.wait
-    #
-    # Whichever finishes first determines the outcome.
-    # ═══════════════════════════════════════════════════════════
+    # ── Recording with timeout + stop signal ──
     stop_event = asyncio.Event()
     stop_checker_task = asyncio.create_task(stop_signal_checker(stream_id, stop_event))
     recording_stopped_manually = False
     recording_timed_out = False
-    recording_error = None
 
     try:
         import record_once
@@ -745,41 +677,35 @@ async def main():
         if stop_event.is_set() and recording_task not in done:
             # ── MANUAL STOP from Telegram ──
             recording_stopped_manually = True
-            print(f"\n[LAUNCHER] 🛑 STOP SIGNAL received — cancelling recording")
+            print(f"\n[LAUNCHER] 🛑 STOP SIGNAL — cancelling recording")
             recording_task.cancel()
             try:
-                # Give record_once 20s to clean up and close files
                 await asyncio.wait_for(asyncio.shield(recording_task), timeout=20)
-                print("[LAUNCHER] ✓ Recording task cleaned up after stop signal")
-            except asyncio.CancelledError:
-                print("[LAUNCHER] Recording task cancelled successfully")
-            except asyncio.TimeoutError:
-                print("[LAUNCHER] Recording task did not finish in 20s — proceeding")
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
             except Exception as e:
-                print(f"[LAUNCHER] Recording ended during stop cleanup: {e}")
+                print(f"[LAUNCHER] Recording ended during stop: {e}")
             stop_waiter.cancel()
-
             update_worker_state(stream_id, {
                 "status": "stopped",
                 "stopped_at": datetime.now(timezone.utc).isoformat(),
                 "stopped_reason": "manual_stop_from_telegram"
             })
             elapsed = datetime.now().timestamp() - start_time
-            stop_msg = (
+            send_telegram_message(
                 f"🛑 <b>تم إيقاف التسجيل يدوياً</b>\n"
                 f"👤 الاسم: <b>{stream_name or 'Unknown'}</b>\n"
                 f"🆔 ID: <code>{stream_id}</code>\n"
                 f"⏰ المدة: {int(elapsed // 60)} دقيقة و {int(elapsed % 60)} ثانية\n"
                 f"📦 جارٍ الحفظ والمعالجة..."
             )
-            send_telegram_message(stop_msg)
 
         elif recording_task in done:
             # ── Natural completion or exception ──
             stop_waiter.cancel()
             try:
-                await recording_task  # Re-raise any exception
-                print("\n[LAUNCHER] ✓ record_once.py completed successfully (natural end)")
+                await recording_task
+                print("\n[LAUNCHER] ✓ record_once.py completed successfully")
                 update_worker_state(stream_id, {
                     "status": "completed",
                     "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -787,29 +713,26 @@ async def main():
                 })
             except asyncio.CancelledError:
                 recording_stopped_manually = True
-                print("\n[LAUNCHER] Recording was cancelled")
                 update_worker_state(stream_id, {
                     "status": "stopped",
                     "stopped_at": datetime.now(timezone.utc).isoformat()
                 })
             except Exception as e:
-                recording_error = str(e)
                 error_str = str(e)
-
+                
                 # ═══════════════════════════════════════════════════
                 # IMMEDIATE CLEANUP on recording failure
                 # ═══════════════════════════════════════════════════
-                cleanup_failed_recording(stream_id, f"recording_error:{error_str[:80]}")
-
+                cleanup_failed_recording(stream_id, f"recording_error:{error_str[:50]}")
+                
                 if "Unable to split Matroska" in error_str:
                     print("[LAUNCHER] Matroska split failed — RESCUE MODE")
-                    rescue_msg = (
+                    send_telegram_message(
                         f"⚠️ <b>فشل تقسيم Matroska — جارٍ الإنقاذ</b>\n"
                         f"👤 الاسم: <b>{stream_name or 'Unknown'}</b>\n"
                         f"🆔 ID: <code>{stream_id}</code>\n"
-                        f"📦 التسجيل الأصلي محفوظ، مرحلة المعالجة اللاحقة ستُكمل التقسيم والإرسال."
+                        f"📦 مرحلة المعالجة اللاحقة ستُكمل التقسيم والإرسال."
                     )
-                    send_telegram_message(rescue_msg)
                     update_worker_state(stream_id, {
                         "split_error": error_str[:300],
                         "rescue_pending": True,
@@ -817,55 +740,24 @@ async def main():
                         "completed_at": datetime.now(timezone.utc).isoformat(),
                         "completed_reason": "split_failed_rescue_pending"
                     })
-                    # Exit with 0 so post-processing step runs
-                    preserver.stop()
-                    stop_checker_task.cancel()
-                    try:
-                        await stop_checker_task
-                    except asyncio.CancelledError:
-                        pass
                     sys.exit(0)
-                elif "No visible live video target" in error_str or "Live video was not detected" in error_str:
-                    print("[LAUNCHER] Live video not detected — CLEANING UP immediately")
-                    send_telegram_message(
-                        f"❌ <b>فشل التسجيل — البث غير متاح</b>\n"
-                        f"👤 الاسم: <b>{stream_name or 'Unknown'}</b>\n"
-                        f"🆔 ID: <code>{stream_id}</code>\n"
-                        f"⚠️ {error_str[:200]}"
-                    )
-                    update_worker_state(stream_id, {
-                        "status": "failed", "error": error_str[:300],
-                        "failed_at": datetime.now(timezone.utc).isoformat()
-                    })
-                    preserver.stop()
-                    stop_checker_task.cancel()
-                    try:
-                        await stop_checker_task
-                    except asyncio.CancelledError:
-                        pass
-                    sys.exit(1)
                 else:
-                    # Unknown error — re-raise to outer except
                     raise
 
         else:
-            # ── TIMEOUT: RECORDING_MAX_SECONDS reached ──
+            # ── TIMEOUT: 3600 seconds reached ──
             recording_timed_out = True
             elapsed = datetime.now().timestamp() - start_time
             print(f"\n[LAUNCHER] ⏰ Recording reached {RECORDING_MAX_SECONDS}s — STOPPING NOW")
-            print(f"[LAUNCHER] Actual elapsed: {int(elapsed)}s ({int(elapsed // 60)} min)")
+            print(f"[LAUNCHER] Actual elapsed: {int(elapsed)}s")
             recording_task.cancel()
             stop_waiter.cancel()
             try:
-                # Give record_once 20s to flush and close files
                 await asyncio.wait_for(asyncio.shield(recording_task), timeout=20)
-                print("[LAUNCHER] ✓ Recording task finished cleanup after timeout")
-            except asyncio.CancelledError:
-                print("[LAUNCHER] Recording task cancelled on timeout")
-            except asyncio.TimeoutError:
-                print("[LAUNCHER] Recording task did not finish in 20s — proceeding")
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
             except Exception as e:
-                print(f"[LAUNCHER] Recording ended during timeout cleanup: {e}")
+                print(f"[LAUNCHER] Recording ended during timeout: {e}")
 
             update_worker_state(stream_id, {
                 "status": "completed",
@@ -873,14 +765,13 @@ async def main():
                 "completed_reason": "time_limit_3600s",
                 "duration_seconds": round(elapsed)
             })
-            stop_msg = (
+            send_telegram_message(
                 f"⏱️ <b>تم إيقاف التسجيل تلقائياً (حد الساعة)</b>\n"
                 f"👤 الاسم: <b>{stream_name or 'Unknown'}</b>\n"
                 f"🆔 ID: <code>{stream_id}</code>\n"
                 f"⏰ المدة: {int(elapsed // 60)} دقيقة\n"
                 f"📦 جارٍ حفظ الفيديو والمعالجة..."
             )
-            send_telegram_message(stop_msg)
 
     except asyncio.CancelledError:
         recording_stopped_manually = True
@@ -889,16 +780,14 @@ async def main():
             "status": "stopped",
             "stopped_at": datetime.now(timezone.utc).isoformat()
         })
-
     except Exception as e:
-        recording_error = str(e)
         error_str = str(e)
-
+        
         # ═══════════════════════════════════════════════════════════
         # IMMEDIATE CLEANUP on any unhandled exception
         # ═══════════════════════════════════════════════════════════
-        cleanup_failed_recording(stream_id, f"unhandled_error:{error_str[:80]}")
-
+        cleanup_failed_recording(stream_id, f"unhandled_error:{error_str[:50]}")
+        
         if "Unable to split Matroska" in error_str:
             print("[LAUNCHER] Matroska split failed — RESCUE MODE")
             update_worker_state(stream_id, {
@@ -908,35 +797,21 @@ async def main():
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "completed_reason": "split_failed_rescue_pending"
             })
-            preserver.stop()
-            stop_checker_task.cancel()
-            try:
-                await stop_checker_task
-            except asyncio.CancelledError:
-                pass
-            sys.exit(0)
         else:
-            error_msg = (
+            send_telegram_message(
                 f"❌ <b>فشل التسجيل</b>\n"
                 f"👤 الاسم: <b>{stream_name or 'Unknown'}</b>\n"
                 f"🆔 ID: <code>{stream_id}</code>\n"
                 f"⚠️ {error_str[:200]}"
             )
-            send_telegram_message(error_msg)
             update_worker_state(stream_id, {
                 "status": "failed", "error": error_str[:300],
                 "failed_at": datetime.now(timezone.utc).isoformat()
             })
             preserver.stop()
             stop_checker_task.cancel()
-            try:
-                await stop_checker_task
-            except asyncio.CancelledError:
-                pass
             sys.exit(1)
-
     finally:
-        # Always cancel the stop checker
         stop_checker_task.cancel()
         try:
             await stop_checker_task
@@ -944,31 +819,23 @@ async def main():
             pass
         print("[STOP-CHECK] Stopped")
 
-    # ── Wait for file writes to flush ──
+    # Wait for file writes to flush
     if recording_stopped_manually or recording_timed_out:
-        print("[LAUNCHER] Waiting 15s for file writes to flush to disk...")
+        print("[LAUNCHER] Waiting 15s for file finalization...")
         await asyncio.sleep(15)
 
-    # Stop the preserver (it has copied what it could)
     preserver.stop()
 
-    # ═══════════════════════════════════════════════════════════
-    # RECOVERY: Mux raw files if needed
-    # After timeout/stop, record_once.py's internal muxing never ran.
-    # We do it here with FFmpeg.
-    # ═══════════════════════════════════════════════════════════
+    # ── RECOVERY: Mux raw files if needed ──
     if recording_stopped_manually or recording_timed_out:
         print("\n[LAUNCHER] RECOVERY: Muxing raw files → MKV")
         recovered = recover_and_mux_recording()
         if recovered:
-            print(f"[LAUNCHER] ✓ Recovery complete: {len(recovered)} MKV file(s) available")
+            print(f"[LAUNCHER] ✓ Recovery: {len(recovered)} MKV available")
         else:
-            print("[LAUNCHER] ⚠️ No files recovered from raw sources")
+            print("[LAUNCHER] ⚠️ No files recovered")
 
-    # ============================================================
-    # RENAME FILES: After record_once.py finishes, rename files
-    # from generic names (like "recording_*.mkv") to username
-    # ============================================================
+    # ── RENAME FILES ──
     print("\n" + "=" * 70)
     print("POST-PROCESSING: Renaming files by username")
     print("=" * 70)
@@ -981,7 +848,7 @@ async def main():
                 all_current_files.update(glob.glob(pattern))
         new_files = list(all_current_files - existing_files)
         if new_files:
-            print(f"[RENAME] Found {len(new_files)} new file(s) to rename")
+            print(f"[RENAME] Found {len(new_files)} new file(s)")
             safe_name = sanitize_filename(stream_name)
             files_to_rename = [f for f in new_files if safe_name not in os.path.basename(f)]
             if files_to_rename:
@@ -997,20 +864,20 @@ async def main():
                         parse_mode="HTML"
                     )
             else:
-                print(f"[RENAME] ℹ️ All new files already have username in name")
+                print(f"[RENAME] ℹ️ Files already have username")
         else:
-            print(f"[RENAME] ℹ️ No new files found (record_once.py may upload & delete)")
+            print(f"[RENAME] ℹ️ No new files found")
     else:
-        print(f"[RENAME] ⚠️ No username available - skipping rename")
+        print(f"[RENAME] ⚠️ No username - skipping")
 
     # Report preserved files
     preserved = list(PRESERVED_DIR.glob("*.mkv")) if PRESERVED_DIR.exists() else []
     if preserved:
-        print(f"\n[PRESERVE] 📦 {len(preserved)} MKV file(s) in _preserved/ for post-processing:")
+        print(f"\n[PRESERVE] 📦 {len(preserved)} MKV in _preserved/:")
         for p in preserved:
-            print(f"[PRESERVE]   • {p.name}  ({p.stat().st_size / 1024 / 1024:.1f} MB)")
+            print(f"[PRESERVE]   • {p.name} ({p.stat().st_size / 1024 / 1024:.1f} MB)")
     else:
-        print("\n[PRESERVE] ⚠️ No preserved MKV files found")
+        print("\n[PRESERVE] ⚠️ No preserved MKV files")
 
 
 if __name__ == "__main__":
