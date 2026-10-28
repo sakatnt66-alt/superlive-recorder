@@ -108,9 +108,6 @@ async function handleCompletedRecordings(request, env) {
   } catch (error) { return jsonResponse({ error: error.message }, 500); }
 }
 
-// ============================================================
-// AUTO TRIGGER - FIXED: Uses user_id in URL, stream_id in body
-// ============================================================
 async function handleAutoTrigger(request, url, env) {
   if (!isAuthorized(request, env)) return unauthorizedResponse();
   try {
@@ -206,29 +203,17 @@ async function handleDeleteRecording(request, url, env) {
 
 // ============================================================
 // NEW: Cleanup failed recording immediately
-// Removes the stream_id from active recordings list in Worker KV
-// so /status no longer shows it as "recording"
 // ============================================================
 async function handleCleanupFailed(request, url, env) {
   if (!isAuthorized(request, env)) return unauthorizedResponse();
   try {
     const streamId = url.pathname.split('/').pop();
     const recData = await getRecordings(env);
-    const before = Array.isArray(recData.recordings) ? recData.recordings : [];
-    const after = before.filter(r => String(r.stream_id) !== streamId);
-    await saveRecordings(env, after);
-    const removed = before.length - after.length;
-    console.log(`[CLEANUP] Removed failed recording ${streamId} (${removed} removed, ${after.length} remaining)`);
-    return jsonResponse({
-      success: true,
-      removed: streamId,
-      removed_count: removed,
-      remaining: after.length
-    });
-  } catch (error) {
-    console.error('[handleCleanupFailed] Error:', error);
-    return jsonResponse({ error: error.message }, 500);
-  }
+    const recordings = (Array.isArray(recData.recordings) ? recData.recordings : []).filter(r => String(r.stream_id) !== streamId);
+    await saveRecordings(env, recordings);
+    console.log(`[CLEANUP] Removed failed recording ${streamId}`);
+    return jsonResponse({ success: true, removed: streamId });
+  } catch (error) { return jsonResponse({ error: error.message }, 500); }
 }
 
 async function handleCleanup(env) {
@@ -255,9 +240,6 @@ async function handleCheckStop(request, url, env) {
   } catch (error) { return jsonResponse({ error: error.message, should_stop: false }, 500); }
 }
 
-// ============================================================
-// TELEGRAM WEBHOOK
-// ============================================================
 async function handleTelegramWebhook(request, env) {
   try {
     const update = await request.json();
@@ -331,9 +313,6 @@ async function handleCallbackQuery(callbackQuery, env) {
   return new Response('OK');
 }
 
-// ============================================================
-// WATCHLIST COMMANDS
-// ============================================================
 async function handleAddWatch(chatId, streamId, env) {
   try {
     if (!streamId || !/^\d+$/.test(streamId)) {
@@ -395,9 +374,6 @@ async function handleWatchlistCommand(chatId, env) {
   }
 }
 
-// ============================================================
-// MANUAL RECORDING
-// ============================================================
 async function handleRecord(chatId, streamUrl, streamId, env) {
   try {
     const recData = await getRecordings(env);
@@ -440,9 +416,6 @@ async function handleRecord(chatId, streamUrl, streamId, env) {
   }
 }
 
-// ============================================================
-// STATUS & STOP
-// ============================================================
 async function handleStatus(chatId, env) {
   const recData = await getRecordings(env);
   const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
@@ -508,9 +481,6 @@ async function showStopMenu(chatId, env) {
   await sendTelegramMessage(env, chatId, '🛑 اختر التسجيل المراد إيقافه:', { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
 }
 
-// ============================================================
-// CLEANUP WITH CONFIRMATION
-// ============================================================
 async function handleCleanupConfirm(chatId, env) {
   try {
     const recData = await getRecordings(env);
@@ -562,9 +532,6 @@ async function handleCleanupExecute(chatId, env) {
   }
 }
 
-// ============================================================
-// RECORDINGS SEARCH
-// ============================================================
 async function handleRecordingsSearch(chatId, query, env) {
   try {
     const recData = await getRecordings(env);
@@ -612,18 +579,12 @@ async function handleRecordingsSearch(chatId, query, env) {
   }
 }
 
-// ============================================================
-// TEST MONITOR
-// ============================================================
 async function handleTestMonitor(chatId, env) {
   await sendTelegramMessage(env, chatId, '🧪 جاري تشغيل المراقبة...', { parse_mode: 'HTML' });
   const result = await triggerGitHubDispatch(env, 'auto_monitor', { source: 'telegram_button' });
   await sendTelegramMessage(env, chatId, result.success ? '✅ تم تشغيل المراقبة بنجاح' : '❌ فشل التشغيل: ' + result.error, { parse_mode: 'HTML' });
 }
 
-// ============================================================
-// MAIN MENU
-// ============================================================
 async function sendMainMenu(chatId, env) {
   const wlData = await getWatchlist(env);
   const recData = await getRecordings(env);
@@ -649,9 +610,6 @@ async function sendMainMenu(chatId, env) {
   );
 }
 
-// ============================================================
-// TELEGRAM API HELPERS
-// ============================================================
 async function sendTelegramMessage(env, chatId, text, options = {}) {
   try {
     await fetch('https://api.telegram.org/bot' + env.TELEGRAM_BOT_TOKEN + '/sendMessage', {
@@ -672,9 +630,6 @@ async function answerCallbackQuery(id, env, text) {
   } catch (e) {}
 }
 
-// ============================================================
-// CRON & GITHUB DISPATCH
-// ============================================================
 async function handleAutoMonitorCron(env) {
   try {
     const wlData = await getWatchlist(env);
