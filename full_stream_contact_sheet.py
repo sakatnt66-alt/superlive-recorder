@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
 full_stream_contact_sheet.py — Full Stream Contact Sheet Generator (Portrait)
-
 Creates EXACTLY ONE portrait JPG containing 12 frames taken from the
 ORIGINAL full recording, distributed across its entire duration.
-
-Grid: 2 columns x 6 rows = 660 x 1260 px (PORTRAIT enforced).
 """
 
 import json
@@ -17,6 +14,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,49 +22,34 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 RECORDINGS_DIR     = Path(os.environ.get("RECORDINGS_DIR", "recordings"))
 PRESERVED_DIR      = RECORDINGS_DIR / "_preserved"
+TEMP_DIR           = RECORDINGS_DIR / "_temp"
 STATE_DIR          = RECORDINGS_DIR / "_state"
 STREAM_ID          = os.environ.get("STREAM_ID", "unknown")
 STREAM_NAME        = os.environ.get("STREAM_NAME", "")
 
-# ═══════════════════════════════════════════════════════════
-# PORTRAIT GRID CONFIGURATION — 2 cols x 6 rows = 12 frames
-# ═══════════════════════════════════════════════════════════
-GRID_COLS = int(os.environ.get("CS_COLS", "2"))
-GRID_ROWS = int(os.environ.get("CS_ROWS", "6"))
+GRID_COLS = 2
+GRID_ROWS = 6
+TOTAL_FRAMES = GRID_COLS * GRID_ROWS
 
-# ENFORCE: exactly 12 frames, portrait orientation
-if GRID_COLS * GRID_ROWS != 12:
-    GRID_COLS, GRID_ROWS = 2, 6
-if GRID_COLS >= GRID_ROWS:
-    GRID_COLS, GRID_ROWS = 2, 6
-
-TOTAL_FRAMES = GRID_COLS * GRID_ROWS  # Always 12
-
-CELL_W       = int(os.environ.get("CS_CELL_W", "320"))
-CELL_H       = int(os.environ.get("CS_CELL_H", "180"))
-GAP          = int(os.environ.get("CS_GAP", "4"))
-MARGIN       = int(os.environ.get("CS_MARGIN", "8"))
-JPEG_QUALITY = int(os.environ.get("CS_QUALITY", "85"))
-FONT_SIZE    = int(os.environ.get("CS_FONT_SIZE", "16"))
-BG_COLOR     = os.environ.get("CS_BG_COLOR", "black")
+CELL_W = 540
+CELL_H = 960
+GAP = 2
+MARGIN = 10
+JPEG_QUALITY = 90
+FONT_SIZE = 32
+BG_COLOR = "black"
 MAX_TG_PHOTO = 10 * 1024 * 1024
 
-TEXT_H = FONT_SIZE + 8
-
+TEXT_H = FONT_SIZE + 10
 
 def log(msg: str, level: str = "INFO") -> None:
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[CONTACT_SHEET {ts}] [{level}] {msg}", flush=True)
 
-
-# ═══════════════════════════════════════════════════════════
-# STATE MANAGEMENT
-# ═══════════════════════════════════════════════════════════
 def state_file() -> Path:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(STREAM_ID))
     return STATE_DIR / f"contact_sheet_{safe_id}.json"
-
 
 def load_state() -> dict:
     p = state_file()
@@ -77,7 +60,6 @@ def load_state() -> dict:
             pass
     return {"stream_id": STREAM_ID, "state": "NOT_STARTED"}
 
-
 def save_state(st: dict) -> None:
     p = state_file()
     tmp = p.with_suffix(".tmp")
@@ -85,10 +67,6 @@ def save_state(st: dict) -> None:
     tmp.write_text(json.dumps(st, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(p)
 
-
-# ═══════════════════════════════════════════════════════════
-# FFPROBE / FFMPEG HELPERS
-# ═══════════════════════════════════════════════════════════
 def run_cmd(cmd: str, timeout: int = 300):
     try:
         return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
@@ -96,7 +74,6 @@ def run_cmd(cmd: str, timeout: int = 300):
         return None
     except Exception:
         return None
-
 
 def get_duration(path: str) -> float:
     r = run_cmd(f'ffprobe -v quiet -print_format json -show_format "{path}"', 30)
@@ -106,7 +83,6 @@ def get_duration(path: str) -> float:
         except Exception:
             pass
     return 0.0
-
 
 def validate_source(path: str) -> bool:
     try:
@@ -121,17 +97,46 @@ def validate_source(path: str) -> bool:
     except OSError:
         return False
 
-
 def format_timestamp(seconds: float) -> str:
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
+def find_and_concatenate_parts() -> str:
+    parts = []
+    for d in [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]:
+        if not d.exists(): continue
+        for f in d.glob("*_av_part_*.mkv"):
+            parts.append(f)
+    
+    if not parts:
+        return None
+        
+    def get_part_num(f):
+        m = re.search(r'_av_part_(\d+)', f.name)
+        return int(m.group(1)) if m else 0
+    parts.sort(key=get_part_num)
+    
+    log(f"🔗 Found {len(parts)} parts to concatenate")
+    
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(STREAM_ID))
+    concat_file = TEMP_DIR / f"cs_concat_{safe_id}.txt"
+    with open(concat_file, "w", encoding="utf-8") as f:
+        for p in parts:
+            f.write(f"file '{p}'\n")
+            
+    out_file = TEMP_DIR / f"cs_concatenated_{safe_id}.mkv"
+    if out_file.exists() and out_file.stat().st_size > 0:
+        return str(out_file)
+        
+    cmd = f'ffmpeg -y -f concat -safe 0 -i "{concat_file}" -c copy "{out_file}"'
+    r = run_cmd(cmd, timeout=1200)
+    if r and r.returncode == 0 and out_file.exists() and out_file.stat().st_size > 0:
+        return str(out_file)
+    return None
 
-# ═══════════════════════════════════════════════════════════
-# SOURCE DISCOVERY — excludes _part_ and _encoded
-# ═══════════════════════════════════════════════════════════
 def find_source_mkv():
     search_dirs = [PRESERVED_DIR, RECORDINGS_DIR, RECORDINGS_DIR / "_temp"]
     candidates = []
@@ -150,18 +155,22 @@ def find_source_mkv():
     if not candidates:
         return None
     candidates.sort(key=lambda f: (f.stem.endswith("_av"), f.stat().st_size), reverse=True)
-    return candidates[0]
+    
+    main_file = candidates[0]
+    # If main file is suspiciously small (< 50MB), try to concatenate parts
+    if main_file.stat().st_size < 50 * 1024 * 1024:
+        concat_path = find_and_concatenate_parts()
+        if concat_path and Path(concat_path).stat().st_size > main_file.stat().st_size:
+            return Path(concat_path)
+            
+    return main_file
 
-
-# ═══════════════════════════════════════════════════════════
-# TIMESTAMP CALCULATION — distributed across FULL duration
-# ═══════════════════════════════════════════════════════════
 def calculate_timestamps(duration: float, count: int) -> list:
     if duration <= 0 or count <= 0:
         return []
-    if count == 1:
-        return [duration / 2]
-    margin = min(1.0, duration * 0.01)
+    if duration < 12:
+        return [duration * (i + 1) / (count + 1) for i in range(count)]
+    margin = min(2.0, duration * 0.02)
     usable = max(duration - 2 * margin, 0.1)
     timestamps = []
     for i in range(count):
@@ -170,28 +179,28 @@ def calculate_timestamps(duration: float, count: int) -> list:
         timestamps.append(ts)
     return timestamps
 
-
-# ═══════════════════════════════════════════════════════════
-# FRAME EXTRACTION
-# ═══════════════════════════════════════════════════════════
 def extract_frames(source: str, timestamps: list, tmpdir: str) -> list:
     frames = []
     for i, ts in enumerate(timestamps):
         out = os.path.join(tmpdir, f"frame_{i:03d}.jpg")
         label = format_timestamp(ts)
+        
+        # Try fast seek first
         cmd = f'ffmpeg -y -ss {ts:.3f} -i "{source}" -frames:v 1 -q:v 2 "{out}"'
         r = run_cmd(cmd, timeout=30)
         if r and r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
             frames.append((out, ts, label))
+            continue
+            
+        # Fallback: accurate seek
+        cmd2 = f'ffmpeg -y -i "{source}" -ss {ts:.3f} -frames:v 1 -q:v 2 "{out}"'
+        r2 = run_cmd(cmd2, timeout=60)
+        if r2 and r2.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+            frames.append((out, ts, label))
         else:
-            stderr_snippet = (r.stderr or "")[:200] if r else "timeout"
-            log(f"Frame {i+1}/{len(timestamps)} at {label} FAILED: {stderr_snippet}", "ERROR")
+            log(f"Frame {i+1}/{len(timestamps)} at {label} FAILED", "ERROR")
     return frames
 
-
-# ═══════════════════════════════════════════════════════════
-# PORTRAIT GRID BUILDING (Pillow)
-# ═══════════════════════════════════════════════════════════
 def build_contact_sheet(frames: list, output_path: str) -> bool:
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -207,28 +216,20 @@ def build_contact_sheet(frames: list, output_path: str) -> bool:
     img_w = MARGIN * 2 + GRID_COLS * CELL_W + (GRID_COLS - 1) * GAP
     img_h = MARGIN * 2 + GRID_ROWS * (CELL_H + TEXT_H) + (GRID_ROWS - 1) * GAP
 
-    if img_h <= img_w:
-        log(f"Canvas {img_w}x{img_h} is NOT portrait. Aborting.", "ERROR")
-        return False
-
-    log(f"Canvas: {img_w}x{img_h} (portrait={img_h > img_w}), grid={GRID_COLS}x{GRID_ROWS}")
-
     grid_img = Image.new('RGB', (img_w, img_h), color=BG_COLOR)
     draw = ImageDraw.Draw(grid_img)
 
     font = None
-    for fp in ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-               "/usr/share/fonts/truetype/freefont/FreeSans.ttf"]:
+    for fp in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+               "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+               "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"]:
         try:
             font = ImageFont.truetype(fp, FONT_SIZE)
             break
         except (IOError, OSError):
             continue
     if font is None:
-        try:
-            font = ImageFont.load_default()
-        except Exception:
-            font = None
+        font = ImageFont.load_default()
 
     for i, (frame_path, ts, label) in enumerate(frames):
         row, col = divmod(i, GRID_COLS)
@@ -238,6 +239,7 @@ def build_contact_sheet(frames: list, output_path: str) -> bool:
             with Image.open(frame_path) as img:
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
+                # Resize to fit cell while keeping aspect ratio
                 img.thumbnail((CELL_W, CELL_H), Image.LANCZOS)
                 ox = x + (CELL_W - img.width) // 2
                 oy = y + (CELL_H - img.height) // 2
@@ -251,6 +253,8 @@ def build_contact_sheet(frames: list, output_path: str) -> bool:
                 tw = bbox[2] - bbox[0]
             except AttributeError:
                 tw = len(label) * (FONT_SIZE // 2)
+            # Draw text with shadow for readability
+            draw.text((x + (CELL_W - tw) // 2 + 2, y + CELL_H + 3 + 2), label, fill="black", font=font)
             draw.text((x + (CELL_W - tw) // 2, y + CELL_H + 3), label, fill="white", font=font)
 
     try:
@@ -260,10 +264,6 @@ def build_contact_sheet(frames: list, output_path: str) -> bool:
         log(f"Save failed: {e}", "ERROR")
         return False
 
-
-# ═══════════════════════════════════════════════════════════
-# TELEGRAM SEND
-# ═══════════════════════════════════════════════════════════
 def send_photo(photo_path: str, caption: str) -> dict:
     result = {"ok": False, "message_id": None, "error": ""}
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -308,13 +308,9 @@ def send_photo(photo_path: str, caption: str) -> dict:
             time.sleep(2 * attempt)
     return result
 
-
-# ═══════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════
 def main():
     log("=" * 60)
-    log("Full Stream Contact Sheet Generator (PORTRAIT)")
+    log("Full Stream Contact Sheet Generator (PORTRAIT 2x6)")
     log(f"  STREAM_ID   : {STREAM_ID}")
     log(f"  GRID        : {GRID_COLS}x{GRID_ROWS} = {TOTAL_FRAMES} frames")
     log(f"  CELL SIZE   : {CELL_W}x{CELL_H}")
@@ -412,7 +408,6 @@ def main():
         st["last_send_error"] = tg_res["error"]
     save_state(st)
     log("Contact sheet pipeline finished")
-
 
 if __name__ == "__main__":
     try:
