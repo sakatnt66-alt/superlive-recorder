@@ -749,8 +749,10 @@ async def main():
             except Exception as e:
                 print(f"[LAUNCHER] Recording ended during stop: {e}")
             stop_waiter.cancel()
+            
+            # FIX: Transition to 'processing' to free the recording slot
             update_worker_state(stream_id, {
-                "status": "stopped",
+                "status": "processing",
                 "stopped_at": datetime.now(timezone.utc).isoformat(),
                 "stopped_reason": "manual_stop_from_telegram"
             })
@@ -769,15 +771,17 @@ async def main():
             try:
                 await recording_task
                 print("\n[LAUNCHER] ✓ record_once.py completed successfully")
+                
+                # FIX: Transition to 'processing' to free the recording slot
                 update_worker_state(stream_id, {
-                    "status": "completed",
+                    "status": "processing",
                     "completed_at": datetime.now(timezone.utc).isoformat(),
                     "completed_reason": "natural_end"
                 })
             except asyncio.CancelledError:
                 recording_stopped_manually = True
                 update_worker_state(stream_id, {
-                    "status": "stopped",
+                    "status": "processing",
                     "stopped_at": datetime.now(timezone.utc).isoformat()
                 })
             except Exception as e:
@@ -796,10 +800,12 @@ async def main():
                         f"🆔 ID: <code>{stream_id}</code>\n"
                         f"📦 مرحلة المعالجة اللاحقة ستُكمل التقسيم والإرسال."
                     )
+                    
+                    # FIX: Transition to 'processing' to free the recording slot
                     update_worker_state(stream_id, {
                         "split_error": error_str[:300],
                         "rescue_pending": True,
-                        "status": "completed",
+                        "status": "processing",
                         "completed_at": datetime.now(timezone.utc).isoformat(),
                         "completed_reason": "split_failed_rescue_pending"
                     })
@@ -823,8 +829,9 @@ async def main():
             except Exception as e:
                 print(f"[LAUNCHER] Recording ended during timeout: {e}")
 
+            # FIX: Transition to 'processing' to free the recording slot
             update_worker_state(stream_id, {
-                "status": "completed",
+                "status": "processing",
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "completed_reason": "time_limit_3600s",
                 "duration_seconds": round(elapsed)
@@ -841,7 +848,7 @@ async def main():
         recording_stopped_manually = True
         print("\n[LAUNCHER] Recording cancelled externally")
         update_worker_state(stream_id, {
-            "status": "stopped",
+            "status": "processing",
             "stopped_at": datetime.now(timezone.utc).isoformat()
         })
     except Exception as e:
@@ -854,10 +861,12 @@ async def main():
         
         if "Unable to split Matroska" in error_str:
             print("[LAUNCHER] Matroska split failed — RESCUE MODE")
+            
+            # FIX: Transition to 'processing' to free the recording slot
             update_worker_state(stream_id, {
                 "split_error": error_str[:300],
                 "rescue_pending": True,
-                "status": "completed",
+                "status": "processing",
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "completed_reason": "split_failed_rescue_pending"
             })
