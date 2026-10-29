@@ -1,4 +1,4 @@
-// worker.js - Version 13.0 (Fix stuck recordings in /status and concurrency limits)
+// worker.js - Version 14.0 (Fix stuck recordings, separate capture from processing state)
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -113,7 +113,7 @@ async function handleCompletedRecordings(request, env) {
   try {
     const data = await getRecordings(env);
     const recordings = Array.isArray(data.recordings) ? data.recordings : [];
-    const completed = recordings.filter(r => ['completed', 'stopped', 'failed'].includes(r.status));
+    const completed = recordings.filter(r => ['completed', 'stopped', 'failed', 'processing'].includes(r.status));
     return jsonResponse({ count: completed.length, recordings: completed });
   } catch (error) { return jsonResponse({ error: error.message }, 500); }
 }
@@ -172,9 +172,23 @@ async function handleUpdateState(request, url, env) {
     const body = await request.json();
     const recData = await getRecordings(env);
     const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
-    const idx = recordings.findIndex(r => String(r.stream_id) === streamId && r.status === 'recording');
-    if (idx >= 0) recordings[idx] = Object.assign({}, recordings[idx], body);
-    else recordings.push(Object.assign({ stream_id: streamId }, body));
+    const idx = recordings.findIndex(r => String(r.stream_id) === streamId);
+    
+    // FIX: Allow status transitions that free the recording slot
+    if (idx >= 0) {
+        // When capture ends, transition from 'recording' to 'processing' or 'completed'
+        // This frees the slot for new recordings while keeping the entry for post-processing
+        const oldStatus = recordings[idx].status;
+        const newStatus = body.status || oldStatus;
+        
+        // Merge the update
+        recordings[idx] = Object.assign({}, recordings[idx], body);
+        
+        console.log(`[UPDATE-STATE] ${streamId}: ${oldStatus} → ${newStatus}`);
+    } else {
+        recordings.push(Object.assign({ stream_id: streamId }, body));
+    }
+    
     await saveRecordings(env, recordings);
     return jsonResponse({ success: true });
   } catch (error) { return jsonResponse({ error: error.message }, 500); }
@@ -220,7 +234,8 @@ async function handleCheckStop(request, url, env) {
     let should_stop = false, status = 'not_found';
     if (recording) {
       status = recording.status;
-      if (['stopped', 'failed', 'finished'].includes(recording.status)) should_stop = true;
+      // FIX: Stop signal should work for 'recording' status, but NOT for 'processing'
+      if (['stopped', 'failed', 'completed'].includes(recording.status)) should_stop = true;
     }
     return jsonResponse({ stream_id: streamId, status, should_stop });
   } catch (error) { return jsonResponse({ error: error.message, should_stop: false }, 500); }
@@ -402,6 +417,7 @@ async function handleRecord(chatId, streamUrl, streamId, env) {
 async function handleStatus(chatId, env) {
   const recData = await getRecordings(env);
   const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
+  // FIX: Only show recordings with status='recording' as active
   const active = getActiveRecordingsList(recordings);
   if (active.length === 0) {
     await sendTelegramMessage(env, chatId, '📭 لا توجد تسجيلات نشطة.', { parse_mode: 'HTML' });
@@ -519,7 +535,7 @@ async function handleRecordingsSearch(chatId, query, env) {
   try {
     const recData = await getRecordings(env);
     const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
-    const completed = recordings.filter(r => ['completed', 'stopped', 'failed'].includes(r.status));
+    const completed = recordings.filter(r => ['completed', 'stopped', 'failed', 'processing'].includes(r.status));
     if (completed.length === 0) {
       await sendTelegramMessage(env, chatId, '📭 لا توجد تسجيلات مكتملة.', { parse_mode: 'HTML' });
       return;
@@ -541,7 +557,7 @@ async function handleRecordingsSearch(chatId, query, env) {
     for (const r of toShow) {
       const source = r.source === 'auto' ? '🤖' : '✋';
       const name = r.stream_name || 'غير معروف';
-      const status = r.status === 'completed' ? '✅' : (r.status === 'stopped' ? '🛑' : '❌');
+      const status = r.status === 'completed' ? '✅' : (r.status === 'stopped' ? '🛑' : (r.status === 'processing' ? '⚙️' : '❌'));
       const startTime = new Date(r.started_at);
       const duration = r.duration ? formatDuration(Math.floor(r.duration)) : 'غير محدد';
       const size = r.file_size ? (r.file_size / (1024*1024)).toFixed(2) + ' MB' : 'غير محدد';
@@ -573,7 +589,7 @@ async function sendMainMenu(chatId, env) {
   const recData = await getRecordings(env);
   const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
   const active = getActiveRecordingsList(recordings).length;
-  const completed = recordings.filter(r => ['completed', 'stopped', 'failed'].includes(r.status)).length;
+  const completed = recordings.filter(r => ['completed', 'stopped', 'failed', 'processing'].includes(r.status)).length;
   await sendTelegramMessage(env, chatId,
     '🎬 <b>SuperLive Recorder</b>\n\n' +
     '📊 النشطة: <b>' + active + '/5</b>\n' +
