@@ -3,12 +3,11 @@
 postprocess_recording.py — MKV-to-MP4 conversion, segmentation, delivery.
 
 KEY FIXES in this version:
-  1. Concatenates _av_part_*.mkv files to recover the full recording
-  2. Audio re-encoded to AAC for MP4 compatibility (fixes silent segments)
-  3. Verifies total coverage duration matches source duration
-  4. Retries failed segments independently
-  5. Segment sending loop NEVER stops early — all segments are attempted
-  6. Rate limiting between Telegram sends to avoid 429 errors
+  1. Sends segments EVEN WITHOUT AUDIO (video is more important)
+  2. Calculates actual start times from source (not from index)
+  3. Per-segment state management for resume capability
+  4. Never rejects segments due to missing audio
+  5. Coverage verification before declaring success
 """
 
 import json
@@ -80,15 +79,6 @@ def get_resolution(info: dict):
         if s.get("codec_type") == "video":
             return s.get("width", 0), s.get("height", 0)
     return 0, 0
-
-def get_audio_packets(info: dict) -> int:
-    for s in info.get("streams", []):
-        if s.get("codec_type") == "audio":
-            try:
-                return int(s.get("nb_read_packets", 0) or s.get("nb_frames", 0) or 0)
-            except (TypeError, ValueError):
-                return 0
-    return 0
 
 def human_size(n: int) -> str:
     mb = n / (1024 * 1024)
@@ -191,16 +181,14 @@ def discover_mkv_files() -> list:
         if info is None:
             continue
         vc, ac = get_codecs(info)
-        if vc and ac:
+        if vc:  # Accept video-only files too
             verified.append(f)
-            log(f"✓ Source: {f.name} ({human_size(size)}, v={vc}, a={ac})")
+            log(f"✓ Source: {f.name} ({human_size(size)}, v={vc}, a={ac or 'NONE'})")
             break
-        elif vc:
-            log(f"Skipping video-only: {f.name}")
     return verified
 
 # ═══════════════════════════════════════════════════════════
-# SEGMENTATION with AAC re-encoding for MP4 compatibility
+# SEGMENTATION
 # ═══════════════════════════════════════════════════════════
 def calc_segment_duration(file_size: int, duration: float) -> float:
     if duration <= 0 or file_size <= 0:
@@ -214,7 +202,7 @@ def calc_segment_duration(file_size: int, duration: float) -> float:
 
 def split_to_segments(src: str, outdir: str, seg_dur: float) -> list:
     pattern = os.path.join(outdir, "segment_%03d.mp4")
-    # FIX: Re-encode audio to AAC for MP4 compatibility (fixes silent segments)
+    # FIX: Re-encode audio to AAC, but DON'T fail if no audio
     cmd = (
         f'ffmpeg -y -i "{src}" '
         f'-c:v copy -c:a aac -b:a 128k '
@@ -256,9 +244,18 @@ def resplit_oversized(seg_path: str, outdir: str, idx: int) -> list:
             return subs
     return [seg_path]
 
-def recreate_segment_with_audio(src: str, start_time: float, duration: float, out_path: str) -> bool:
-    """Re-create a segment with proper audio encoding from the source."""
-    log(f"  🔄 Recreating segment with audio: {start_time:.1f}s → {start_time + duration:.1f}s")
+def recreate_segment_from_source(src: str, start_time: float, duration: float, out_path: str) -> bool:
+    """Re-create a segment from the source using exact start time and duration."""
+    log(f"  🔄 Recreating segment: {start_time:.1f}s → {start_time + duration:.1f}s")
+    # Clamp to source duration
+    src_info = ffprobe_json(src)
+    if src_info:
+        src_dur = get_duration(src_info)
+        if start_time >= src_dur:
+            log(f"  ✗ Start time {start_time:.1f}s >= source duration {src_dur:.1f}s")
+            return False
+        duration = min(duration, src_dur - start_time)
+    
     cmd = (
         f'ffmpeg -y -ss {start_time:.3f} -t {duration:.3f} -i "{src}" '
         f'-c:v copy -c:a aac -b:a 128k '
@@ -269,13 +266,14 @@ def recreate_segment_with_audio(src: str, start_time: float, duration: float, ou
         info = ffprobe_json(out_path)
         if info:
             vc, ac = get_codecs(info)
-            if vc and ac:
-                log(f"  ✓ Recreated segment has audio: {ac}")
+            if vc:
+                log(f"  ✓ Recreated segment: v={vc}, a={ac or 'NONE'}")
                 return True
     return False
 
 def verify_segment(path: str) -> dict:
-    result = {"ok": False, "reason": "", "duration": 0.0, "width": 0, "height": 0, "audio_packets": 0}
+    """Verify segment has video (audio is optional now)."""
+    result = {"ok": False, "reason": "", "duration": 0.0, "width": 0, "height": 0, "has_audio": False}
     info = ffprobe_json(path)
     if not info:
         result["reason"] = "ffprobe failed"
@@ -288,18 +286,17 @@ def verify_segment(path: str) -> dict:
     if not vc:
         result["reason"] = "no video"
         return result
-    if not ac:
-        result["reason"] = "no audio (silent)"
-        return result
     
-    # Check audio packets to ensure audio is not just a stream header
-    audio_packets = get_audio_packets(info)
-    if audio_packets < 10:
-        result["reason"] = f"insufficient audio packets ({audio_packets})"
-        return result
+    # FIX: Audio is now OPTIONAL - don't reject video-only segments
+    if not ac:
+        result["reason"] = "ok (video only, no audio)"
+        result["has_audio"] = False
+    else:
+        result["reason"] = "ok"
+        result["has_audio"] = True
     
     w, h = get_resolution(info)
-    result.update({"ok": True, "reason": "ok", "duration": dur, "width": w, "height": h, "audio_packets": audio_packets})
+    result.update({"ok": True, "duration": dur, "width": w, "height": h})
     return result
 
 # ═══════════════════════════════════════════════════════════
@@ -391,13 +388,17 @@ def process_one(mkv_path: Path, sid: str) -> bool:
     log(f"⏱️ Duration: {format_ts(duration)} ({duration:.1f}s)")
     log(f"📦 Size: {human_size(src_size)}")
     log(f"🎬 Video: {vc} {w}x{h}")
-    log(f"🔊 Audio: {ac or 'NONE'}")
+    log(f"🔊 Audio: {ac or 'NONE (video-only source)'}")
 
-    if not ac:
-        log("✗ Source has NO audio — refusing to process silent video")
-        st["state"] = "FAILED_NO_AUDIO"
+    if not vc:
+        log("✗ Source has NO video — cannot process")
+        st["state"] = "FAILED_NO_VIDEO"
         save_state(sid, st)
         return False
+
+    # FIX: Audio is now OPTIONAL - don't reject video-only sources
+    if not ac:
+        log("⚠️ Source has NO audio — will send video-only segments")
 
     if vc and vc not in MP4_VIDEO_OK:
         log(f"✗ Codec '{vc}' not MP4-compatible")
@@ -448,12 +449,25 @@ def process_one(mkv_path: Path, sid: str) -> bool:
         failed_count = 0
         retry_needed = []
 
+        # Calculate actual start times from segment durations
+        cumulative_time = 0.0
+        segment_times = []
+        for seg_path in final_segments:
+            seg_info = ffprobe_json(seg_path)
+            if seg_info:
+                seg_dur_actual = get_duration(seg_info)
+            else:
+                seg_dur_actual = seg_dur
+            segment_times.append((cumulative_time, seg_dur_actual))
+            cumulative_time += seg_dur_actual
+
         # ═══════════════════════════════════════════════════
         # SEND ALL SEGMENTS — loop NEVER stops early
         # ═══════════════════════════════════════════════════
         for idx, seg_path in enumerate(final_segments):
             seg_name = os.path.basename(seg_path)
             seg_key = f"seg_{idx:04d}"
+            seg_start, seg_dur_actual = segment_times[idx] if idx < len(segment_times) else (0, seg_dur)
 
             # Skip already-sent segments (idempotency)
             prev = st["segments"].get(seg_key, {})
@@ -462,41 +476,35 @@ def process_one(mkv_path: Path, sid: str) -> bool:
                 sent_count += 1
                 continue
 
-            # Verify segment
+            # Verify segment (audio is now optional)
             verdict = verify_segment(seg_path)
             if not verdict["ok"]:
                 log(f"  [{idx+1}/{total}] ✗ REJECTED: {verdict['reason']}")
                 
-                # If audio issue, try to recreate the segment with proper audio
-                if "audio" in verdict["reason"]:
-                    log(f"  [{idx+1}/{total}] 🔄 Attempting to recreate segment with audio...")
-                    seg_info = ffprobe_json(seg_path)
-                    if seg_info:
-                        seg_dur_actual = get_duration(seg_info)
-                        # Estimate start time based on segment index
-                        start_time = idx * seg_dur
-                        recreated_path = os.path.join(segdir, f"recreated_{idx:03d}.mp4")
-                        if recreate_segment_with_audio(mkv, start_time, seg_dur_actual, recreated_path):
-                            # Verify the recreated segment
-                            verdict = verify_segment(recreated_path)
-                            if verdict["ok"]:
-                                seg_path = recreated_path
-                                seg_name = os.path.basename(recreated_path)
-                                log(f"  [{idx+1}/{total}] ✓ Recreated segment passed verification")
-                            else:
-                                log(f"  [{idx+1}/{total}] ✗ Recreated segment still failed: {verdict['reason']}")
-                                st["segments"][seg_key] = {"sent": False, "error": verdict["reason"]}
-                                st["errors"].append(f"{seg_name}:{verdict['reason']}")
-                                failed_count += 1
-                                save_state(sid, st)
-                                continue
+                # If video issue, try to recreate the segment
+                if "video" in verdict["reason"] or "duration" in verdict["reason"]:
+                    log(f"  [{idx+1}/{total}] 🔄 Attempting to recreate segment from source...")
+                    recreated_path = os.path.join(segdir, f"recreated_{idx:03d}.mp4")
+                    if recreate_segment_from_source(mkv, seg_start, seg_dur_actual, recreated_path):
+                        verdict = verify_segment(recreated_path)
+                        if verdict["ok"]:
+                            seg_path = recreated_path
+                            seg_name = os.path.basename(recreated_path)
+                            log(f"  [{idx+1}/{total}] ✓ Recreated segment passed verification")
                         else:
-                            log(f"  [{idx+1}/{total}] ✗ Recreation failed")
+                            log(f"  [{idx+1}/{total}] ✗ Recreated segment still failed: {verdict['reason']}")
                             st["segments"][seg_key] = {"sent": False, "error": verdict["reason"]}
                             st["errors"].append(f"{seg_name}:{verdict['reason']}")
                             failed_count += 1
                             save_state(sid, st)
                             continue
+                    else:
+                        log(f"  [{idx+1}/{total}] ✗ Recreation failed")
+                        st["segments"][seg_key] = {"sent": False, "error": verdict["reason"]}
+                        st["errors"].append(f"{seg_name}:{verdict['reason']}")
+                        failed_count += 1
+                        save_state(sid, st)
+                        continue
                 else:
                     st["segments"][seg_key] = {"sent": False, "error": verdict["reason"]}
                     st["errors"].append(f"{seg_name}:{verdict['reason']}")
@@ -504,8 +512,14 @@ def process_one(mkv_path: Path, sid: str) -> bool:
                     save_state(sid, st)
                     continue
 
+            # FIX: If no audio, add warning but still send
+            audio_note = ""
+            if not verdict.get("has_audio", False):
+                audio_note = "\n⚠️ بدون صوت"
+                log(f"  [{idx+1}/{total}] ⚠️ Segment has NO AUDIO — will send video-only")
+
             seg_size = os.path.getsize(seg_path)
-            log(f"  [{idx+1}/{total}] {seg_name}: {human_size(seg_size)}, {verdict['duration']:.1f}s ✓")
+            log(f"  [{idx+1}/{total}] {seg_name}: {human_size(seg_size)}, {verdict['duration']:.1f}s, audio={'YES' if verdict.get('has_audio') else 'NO'} ✓")
 
             if seg_size > TG_HARD_LIMIT:
                 log(f"  [{idx+1}/{total}] ✗ Exceeds Telegram limit — cannot send")
@@ -519,6 +533,7 @@ def process_one(mkv_path: Path, sid: str) -> bool:
                 f"🆔 {sid}\n"
                 f"📎 المقطع {idx+1} من {total}\n"
                 f"⏱️ {format_ts(verdict['duration'])}"
+                f"{audio_note}"
             )
 
             # Send with retry
@@ -536,13 +551,15 @@ def process_one(mkv_path: Path, sid: str) -> bool:
                     "message_id": tg_res["message_id"],
                     "size": seg_size,
                     "duration": round(verdict["duration"], 1),
+                    "has_audio": verdict.get("has_audio", False),
+                    "start_time": round(seg_start, 1),
                 }
             else:
                 log(f"  [{idx+1}/{total}] ✗ Send failed: {tg_res['error']} — will NOT stop, continuing...")
                 st["segments"][seg_key] = {"sent": False, "error": tg_res["error"]}
                 st["errors"].append(f"{seg_name}:{tg_res['error']}")
                 failed_count += 1
-                retry_needed.append((seg_key, seg_path, verdict))
+                retry_needed.append((seg_key, seg_path, verdict, seg_start))
 
             save_state(sid, st)
 
@@ -553,18 +570,23 @@ def process_one(mkv_path: Path, sid: str) -> bool:
         # Retry failed segments (one more pass)
         if retry_needed:
             log(f"\n🔄 Retrying {len(retry_needed)} failed segments...")
-            for seg_key, seg_path, verdict in retry_needed:
+            for seg_key, seg_path, verdict, seg_start in retry_needed:
                 if st["segments"].get(seg_key, {}).get("sent"):
                     continue  # Already succeeded on retry
                 
                 seg_name = os.path.basename(seg_path)
                 seg_size = os.path.getsize(seg_path)
                 
+                audio_note = ""
+                if not verdict.get("has_audio", False):
+                    audio_note = "\n⚠️ بدون صوت"
+                
                 caption = (
                     f"🎬 {display_name}\n"
                     f"🆔 {sid}\n"
                     f"📎 المقطع {int(seg_key.split('_')[1])+1} من {total}\n"
                     f"⏱️ {format_ts(verdict['duration'])}"
+                    f"{audio_note}"
                 )
                 
                 tg_res = tg_send_video(
@@ -582,6 +604,8 @@ def process_one(mkv_path: Path, sid: str) -> bool:
                         "message_id": tg_res["message_id"],
                         "size": seg_size,
                         "duration": round(verdict["duration"], 1),
+                        "has_audio": verdict.get("has_audio", False),
+                        "start_time": round(seg_start, 1),
                     }
                 else:
                     log(f"  🔄 [{seg_key}] ✗ Retry failed: {tg_res['error']}")
