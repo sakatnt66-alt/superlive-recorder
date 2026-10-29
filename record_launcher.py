@@ -1,64 +1,113 @@
 #!/usr/bin/env python3
 """
-SuperLive Recorder - Launcher with Pre-flight Validation
-ENFORCED: 3600s limit, stop signal, file preservation, recovery muxing
+record_launcher.py — SuperLive Recorder Launcher
+Handles pre-flight validation, recording with timeout, post-processing recovery
 """
+
 import asyncio
 import json
 import os
 import sys
-import shutil
-import glob
-import subprocess
-import threading
+import time
 import urllib.request
 import urllib.error
+import re
+import glob
+import shutil
+import threading
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-import re
+
 from superlive_discovery import SuperLiveDiscovery
 
-WORKER_API_URL = os.environ.get("WORKER_API_URL", "")
-AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "")
+# Configuration
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+WORKER_API_URL = os.environ.get("WORKER_API_URL", "").strip()
+AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-RECORDINGS_DIR = Path("recordings")
-TEMP_DIR = RECORDINGS_DIR / "_temp"
+
+# User-Agent to avoid Cloudflare WAF blocking GitHub Actions
+USER_AGENT = "SuperLive-AutoMonitor/1.0 (GitHub Actions; +https://github.com/sakatnt66-alt/superlive-recorder)"
+
+# Debug: Print configuration status
+print(f"[DEBUG] WORKER_API_URL: {'SET' if WORKER_API_URL else 'MISSING'} (length={len(WORKER_API_URL)})")
+print(f"[DEBUG] AUTO_API_TOKEN: {'SET' if AUTO_API_TOKEN else 'MISSING'} (length={len(AUTO_API_TOKEN)})")
+
+# Remove trailing slash from WORKER_API_URL if present
+if WORKER_API_URL and WORKER_API_URL.endswith('/'):
+    WORKER_API_URL = WORKER_API_URL[:-1]
+
+WATCHLIST_FILE = Path("data/watchlist.json")  # Fallback only
+MAX_CONCURRENT = 4
+
+RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "recordings"))
+TEMP_DIR = Path(os.environ.get("TEMP_DIR", "recordings/_temp"))
 PRESERVED_DIR = RECORDINGS_DIR / "_preserved"
 
-# ═══════════════════════════════════════════════════════════
-# RECORDING TIME LIMIT — exactly 1 hour (3600 seconds)
-# ═══════════════════════════════════════════════════════════
 RECORDING_MAX_SECONDS = int(os.environ.get("RECORDING_MAX_SECONDS", "3600"))
-STOP_CHECK_INTERVAL = 10
+STOP_CHECK_INTERVAL = int(os.environ.get("STOP_CHECK_INTERVAL", "30"))
 
+def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
+    """Check if stream_id is valid (different from user_id, 9+ digits, numeric)."""
+    stream_id_str = str(stream_id)
+    user_id_str = str(user_id)
+    
+    if stream_id_str == user_id_str:
+        return False
+    if len(stream_id_str) < 9:
+        return False
+    if not stream_id_str.isdigit():
+        return False
+    return True
 
-def sanitize_filename(name: str) -> str:
-    if not name:
-        return "unknown"
-    name = re.sub(r'[<>:"/\\|?*]', '', name)
-    name = re.sub(r'\s+', '_', name).strip('_')
-    if len(name) > 80:
-        name = name[:80]
-    return name or "unknown"
+def is_valid_profile_id(profile_id: str) -> bool:
+    """Check if profile_id is valid (numeric, not a hash)."""
+    if not profile_id:
+        return False
+    profile_id_str = str(profile_id)
+    if not profile_id_str.isdigit():
+        return False
+    if len(profile_id_str) < 5 or len(profile_id_str) > 15:
+        return False
+    return True
 
+def read_error_body(error):
+    """Safely read HTTPError response body for debugging."""
+    try:
+        body = error.read().decode('utf-8', errors='replace')
+        return body[:500] if body else '(empty)'
+    except Exception:
+        return '(unreadable)'
 
 def send_telegram_message(text: str, parse_mode: str = "HTML"):
+    """Send message to Telegram"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = json.dumps({
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": parse_mode
     }).encode('utf-8')
-    req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'})
+    
+    req = urllib.request.Request(url, data=payload, headers={
+        'Content-Type': 'application/json',
+        'User-Agent': USER_AGENT,
+        'Accept': 'application/json'
+    })
+    
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
-            pass
+            if response.status != 200:
+                print(f"[TELEGRAM] Failed to send message: {response.status}")
+    except urllib.error.HTTPError as e:
+        print(f"[TELEGRAM] HTTP Error {e.code}: {e.reason}")
     except Exception as e:
-        print(f"[TELEGRAM] Error: {e}")
-
+        print(f"[TELEGRAM] Error sending message: {e}")
 
 def update_worker_state(stream_id: str, state: dict):
     if not WORKER_API_URL or not AUTO_API_TOKEN:
@@ -74,7 +123,6 @@ def update_worker_state(stream_id: str, state: dict):
             pass
     except Exception as e:
         print(f"[WORKER] Error updating state: {e}")
-
 
 def cleanup_failed_recording(stream_id: str, reason: str):
     """Immediately remove failed recording from active list in Worker KV."""
@@ -92,7 +140,6 @@ def cleanup_failed_recording(stream_id: str, reason: str):
     except Exception as e:
         print(f"[WORKER] Error cleaning up {stream_id}: {e}")
 
-
 def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
     stream_id_str = str(stream_id)
     user_id_str = str(user_id)
@@ -104,6 +151,28 @@ def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
         return False
     return True
 
+def sanitize_filename(name: str) -> str:
+    """Sanitize a string to be used as a filename."""
+    if not name:
+        return "unknown"
+    # Remove or replace invalid characters
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
+    # Remove leading/trailing dots and spaces
+    safe = safe.strip('. ')
+    # Limit length
+    return safe[:100] if safe else "unknown"
+
+# ═══════════════════════════════════════════════════════════
+# FIX: Kill orphan ffmpeg/yt-dlp processes to ensure files are closed
+# ═══════════════════════════════════════════════════════════
+def kill_orphan_processes():
+    print("[LAUNCHER] Killing orphan ffmpeg/yt-dlp processes to ensure files are closed...")
+    try:
+        subprocess.run("pkill -f 'ffmpeg'", shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        subprocess.run("pkill -f 'yt-dlp'", shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        subprocess.run("pkill -f 'record_once'", shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"[LAUNCHER] Kill error: {e}")
 
 # ═══════════════════════════════════════════════════════════
 # FILE PRESERVER — watches MKV, H264, WEBM in background thread
@@ -159,7 +228,6 @@ class FilePreserverThread:
                         pass
                     except Exception as e:
                         print(f"[PRESERVE] ✗ copy failed for {f.name}: {e}")
-
 
 # ═══════════════════════════════════════════════════════════
 # RECOVERY: Mux raw video+audio into MKV after timeout/stop
@@ -270,7 +338,6 @@ def recover_and_mux_recording() -> list:
     print(f"[RECOVERY] Result: {len(created_mkvs)} MKV file(s) available")
     return created_mkvs
 
-
 # ═══════════════════════════════════════════════════════════
 # STOP SIGNAL CHECKER
 # ═══════════════════════════════════════════════════════════
@@ -297,7 +364,6 @@ async def stop_signal_checker(stream_id: str, stop_event: asyncio.Event):
         except Exception as e:
             print(f"[STOP-CHECK] Poll error: {e}")
         await asyncio.sleep(STOP_CHECK_INTERVAL)
-
 
 async def verify_stream_is_accessible(stream_url: str) -> dict:
     try:
@@ -361,7 +427,6 @@ async def verify_stream_is_accessible(stream_url: str) -> dict:
             return {"accessible": False, "error": "No playable video"}
     except Exception as e:
         return {"accessible": False, "error": str(e)}
-
 
 async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
     print(f"[PRE-FLIGHT] Starting validation for stream {stream_id}")
@@ -489,7 +554,6 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
             "actual_stream_id": stream_id, "error": str(e)
         }
 
-
 def get_latest_files(before_time: float) -> list:
     files = []
     for ext in ['*.mkv', '*.webm', '*.mp4']:
@@ -501,7 +565,6 @@ def get_latest_files(before_time: float) -> list:
                 except:
                     pass
     return files
-
 
 def rename_files_by_username(files: list, username: str) -> list:
     if not files or not username or username.startswith("user_"):
@@ -545,7 +608,6 @@ def rename_files_by_username(files: list, username: str) -> list:
         except Exception as e:
             print(f"[RENAME] ✗ Failed to rename {old_path}: {e}")
     return renamed
-
 
 async def main():
     stream_url = os.environ.get("RECORD_URL")
@@ -679,6 +741,7 @@ async def main():
             recording_stopped_manually = True
             print(f"\n[LAUNCHER] 🛑 STOP SIGNAL — cancelling recording")
             recording_task.cancel()
+            kill_orphan_processes()
             try:
                 await asyncio.wait_for(asyncio.shield(recording_task), timeout=20)
             except (asyncio.CancelledError, asyncio.TimeoutError):
@@ -751,6 +814,7 @@ async def main():
             print(f"\n[LAUNCHER] ⏰ Recording reached {RECORDING_MAX_SECONDS}s — STOPPING NOW")
             print(f"[LAUNCHER] Actual elapsed: {int(elapsed)}s")
             recording_task.cancel()
+            kill_orphan_processes()
             stop_waiter.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(recording_task), timeout=20)
@@ -844,7 +908,9 @@ async def main():
         await asyncio.sleep(2)
         all_current_files = set()
         for ext in ['*.mkv', '*.webm', '*.mp4']:
-            for pattern in [str(RECORDINGS_DIR / ext), str(TEMP_DIR / ext), str(PRESERVED_DIR / ext)]:
+            # FIX: Exclude PRESERVED_DIR from renaming!
+            # Files in _preserved must keep original names for postprocess and contact sheet to find them.
+            for pattern in [str(RECORDINGS_DIR / ext), str(TEMP_DIR / ext)]:
                 all_current_files.update(glob.glob(pattern))
         new_files = list(all_current_files - existing_files)
         if new_files:
@@ -878,7 +944,6 @@ async def main():
             print(f"[PRESERVE]   • {p.name} ({p.stat().st_size / 1024 / 1024:.1f} MB)")
     else:
         print("\n[PRESERVE] ⚠️ No preserved MKV files")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
