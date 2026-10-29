@@ -3,12 +3,10 @@
 postprocess_recording.py — MKV-to-MP4 conversion, segmentation, delivery.
 
 KEY FIXES in this version:
-  1. Segment sending loop NEVER stops early — all segments are attempted
-  2. Each segment is tracked independently with retry capability
-  3. Oversized segments are re-split instead of skipped
-  4. Audio verification before every send
-  5. Rate limiting between Telegram sends to avoid 429 errors
-  6. Audio re-encoded to AAC for MP4 compatibility (fixes silent segments)
+  1. Concatenates _av_part_*.mkv files to recover the full recording
+  2. Verifies total coverage duration matches source duration
+  3. Audio re-encoded to AAC for MP4 compatibility
+  4. Segment sending loop NEVER stops early
 """
 
 import json
@@ -20,6 +18,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,11 +33,9 @@ STREAM_NAME        = os.environ.get("STREAM_NAME", "")
 
 MAX_SEGMENT_BYTES  = 45 * 1024 * 1024
 TG_HARD_LIMIT      = 50 * 1024 * 1024
-MAX_TG_PHOTO_BYTES = 10 * 1024 * 1024
 MARKER_SUFFIX      = ".postprocessed"
 MP4_VIDEO_OK       = {"h264", "hevc", "mpeg4", "mjpeg"}
-MP4_AUDIO_OK       = {"aac", "mp3", "ac3", "eac3", "alac", "mp2", "opus"}
-SEND_DELAY_SECONDS = 3  # Delay between Telegram sends to avoid rate limits
+SEND_DELAY_SECONDS = 3
 MAX_RETRIES        = 3
 
 def log(msg: str) -> None:
@@ -94,10 +91,6 @@ def format_ts(seconds: float) -> str:
 def safe_id(sid: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(sid))
 
-def has_audio_stream(path: str) -> bool:
-    r = run(f'ffprobe -v quiet -select_streams a -show_entries stream=codec_type -of csv=p=0 "{path}"', 30)
-    return bool(r and r.returncode == 0 and 'audio' in r.stdout)
-
 # ═══════════════════════════════════════════════════════════
 # STATE
 # ═══════════════════════════════════════════════════════════
@@ -120,6 +113,46 @@ def save_state(sid: str, st: dict) -> None:
     st["updated_at"] = datetime.now(timezone.utc).isoformat()
     tmp.write_text(json.dumps(st, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(p)
+
+# ═══════════════════════════════════════════════════════════
+# CONCATENATION FIX: Merge _av_part_*.mkv files
+# ═══════════════════════════════════════════════════════════
+def find_and_concatenate_parts(sid: str) -> str:
+    parts = []
+    for d in [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]:
+        if not d.exists(): continue
+        for f in d.glob("*_av_part_*.mkv"):
+            parts.append(f)
+    
+    if not parts:
+        return None
+        
+    def get_part_num(f):
+        m = re.search(r'_av_part_(\d+)', f.name)
+        return int(m.group(1)) if m else 0
+    parts.sort(key=get_part_num)
+    
+    log(f"🔗 Found {len(parts)} parts to concatenate")
+    
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    concat_file = TEMP_DIR / f"concat_{safe_id(sid)}.txt"
+    with open(concat_file, "w", encoding="utf-8") as f:
+        for p in parts:
+            f.write(f"file '{p}'\n")
+            
+    out_file = TEMP_DIR / f"concatenated_{safe_id(sid)}.mkv"
+    if out_file.exists() and out_file.stat().st_size > 0:
+        log(f"✓ Concatenated file already exists: {out_file.name}")
+        return str(out_file)
+        
+    cmd = f'ffmpeg -y -f concat -safe 0 -i "{concat_file}" -c copy "{out_file}"'
+    r = run(cmd, timeout=1200)
+    if r and r.returncode == 0 and out_file.exists() and out_file.stat().st_size > 0:
+        log(f"✓ Concatenated {len(parts)} parts into {out_file.name} ({human_size(out_file.stat().st_size)})")
+        return str(out_file)
+    else:
+        log(f"✗ Concatenation failed: {(r.stderr or '')[-300:] if r else 'timeout'}")
+        return None
 
 # ═══════════════════════════════════════════════════════════
 # SOURCE DISCOVERY
@@ -147,12 +180,10 @@ def discover_mkv_files() -> list:
         if info is None:
             continue
         vc, ac = get_codecs(info)
-        if vc and ac:
+        if vc:
             verified.append(f)
             log(f"✓ Source: {f.name} ({human_size(size)}, v={vc}, a={ac})")
             break
-        elif vc:
-            log(f"Skipping video-only: {f.name}")
     return verified
 
 # ═══════════════════════════════════════════════════════════
@@ -172,7 +203,7 @@ def split_to_segments(src: str, outdir: str, seg_dur: float) -> list:
     pattern = os.path.join(outdir, "segment_%03d.mp4")
     cmd = (
         f'ffmpeg -y -i "{src}" '
-        f'-c:v copy -c:a aac -b:a 128k '  # FIX: Re-encode audio to AAC for MP4 compatibility
+        f'-c:v copy -c:a aac -b:a 128k '
         f'-f segment -segment_time {seg_dur:.1f} '
         f'-reset_timestamps 1 -movflags +faststart '
         f'"{pattern}"'
@@ -198,7 +229,7 @@ def resplit_oversized(seg_path: str, outdir: str, idx: int) -> list:
     pattern = os.path.join(outdir, f"resplit_{idx:03d}_%03d.mp4")
     cmd = (
         f'ffmpeg -y -i "{seg_path}" '
-        f'-c:v copy -c:a aac -b:a 128k '  # FIX: Re-encode audio to AAC
+        f'-c:v copy -c:a aac -b:a 128k '
         f'-f segment -segment_time {target_dur:.1f} '
         f'-reset_timestamps 1 -movflags +faststart '
         f'"{pattern}"'
@@ -233,7 +264,7 @@ def verify_segment(path: str) -> dict:
     return result
 
 # ═══════════════════════════════════════════════════════════
-# TELEGRAM SENDING with retry
+# TELEGRAM SENDING
 # ═══════════════════════════════════════════════════════════
 def tg_send_video(video_path: str, caption: str, duration: int, width: int, height: int) -> dict:
     result = {"ok": False, "message_id": None, "error": ""}
@@ -349,7 +380,6 @@ def process_one(mkv_path: Path, sid: str) -> bool:
             save_state(sid, st)
             return False
 
-        # Handle oversized segments
         final_segments = []
         for idx, seg in enumerate(segments):
             if os.path.getsize(seg) > MAX_SEGMENT_BYTES:
@@ -359,7 +389,6 @@ def process_one(mkv_path: Path, sid: str) -> bool:
                     if os.path.getsize(sub) <= MAX_SEGMENT_BYTES:
                         final_segments.append(sub)
                     else:
-                        log(f"✗ Sub-segment still oversized: {human_size(os.path.getsize(sub))}")
                         st["errors"].append(f"oversize:{os.path.basename(sub)}")
             else:
                 final_segments.append(seg)
@@ -377,21 +406,16 @@ def process_one(mkv_path: Path, sid: str) -> bool:
         sent_count = 0
         failed_count = 0
 
-        # ═══════════════════════════════════════════════════
-        # SEND ALL SEGMENTS — loop NEVER stops early
-        # ═══════════════════════════════════════════════════
         for idx, seg_path in enumerate(final_segments):
             seg_name = os.path.basename(seg_path)
             seg_key = f"seg_{idx:04d}"
 
-            # Skip already-sent segments (idempotency)
             prev = st["segments"].get(seg_key, {})
             if prev.get("sent") and prev.get("message_id"):
                 log(f"  [{idx+1}/{total}] Already sent (msg={prev['message_id']}) — skip")
                 sent_count += 1
                 continue
 
-            # Verify segment
             verdict = verify_segment(seg_path)
             if not verdict["ok"]:
                 log(f"  [{idx+1}/{total}] ✗ REJECTED: {verdict['reason']}")
@@ -405,7 +429,6 @@ def process_one(mkv_path: Path, sid: str) -> bool:
             log(f"  [{idx+1}/{total}] {seg_name}: {human_size(seg_size)}, {verdict['duration']:.1f}s ✓")
 
             if seg_size > TG_HARD_LIMIT:
-                log(f"  [{idx+1}/{total}] ✗ Exceeds Telegram limit — cannot send")
                 st["segments"][seg_key] = {"sent": False, "error": "exceeds_tg_limit"}
                 failed_count += 1
                 save_state(sid, st)
@@ -418,7 +441,6 @@ def process_one(mkv_path: Path, sid: str) -> bool:
                 f"⏱️ {format_ts(verdict['duration'])}"
             )
 
-            # Send with retry
             tg_res = tg_send_video(
                 seg_path, caption,
                 int(verdict["duration"]),
@@ -435,21 +457,30 @@ def process_one(mkv_path: Path, sid: str) -> bool:
                     "duration": round(verdict["duration"], 1),
                 }
             else:
-                log(f"  [{idx+1}/{total}] ✗ Send failed: {tg_res['error']} — will NOT stop, continuing...")
+                log(f"  [{idx+1}/{total}] ✗ Send failed: {tg_res['error']}")
                 st["segments"][seg_key] = {"sent": False, "error": tg_res["error"]}
                 st["errors"].append(f"{seg_name}:{tg_res['error']}")
                 failed_count += 1
 
             save_state(sid, st)
 
-            # Rate limit delay between sends
             if idx < total - 1:
                 time.sleep(SEND_DELAY_SECONDS)
 
-    # Final status
+    # Coverage Check
+    total_sent_duration = sum(seg.get("duration", 0) for seg in st["segments"].values() if seg.get("sent"))
+    coverage_ratio = total_sent_duration / duration if duration > 0 else 0
+    
     log(f"\n{'=' * 60}")
     log(f"RESULT: {sent_count}/{total} sent, {failed_count} failed")
+    log(f"COVERAGE: {total_sent_duration:.1f}s / {duration:.1f}s ({coverage_ratio*100:.0f}%)")
     log(f"{'=' * 60}")
+
+    if coverage_ratio < 0.90 and sent_count > 0:
+        log("⚠️ COVERAGE INCOMPLETE: Source preserved for retry.")
+        st["state"] = "PARTIAL_COVERAGE"
+        save_state(sid, st)
+        return False
 
     if sent_count > 0 and failed_count == 0:
         st["state"] = "SENT"
@@ -460,12 +491,10 @@ def process_one(mkv_path: Path, sid: str) -> bool:
     elif sent_count > 0:
         st["state"] = "PARTIAL"
         save_state(sid, st)
-        log(f"⚠️ PARTIAL: {sent_count}/{total} sent. Source preserved for retry.")
         return False
     else:
         st["state"] = "FAILED"
         save_state(sid, st)
-        log("✗ No segments sent. Source preserved.")
         return False
 
 def main():
@@ -475,9 +504,15 @@ def main():
     log("=" * 60)
 
     mkv_files = discover_mkv_files()
+    
     if not mkv_files:
-        log("No valid MKV source found")
-        return
+        log("No complete MKV found. Checking for parts...")
+        concat_path = find_and_concatenate_parts(STREAM_ID)
+        if concat_path:
+            mkv_files = [Path(concat_path)]
+        else:
+            log("No valid MKV source or parts found")
+            return
 
     success = fail = 0
     for mkv in mkv_files:
