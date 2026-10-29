@@ -8,6 +8,7 @@ KEY FIXES in this version:
   3. Oversized segments are re-split instead of skipped
   4. Audio verification before every send
   5. Rate limiting between Telegram sends to avoid 429 errors
+  6. Audio re-encoded to AAC for MP4 compatibility (fixes silent segments)
 """
 
 import json
@@ -40,10 +41,8 @@ MP4_AUDIO_OK       = {"aac", "mp3", "ac3", "eac3", "alac", "mp2", "opus"}
 SEND_DELAY_SECONDS = 3  # Delay between Telegram sends to avoid rate limits
 MAX_RETRIES        = 3
 
-
 def log(msg: str) -> None:
     print(f"[POSTPROC] {msg}", flush=True)
-
 
 def run(cmd: str, timeout: int = 900):
     try:
@@ -52,7 +51,6 @@ def run(cmd: str, timeout: int = 900):
         return None
     except Exception:
         return None
-
 
 def ffprobe_json(path: str):
     r = run(f'ffprobe -v quiet -print_format json -show_format -show_streams "{path}"', 60)
@@ -63,13 +61,11 @@ def ffprobe_json(path: str):
             pass
     return None
 
-
 def get_duration(info: dict) -> float:
     try:
         return float(info.get("format", {}).get("duration", 0))
     except (TypeError, ValueError):
         return 0.0
-
 
 def get_codecs(info: dict):
     vc = ac = None
@@ -80,33 +76,27 @@ def get_codecs(info: dict):
         elif ct == "audio" and ac is None: ac = cn
     return vc, ac
 
-
 def get_resolution(info: dict):
     for s in info.get("streams", []):
         if s.get("codec_type") == "video":
             return s.get("width", 0), s.get("height", 0)
     return 0, 0
 
-
 def human_size(n: int) -> str:
     mb = n / (1024 * 1024)
     return f"{mb / 1024:.2f} GB" if mb >= 1024 else f"{mb:.1f} MB"
-
 
 def format_ts(seconds: float) -> str:
     h, rem = divmod(int(seconds), 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-
 def safe_id(sid: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(sid))
-
 
 def has_audio_stream(path: str) -> bool:
     r = run(f'ffprobe -v quiet -select_streams a -show_entries stream=codec_type -of csv=p=0 "{path}"', 30)
     return bool(r and r.returncode == 0 and 'audio' in r.stdout)
-
 
 # ═══════════════════════════════════════════════════════════
 # STATE
@@ -114,7 +104,6 @@ def has_audio_stream(path: str) -> bool:
 def state_path(sid: str) -> Path:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     return STATE_DIR / f"{safe_id(sid)}.json"
-
 
 def load_state(sid: str) -> dict:
     p = state_path(sid)
@@ -125,14 +114,12 @@ def load_state(sid: str) -> dict:
             pass
     return {"stream_id": sid, "state": "DISCOVERED", "segments": {}, "errors": []}
 
-
 def save_state(sid: str, st: dict) -> None:
     p = state_path(sid)
     tmp = p.with_suffix(".tmp")
     st["updated_at"] = datetime.now(timezone.utc).isoformat()
     tmp.write_text(json.dumps(st, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(p)
-
 
 # ═══════════════════════════════════════════════════════════
 # SOURCE DISCOVERY
@@ -168,7 +155,6 @@ def discover_mkv_files() -> list:
             log(f"Skipping video-only: {f.name}")
     return verified
 
-
 # ═══════════════════════════════════════════════════════════
 # SEGMENTATION
 # ═══════════════════════════════════════════════════════════
@@ -182,12 +168,11 @@ def calc_segment_duration(file_size: int, duration: float) -> float:
     safe_dur = max_dur * 0.75
     return max(safe_dur, 10.0)
 
-
 def split_to_segments(src: str, outdir: str, seg_dur: float) -> list:
     pattern = os.path.join(outdir, "segment_%03d.mp4")
     cmd = (
         f'ffmpeg -y -i "{src}" '
-        f'-c:v copy -c:a copy '
+        f'-c:v copy -c:a aac -b:a 128k '  # FIX: Re-encode audio to AAC for MP4 compatibility
         f'-f segment -segment_time {seg_dur:.1f} '
         f'-reset_timestamps 1 -movflags +faststart '
         f'"{pattern}"'
@@ -198,7 +183,6 @@ def split_to_segments(src: str, outdir: str, seg_dur: float) -> list:
         log(f"Split failed: {(r.stderr or '')[-300:] if r else 'timeout'}")
         return []
     return [str(s) for s in sorted(Path(outdir).glob("segment_*.mp4")) if s.stat().st_size > 0]
-
 
 def resplit_oversized(seg_path: str, outdir: str, idx: int) -> list:
     size = os.path.getsize(seg_path)
@@ -214,7 +198,7 @@ def resplit_oversized(seg_path: str, outdir: str, idx: int) -> list:
     pattern = os.path.join(outdir, f"resplit_{idx:03d}_%03d.mp4")
     cmd = (
         f'ffmpeg -y -i "{seg_path}" '
-        f'-c:v copy -c:a copy '
+        f'-c:v copy -c:a aac -b:a 128k '  # FIX: Re-encode audio to AAC
         f'-f segment -segment_time {target_dur:.1f} '
         f'-reset_timestamps 1 -movflags +faststart '
         f'"{pattern}"'
@@ -226,7 +210,6 @@ def resplit_oversized(seg_path: str, outdir: str, idx: int) -> list:
             log(f"Re-split produced {len(subs)} sub-segments")
             return subs
     return [seg_path]
-
 
 def verify_segment(path: str) -> dict:
     result = {"ok": False, "reason": "", "duration": 0.0, "width": 0, "height": 0}
@@ -248,7 +231,6 @@ def verify_segment(path: str) -> dict:
     w, h = get_resolution(info)
     result.update({"ok": True, "reason": "ok", "duration": dur, "width": w, "height": h})
     return result
-
 
 # ═══════════════════════════════════════════════════════════
 # TELEGRAM SENDING with retry
@@ -308,7 +290,6 @@ def tg_send_video(video_path: str, caption: str, duration: int, width: int, heig
             log(f"Retrying in {wait}s...")
             time.sleep(wait)
     return result
-
 
 # ═══════════════════════════════════════════════════════════
 # MAIN PIPELINE
@@ -487,7 +468,6 @@ def process_one(mkv_path: Path, sid: str) -> bool:
         log("✗ No segments sent. Source preserved.")
         return False
 
-
 def main():
     log("=" * 60)
     log("Post-processing pipeline (RESCUE + PRIMARY)")
@@ -514,7 +494,6 @@ def main():
 
     log(f"Final: {success} complete, {fail} failed")
     log("Source files NEVER deleted by this pipeline.")
-
 
 if __name__ == "__main__":
     main()
