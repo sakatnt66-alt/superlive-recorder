@@ -1,4 +1,4 @@
-// worker.js - Version 14.0 (Fix stuck recordings, separate capture from processing state)
+// worker.js - Version 15.0 (Complete lifecycle management, auto-cleanup, status fix)
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -23,7 +23,10 @@ export default {
 
 const WATCHLIST_KEY = 'watchlist:all';
 const RECORDINGS_KEY = 'recordings:active';
-const MAX_AGE_MS = 75 * 60 * 1000; // 75 minutes max age for active recording (60 min record + 15 min postproc)
+// Max age for a recording to be considered "active" (recording phase)
+const MAX_RECORDING_AGE_MS = 75 * 60 * 1000; // 75 minutes
+// Max age for a recording to be kept in the list before auto-cleanup
+const MAX_RETENTION_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 function isAuthorized(request, env) {
   if (!env.AUTO_API_TOKEN) return true;
@@ -83,13 +86,25 @@ async function saveRecordings(env, recordingsArray) {
   }
 }
 
-// Helper: Filter out stuck recordings (> 75 min old)
-function getActiveRecordingsList(recordings) {
+// Helper: Filter recordings that are ACTUALLY recording (not stuck)
+function getActiveRecordingList(recordings) {
     const now = new Date();
     return (Array.isArray(recordings) ? recordings : []).filter(r => {
+        // Only 'recording' status counts as active
         if (r.status !== 'recording') return false;
+        // Check if recording is stuck (older than max age)
         const started = new Date(r.started_at);
-        return (now - started) <= MAX_AGE_MS;
+        return (now - started) <= MAX_RECORDING_AGE_MS;
+    });
+}
+
+// Helper: Clean up old recordings (older than 24 hours)
+function cleanupOldRecordings(recordings) {
+    const now = new Date();
+    return (Array.isArray(recordings) ? recordings : []).filter(r => {
+        const started = new Date(r.started_at);
+        // Keep recordings younger than 24 hours
+        return (now - started) <= MAX_RETENTION_AGE_MS;
     });
 }
 
@@ -103,7 +118,7 @@ async function handleActiveRecordings(request, env) {
   if (!isAuthorized(request, env)) return unauthorizedResponse();
   try {
     const data = await getRecordings(env);
-    const active = getActiveRecordingsList(data.recordings);
+    const active = getActiveRecordingList(data.recordings);
     return jsonResponse({ active_count: active.length, max_concurrent: 5, recordings: active });
   } catch (error) { return jsonResponse({ error: error.message }, 500); }
 }
@@ -132,7 +147,7 @@ async function handleAutoTrigger(request, url, env) {
     }
     const recData = await getRecordings(env);
     const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
-    const active = getActiveRecordingsList(recordings);
+    const active = getActiveRecordingList(recordings);
     
     if (active.some(r => String(r.stream_id) === streamId)) {
       return jsonResponse({ success: false, error: 'already_recording', stream_id: streamId, user_id: userId }, 409);
@@ -174,10 +189,7 @@ async function handleUpdateState(request, url, env) {
     const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
     const idx = recordings.findIndex(r => String(r.stream_id) === streamId);
     
-    // FIX: Allow status transitions that free the recording slot
     if (idx >= 0) {
-        // When capture ends, transition from 'recording' to 'processing' or 'completed'
-        // This frees the slot for new recordings while keeping the entry for post-processing
         const oldStatus = recordings[idx].status;
         const newStatus = body.status || oldStatus;
         
@@ -185,6 +197,11 @@ async function handleUpdateState(request, url, env) {
         recordings[idx] = Object.assign({}, recordings[idx], body);
         
         console.log(`[UPDATE-STATE] ${streamId}: ${oldStatus} → ${newStatus}`);
+        
+        // If status changed to 'completed', 'failed', or 'stopped', the slot is freed
+        if (['completed', 'failed', 'stopped'].includes(newStatus)) {
+            console.log(`[UPDATE-STATE] ${streamId}: Slot freed for new recordings`);
+        }
     } else {
         recordings.push(Object.assign({ stream_id: streamId }, body));
     }
@@ -220,7 +237,7 @@ async function handleCleanup(env) {
   try {
     const recData = await getRecordings(env);
     const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
-    const active = getActiveRecordingsList(recordings);
+    const active = getActiveRecordingList(recordings);
     await saveRecordings(env, active);
     return jsonResponse({ success: true, deleted_count: recordings.length - active.length });
   } catch (error) { return jsonResponse({ error: error.message }, 500); }
@@ -234,7 +251,7 @@ async function handleCheckStop(request, url, env) {
     let should_stop = false, status = 'not_found';
     if (recording) {
       status = recording.status;
-      // FIX: Stop signal should work for 'recording' status, but NOT for 'processing'
+      // FIX: Stop signal should work for 'recording' status, but NOT for 'processing' or 'completed'
       if (['stopped', 'failed', 'completed'].includes(recording.status)) should_stop = true;
     }
     return jsonResponse({ stream_id: streamId, status, should_stop });
@@ -379,7 +396,7 @@ async function handleRecord(chatId, streamUrl, streamId, env) {
   try {
     const recData = await getRecordings(env);
     const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
-    const active = getActiveRecordingsList(recordings);
+    const active = getActiveRecordingList(recordings);
     if (active.some(r => String(r.stream_id) === streamId)) {
       await sendTelegramMessage(env, chatId, '⚠️ هذا البث يُسجّل حالياً.', { parse_mode: 'HTML' });
       return;
@@ -418,7 +435,7 @@ async function handleStatus(chatId, env) {
   const recData = await getRecordings(env);
   const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
   // FIX: Only show recordings with status='recording' as active
-  const active = getActiveRecordingsList(recordings);
+  const active = getActiveRecordingList(recordings);
   if (active.length === 0) {
     await sendTelegramMessage(env, chatId, '📭 لا توجد تسجيلات نشطة.', { parse_mode: 'HTML' });
     return;
@@ -470,7 +487,7 @@ async function handleStop(chatId, streamId, env) {
 async function showStopMenu(chatId, env) {
   const recData = await getRecordings(env);
   const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
-  const active = getActiveRecordingsList(recordings);
+  const active = getActiveRecordingList(recordings);
   if (active.length === 0) {
     await sendTelegramMessage(env, chatId, '📭 لا توجد تسجيلات نشطة لإيقافها.', { parse_mode: 'HTML' });
     return;
@@ -484,7 +501,7 @@ async function handleCleanupConfirm(chatId, env) {
   try {
     const recData = await getRecordings(env);
     const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
-    const active = getActiveRecordingsList(recordings);
+    const active = getActiveRecordingList(recordings);
     const inactive = recordings.length - active.length;
     if (inactive === 0) {
       await sendTelegramMessage(env, chatId, '✅ لا توجد تسجيلات منتهية لتنظيفها.', { parse_mode: 'HTML' });
@@ -516,7 +533,7 @@ async function handleCleanupExecute(chatId, env) {
   try {
     const recData = await getRecordings(env);
     const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
-    const active = getActiveRecordingsList(recordings);
+    const active = getActiveRecordingList(recordings);
     const deletedCount = recordings.length - active.length;
     await saveRecordings(env, active);
     await sendTelegramMessage(env, chatId,
@@ -588,7 +605,7 @@ async function sendMainMenu(chatId, env) {
   const wlData = await getWatchlist(env);
   const recData = await getRecordings(env);
   const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
-  const active = getActiveRecordingsList(recordings).length;
+  const active = getActiveRecordingList(recordings).length;
   const completed = recordings.filter(r => ['completed', 'stopped', 'failed', 'processing'].includes(r.status)).length;
   await sendTelegramMessage(env, chatId,
     '🎬 <b>SuperLive Recorder</b>\n\n' +
@@ -634,20 +651,17 @@ async function handleAutoMonitorCron(env) {
     const wlData = await getWatchlist(env);
     if (!wlData.watchlist || wlData.watchlist.length === 0) return;
     
-    // Cleanup stuck recordings (> 75 min old)
+    // Cleanup stuck recordings and old recordings
     const recData = await getRecordings(env);
     const recordings = Array.isArray(recData.recordings) ? recData.recordings : [];
-    const cleaned = getActiveRecordingsList(recordings);
     
-    // If there are stuck recordings, update KV to remove them
-    if (cleaned.length !== recordings.filter(r => r.status === 'recording').length) {
-        const allRecordings = Array.isArray(recData.recordings) ? recData.recordings : [];
-        const toSave = allRecordings.filter(r => {
-            if (r.status !== 'recording') return true;
-            return cleaned.some(c => c.stream_id === r.stream_id);
-        });
-        await saveRecordings(env, toSave);
-        console.log(`[AUTO-CRON] Cleaned up stuck recordings from KV`);
+    // Remove recordings older than 24 hours
+    const cleaned = cleanupOldRecordings(recordings);
+    
+    // If there are stuck recordings or old recordings, update KV
+    if (cleaned.length !== recordings.length) {
+        await saveRecordings(env, cleaned);
+        console.log(`[AUTO-CRON] Cleaned up ${recordings.length - cleaned.length} old recordings`);
     }
 
     await triggerGitHubDispatch(env, 'auto_monitor', { source: 'cloudflare_cron' });
