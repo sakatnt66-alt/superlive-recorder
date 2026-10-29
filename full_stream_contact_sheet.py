@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-full_stream_contact_sheet.py — Full Stream Contact Sheet Generator (Portrait)
+full_stream_contact_sheet.py — Full Stream Contact Sheet Generator (Portrait 3x4)
+
 Creates EXACTLY ONE portrait JPG containing 12 frames taken from the
 ORIGINAL full recording, distributed across its entire duration.
 
@@ -191,13 +192,17 @@ def find_source_mkv():
     return main_file
 
 # ═══════════════════════════════════════════════════════════
-# TIMESTAMP CALCULATION — distributed across FULL duration
+# TIMESTAMP CALCULATION — smart distribution for any duration
 # ═══════════════════════════════════════════════════════════
 def calculate_timestamps(duration: float, count: int) -> list:
     if duration <= 0 or count <= 0:
         return []
+    
+    # For very short recordings (< 12 seconds), distribute evenly
     if duration < 12:
         return [duration * (i + 1) / (count + 1) for i in range(count)]
+    
+    # For normal recordings, use margin and even distribution
     margin = min(2.0, duration * 0.02)
     usable = max(duration - 2 * margin, 0.1)
     timestamps = []
@@ -208,32 +213,34 @@ def calculate_timestamps(duration: float, count: int) -> list:
     return timestamps
 
 # ═══════════════════════════════════════════════════════════
-# FRAME EXTRACTION with fallback recovery
+# FRAME EXTRACTION with fallback strategy
 # ═══════════════════════════════════════════════════════════
 def extract_frames(source: str, timestamps: list, tmpdir: str) -> list:
     frames = []
+    source_duration = get_duration(source)
+    
     for i, ts in enumerate(timestamps):
         out = os.path.join(tmpdir, f"frame_{i:03d}.jpg")
         label = format_timestamp(ts)
         
-        # Try fast seek first (input seeking)
+        # Strategy 1: Fast input seeking
         cmd = f'ffmpeg -y -ss {ts:.3f} -i "{source}" -frames:v 1 -q:v 2 "{out}"'
         r = run_cmd(cmd, timeout=30)
         if r and r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
             frames.append((out, ts, label))
             continue
-            
-        # Fallback: accurate seek (output seeking)
+        
+        # Strategy 2: Accurate output seeking
         cmd2 = f'ffmpeg -y -i "{source}" -ss {ts:.3f} -frames:v 1 -q:v 2 "{out}"'
         r2 = run_cmd(cmd2, timeout=60)
         if r2 and r2.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
             frames.append((out, ts, label))
             continue
         
-        # Recovery: try nearby timestamps (±5 seconds)
+        # Strategy 3: Try nearby timestamps (±5 seconds)
         found = False
         for offset in [-5.0, -3.0, -1.0, 1.0, 3.0, 5.0]:
-            nearby_ts = max(0, min(ts + offset, get_duration(source) - 0.1))
+            nearby_ts = max(0, min(ts + offset, source_duration - 0.1))
             cmd3 = f'ffmpeg -y -ss {nearby_ts:.3f} -i "{source}" -frames:v 1 -q:v 2 "{out}"'
             r3 = run_cmd(cmd3, timeout=30)
             if r3 and r3.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
@@ -244,6 +251,7 @@ def extract_frames(source: str, timestamps: list, tmpdir: str) -> list:
         
         if not found:
             log(f"Frame {i+1}/{len(timestamps)} at {label} FAILED after all attempts", "ERROR")
+    
     return frames
 
 # ═══════════════════════════════════════════════════════════
