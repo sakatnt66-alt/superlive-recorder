@@ -256,7 +256,7 @@ def resplit_oversized(seg_path: str, outdir: str, idx: int) -> list:
             return subs
     return [seg_path]
 
-def recreate_segment_with_audio(src: str, seg_path: str, start_time: float, duration: float, out_path: str) -> bool:
+def recreate_segment_with_audio(src: str, start_time: float, duration: float, out_path: str) -> bool:
     """Re-create a segment with proper audio encoding from the source."""
     log(f"  🔄 Recreating segment with audio: {start_time:.1f}s → {start_time + duration:.1f}s")
     cmd = (
@@ -468,15 +468,15 @@ def process_one(mkv_path: Path, sid: str) -> bool:
                 log(f"  [{idx+1}/{total}] ✗ REJECTED: {verdict['reason']}")
                 
                 # If audio issue, try to recreate the segment with proper audio
-                if "audio" in verdict["reason"] and "silent" in verdict["reason"]:
+                if "audio" in verdict["reason"]:
                     log(f"  [{idx+1}/{total}] 🔄 Attempting to recreate segment with audio...")
                     seg_info = ffprobe_json(seg_path)
                     if seg_info:
-                        seg_dur = get_duration(seg_info)
+                        seg_dur_actual = get_duration(seg_info)
                         # Estimate start time based on segment index
                         start_time = idx * seg_dur
                         recreated_path = os.path.join(segdir, f"recreated_{idx:03d}.mp4")
-                        if recreate_segment_with_audio(mkv, seg_path, start_time, seg_dur, recreated_path):
+                        if recreate_segment_with_audio(mkv, start_time, seg_dur_actual, recreated_path):
                             # Verify the recreated segment
                             verdict = verify_segment(recreated_path)
                             if verdict["ok"]:
@@ -595,18 +595,18 @@ def process_one(mkv_path: Path, sid: str) -> bool:
     
     log(f"\n{'=' * 60}")
     log(f"RESULT: {sent_count}/{total} sent, {failed_count} failed")
-    log(f"COVERAGE: {total_sent_duration:.1f}s / {duration:.1f}s ({coverage_ratio*100:.0f}%)")
+    log(f"COVERAGE: {total_sent_duration:.1f}s / {duration:.1f}s ({coverage_ratio*100:.1f}%)")
     log(f"{'=' * 60}")
 
-    # FIX: Don't declare success if coverage is incomplete
-    if coverage_ratio < 0.90 and sent_count > 0:
-        log("⚠️ COVERAGE INCOMPLETE: Source preserved for retry.")
+    # FIX: Don't declare success if coverage is incomplete (< 95%)
+    if coverage_ratio < 0.95 and sent_count > 0:
+        log("⚠️ COVERAGE INCOMPLETE (< 95%): Source preserved for retry.")
         st["state"] = "PARTIAL_COVERAGE"
         st["coverage_ratio"] = round(coverage_ratio, 3)
         save_state(sid, st)
         return False
 
-    if sent_count > 0 and failed_count == 0 and coverage_ratio >= 0.90:
+    if sent_count > 0 and failed_count == 0 and coverage_ratio >= 0.95:
         st["state"] = "SENT"
         with open(marker, "w") as f:
             json.dump({
