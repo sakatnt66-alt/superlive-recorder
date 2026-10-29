@@ -3,6 +3,8 @@
 full_stream_contact_sheet.py — Full Stream Contact Sheet Generator (Portrait)
 Creates EXACTLY ONE portrait JPG containing 12 frames taken from the
 ORIGINAL full recording, distributed across its entire duration.
+
+Grid: 3 columns x 4 rows = 12 frames (optimized for vertical video)
 """
 
 import json
@@ -27,25 +29,37 @@ STATE_DIR          = RECORDINGS_DIR / "_state"
 STREAM_ID          = os.environ.get("STREAM_ID", "unknown")
 STREAM_NAME        = os.environ.get("STREAM_NAME", "")
 
-GRID_COLS = 2
-GRID_ROWS = 6
+# ═══════════════════════════════════════════════════════════
+# PORTRAIT GRID CONFIGURATION — 3 cols x 4 rows = 12 frames
+# ═══════════════════════════════════════════════════════════
+GRID_COLS = int(os.environ.get("CS_COLS", "3"))
+GRID_ROWS = int(os.environ.get("CS_ROWS", "4"))
+
+# ENFORCE: exactly 12 frames
+if GRID_COLS * GRID_ROWS != 12:
+    GRID_COLS, GRID_ROWS = 3, 4
+
 TOTAL_FRAMES = GRID_COLS * GRID_ROWS
 
-CELL_W = 540
-CELL_H = 960
-GAP = 2
-MARGIN = 10
-JPEG_QUALITY = 90
-FONT_SIZE = 32
-BG_COLOR = "black"
+# Optimized for vertical video (9:16 aspect ratio)
+CELL_W       = int(os.environ.get("CS_CELL_W", "360"))
+CELL_H       = int(os.environ.get("CS_CELL_H", "640"))
+GAP          = int(os.environ.get("CS_GAP", "1"))  # Minimal gap for seamless look
+MARGIN       = int(os.environ.get("CS_MARGIN", "5"))
+JPEG_QUALITY = int(os.environ.get("CS_QUALITY", "92"))
+FONT_SIZE    = int(os.environ.get("CS_FONT_SIZE", "28"))
+BG_COLOR     = os.environ.get("CS_BG_COLOR", "black")
 MAX_TG_PHOTO = 10 * 1024 * 1024
 
-TEXT_H = FONT_SIZE + 10
+TEXT_H = FONT_SIZE + 8
 
 def log(msg: str, level: str = "INFO") -> None:
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[CONTACT_SHEET {ts}] [{level}] {msg}", flush=True)
 
+# ═══════════════════════════════════════════════════════════
+# STATE MANAGEMENT
+# ═══════════════════════════════════════════════════════════
 def state_file() -> Path:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(STREAM_ID))
@@ -67,6 +81,9 @@ def save_state(st: dict) -> None:
     tmp.write_text(json.dumps(st, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(p)
 
+# ═══════════════════════════════════════════════════════════
+# FFPROBE / FFMPEG HELPERS
+# ═══════════════════════════════════════════════════════════
 def run_cmd(cmd: str, timeout: int = 300):
     try:
         return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
@@ -101,8 +118,13 @@ def format_timestamp(seconds: float) -> str:
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
+# ═══════════════════════════════════════════════════════════
+# CONCATENATION: Merge _av_part_*.mkv files
+# ═══════════════════════════════════════════════════════════
 def find_and_concatenate_parts() -> str:
     parts = []
     for d in [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]:
@@ -137,6 +159,9 @@ def find_and_concatenate_parts() -> str:
         return str(out_file)
     return None
 
+# ═══════════════════════════════════════════════════════════
+# SOURCE DISCOVERY — excludes _part_ and _encoded
+# ═══════════════════════════════════════════════════════════
 def find_source_mkv():
     search_dirs = [PRESERVED_DIR, RECORDINGS_DIR, RECORDINGS_DIR / "_temp"]
     candidates = []
@@ -165,6 +190,9 @@ def find_source_mkv():
             
     return main_file
 
+# ═══════════════════════════════════════════════════════════
+# TIMESTAMP CALCULATION — distributed across FULL duration
+# ═══════════════════════════════════════════════════════════
 def calculate_timestamps(duration: float, count: int) -> list:
     if duration <= 0 or count <= 0:
         return []
@@ -179,28 +207,48 @@ def calculate_timestamps(duration: float, count: int) -> list:
         timestamps.append(ts)
     return timestamps
 
+# ═══════════════════════════════════════════════════════════
+# FRAME EXTRACTION with fallback recovery
+# ═══════════════════════════════════════════════════════════
 def extract_frames(source: str, timestamps: list, tmpdir: str) -> list:
     frames = []
     for i, ts in enumerate(timestamps):
         out = os.path.join(tmpdir, f"frame_{i:03d}.jpg")
         label = format_timestamp(ts)
         
-        # Try fast seek first
+        # Try fast seek first (input seeking)
         cmd = f'ffmpeg -y -ss {ts:.3f} -i "{source}" -frames:v 1 -q:v 2 "{out}"'
         r = run_cmd(cmd, timeout=30)
         if r and r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
             frames.append((out, ts, label))
             continue
             
-        # Fallback: accurate seek
+        # Fallback: accurate seek (output seeking)
         cmd2 = f'ffmpeg -y -i "{source}" -ss {ts:.3f} -frames:v 1 -q:v 2 "{out}"'
         r2 = run_cmd(cmd2, timeout=60)
         if r2 and r2.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
             frames.append((out, ts, label))
-        else:
-            log(f"Frame {i+1}/{len(timestamps)} at {label} FAILED", "ERROR")
+            continue
+        
+        # Recovery: try nearby timestamps (±5 seconds)
+        found = False
+        for offset in [-5.0, -3.0, -1.0, 1.0, 3.0, 5.0]:
+            nearby_ts = max(0, min(ts + offset, get_duration(source) - 0.1))
+            cmd3 = f'ffmpeg -y -ss {nearby_ts:.3f} -i "{source}" -frames:v 1 -q:v 2 "{out}"'
+            r3 = run_cmd(cmd3, timeout=30)
+            if r3 and r3.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+                frames.append((out, nearby_ts, label))
+                log(f"Frame {i+1}/{len(timestamps)} at {label} recovered from {nearby_ts:.1f}s", "WARN")
+                found = True
+                break
+        
+        if not found:
+            log(f"Frame {i+1}/{len(timestamps)} at {label} FAILED after all attempts", "ERROR")
     return frames
 
+# ═══════════════════════════════════════════════════════════
+# PORTRAIT GRID BUILDING (Pillow) — 3x4 with crop-to-fill
+# ═══════════════════════════════════════════════════════════
 def build_contact_sheet(frames: list, output_path: str) -> bool:
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -222,14 +270,18 @@ def build_contact_sheet(frames: list, output_path: str) -> bool:
     font = None
     for fp in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-               "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"]:
+               "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+               "/usr/share/fonts/truetype/freefont/FreeSans.ttf"]:
         try:
             font = ImageFont.truetype(fp, FONT_SIZE)
             break
         except (IOError, OSError):
             continue
     if font is None:
-        font = ImageFont.load_default()
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
 
     for i, (frame_path, ts, label) in enumerate(frames):
         row, col = divmod(i, GRID_COLS)
@@ -239,11 +291,26 @@ def build_contact_sheet(frames: list, output_path: str) -> bool:
             with Image.open(frame_path) as img:
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
-                # Resize to fit cell while keeping aspect ratio
-                img.thumbnail((CELL_W, CELL_H), Image.LANCZOS)
-                ox = x + (CELL_W - img.width) // 2
-                oy = y + (CELL_H - img.height) // 2
-                grid_img.paste(img, (ox, oy))
+                
+                # Crop-to-fill: resize and crop to exactly fit CELL_W x CELL_H
+                # This avoids black bars for vertical video
+                target_ratio = CELL_W / CELL_H
+                img_ratio = img.width / img.height
+                
+                if img_ratio > target_ratio:
+                    # Image is wider than cell, crop sides
+                    new_width = int(img.height * target_ratio)
+                    left = (img.width - new_width) // 2
+                    img = img.crop((left, 0, left + new_width, img.height))
+                elif img_ratio < target_ratio:
+                    # Image is taller than cell, crop top/bottom
+                    new_height = int(img.width / target_ratio)
+                    top = (img.height - new_height) // 2
+                    img = img.crop((0, top, img.width, top + new_height))
+                
+                # Resize to exact cell dimensions
+                img = img.resize((CELL_W, CELL_H), Image.LANCZOS)
+                grid_img.paste(img, (x, y))
         except Exception as e:
             log(f"Failed to paste frame {i}: {e}", "WARN")
             continue
@@ -253,9 +320,15 @@ def build_contact_sheet(frames: list, output_path: str) -> bool:
                 tw = bbox[2] - bbox[0]
             except AttributeError:
                 tw = len(label) * (FONT_SIZE // 2)
-            # Draw text with shadow for readability
-            draw.text((x + (CELL_W - tw) // 2 + 2, y + CELL_H + 3 + 2), label, fill="black", font=font)
-            draw.text((x + (CELL_W - tw) // 2, y + CELL_H + 3), label, fill="white", font=font)
+            
+            # Draw timestamp with shadow for readability
+            text_x = x + (CELL_W - tw) // 2
+            text_y = y + CELL_H + 3
+            
+            # Shadow
+            draw.text((text_x + 2, text_y + 2), label, fill="black", font=font)
+            # Main text
+            draw.text((text_x, text_y), label, fill="white", font=font)
 
     try:
         grid_img.save(output_path, "JPEG", quality=JPEG_QUALITY)
@@ -264,6 +337,9 @@ def build_contact_sheet(frames: list, output_path: str) -> bool:
         log(f"Save failed: {e}", "ERROR")
         return False
 
+# ═══════════════════════════════════════════════════════════
+# TELEGRAM SEND
+# ═══════════════════════════════════════════════════════════
 def send_photo(photo_path: str, caption: str) -> dict:
     result = {"ok": False, "message_id": None, "error": ""}
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -308,9 +384,12 @@ def send_photo(photo_path: str, caption: str) -> dict:
             time.sleep(2 * attempt)
     return result
 
+# ═══════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════
 def main():
     log("=" * 60)
-    log("Full Stream Contact Sheet Generator (PORTRAIT 2x6)")
+    log("Full Stream Contact Sheet Generator (PORTRAIT 3x4)")
     log(f"  STREAM_ID   : {STREAM_ID}")
     log(f"  GRID        : {GRID_COLS}x{GRID_ROWS} = {TOTAL_FRAMES} frames")
     log(f"  CELL SIZE   : {CELL_W}x{CELL_H}")
