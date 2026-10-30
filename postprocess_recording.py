@@ -9,6 +9,7 @@ CRITICAL FIXES in this version:
   4. Sends segments EVEN WITHOUT AUDIO (video is more important)
   5. Per-segment state management for resume capability
   6. Never declares success if coverage < 95%
+  7. Updates worker state to 'completed'/'failed' to free recording slot
 """
 
 import json
@@ -43,6 +44,13 @@ MAX_RETRIES        = 3
 # Minimum thresholds to reject corrupt/empty files
 MIN_SOURCE_SIZE_BYTES = 1 * 1024 * 1024  # 1 MB minimum for a valid source
 MIN_SOURCE_DURATION   = 5.0              # 5 seconds minimum duration
+
+# Worker API configuration for final state update
+WORKER_API_URL = os.environ.get("WORKER_API_URL", "").strip()
+AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "").strip()
+
+if WORKER_API_URL and WORKER_API_URL.endswith('/'):
+    WORKER_API_URL = WORKER_API_URL[:-1]
 
 def log(msg: str) -> None:
     print(f"[POSTPROC] {msg}", flush=True)
@@ -98,6 +106,29 @@ def safe_id(sid: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(sid))
 
 # ═══════════════════════════════════════════════════════════
+# WORKER STATE UPDATE — notify worker when processing completes
+# ═══════════════════════════════════════════════════════════
+def update_worker_final_state(sid: str, status: str, extra: dict = None):
+    """Update worker state to 'completed' or 'failed' to free the recording slot."""
+    if not WORKER_API_URL or not AUTO_API_TOKEN:
+        log("⚠️ Worker API not configured, skipping final state update")
+        return
+    url = f"{WORKER_API_URL}/api/update-state/{sid}"
+    state = {"status": status}
+    if extra:
+        state.update(extra)
+    payload = json.dumps(state).encode('utf-8')
+    req = urllib.request.Request(url, data=payload, headers={
+        'X-Auto-Token': AUTO_API_TOKEN,
+        'Content-Type': 'application/json'
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            log(f"✓ Worker state updated: {status}")
+    except Exception as e:
+        log(f"⚠️ Failed to update worker state: {e}")
+
+# ═══════════════════════════════════════════════════════════
 # STATE
 # ═══════════════════════════════════════════════════════════
 def state_path(sid: str) -> Path:
@@ -151,7 +182,7 @@ def find_and_concatenate_parts(sid: str) -> str:
     for d in [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]:
         if not d.exists(): continue
         for f in d.glob("*_av_part_*.mkv"):
-            if f.stat().st_size > MIN_SOURCE_SIZE_BYTES // 10:  # At least 100KB per part
+            if f.stat().st_size > 100 * 1024:  # At least 100KB per part
                 parts.append(f)
     
     if not parts:
@@ -710,6 +741,7 @@ def process_one(mkv_path: Path, sid: str) -> bool:
         st["state"] = "PARTIAL_COVERAGE"
         st["coverage_ratio"] = round(coverage_ratio, 3)
         save_state(sid, st)
+        # Do NOT update worker to 'completed' — keep as 'processing' for retry
         return False
 
     if sent_count > 0 and failed_count == 0 and coverage_ratio >= 0.95:
@@ -722,16 +754,28 @@ def process_one(mkv_path: Path, sid: str) -> bool:
                 "source_duration": round(duration, 1),
             }, f)
         log("✅ ALL segments sent successfully with full coverage")
+        # CRITICAL: Update worker to 'completed' to free the slot and remove from /status
+        update_worker_final_state(sid, "completed", {
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "segments_sent": sent_count,
+            "coverage": round(coverage_ratio, 3),
+        })
         return True
     elif sent_count > 0:
         st["state"] = "PARTIAL"
         save_state(sid, st)
         log(f"⚠️ PARTIAL: {sent_count}/{total} sent. Source preserved for retry.")
+        # Keep as 'processing' for retry — do NOT mark as completed
         return False
     else:
         st["state"] = "FAILED"
         save_state(sid, st)
         log("✗ No segments sent. Source preserved.")
+        # CRITICAL: Update worker to 'failed' to free the slot
+        update_worker_final_state(sid, "failed", {
+            "failed_at": datetime.now(timezone.utc).isoformat(),
+            "error": "no_segments_sent",
+        })
         return False
 
 def main():
