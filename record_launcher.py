@@ -29,18 +29,15 @@ AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# User-Agent to avoid Cloudflare WAF blocking GitHub Actions
 USER_AGENT = "SuperLive-AutoMonitor/1.0 (GitHub Actions; +https://github.com/sakatnt66-alt/superlive-recorder)"
 
-# Debug: Print configuration status
 print(f"[DEBUG] WORKER_API_URL: {'SET' if WORKER_API_URL else 'MISSING'} (length={len(WORKER_API_URL)})")
 print(f"[DEBUG] AUTO_API_TOKEN: {'SET' if AUTO_API_TOKEN else 'MISSING'} (length={len(AUTO_API_TOKEN)})")
 
-# Remove trailing slash from WORKER_API_URL if present
 if WORKER_API_URL and WORKER_API_URL.endswith('/'):
     WORKER_API_URL = WORKER_API_URL[:-1]
 
-WATCHLIST_FILE = Path("data/watchlist.json")  # Fallback only
+WATCHLIST_FILE = Path("data/watchlist.json")
 MAX_CONCURRENT = 4
 
 RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "recordings"))
@@ -50,11 +47,15 @@ PRESERVED_DIR = RECORDINGS_DIR / "_preserved"
 RECORDING_MAX_SECONDS = int(os.environ.get("RECORDING_MAX_SECONDS", "3600"))
 STOP_CHECK_INTERVAL = int(os.environ.get("STOP_CHECK_INTERVAL", "30"))
 
+# Minimum size thresholds to reject corrupt/empty files
+MIN_VIDEO_SIZE = 100 * 1024       # 100 KB minimum for video
+MIN_AUDIO_SIZE = 10 * 1024        # 10 KB minimum for audio
+MIN_MKV_SIZE   = 1 * 1024 * 1024  # 1 MB minimum for final MKV
+MIN_MKV_DURATION = 5.0            # 5 seconds minimum duration
+
 def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
-    """Check if stream_id is valid (different from user_id, 9+ digits, numeric)."""
     stream_id_str = str(stream_id)
     user_id_str = str(user_id)
-    
     if stream_id_str == user_id_str:
         return False
     if len(stream_id_str) < 9:
@@ -64,7 +65,6 @@ def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
     return True
 
 def is_valid_profile_id(profile_id: str) -> bool:
-    """Check if profile_id is valid (numeric, not a hash)."""
     if not profile_id:
         return False
     profile_id_str = str(profile_id)
@@ -75,7 +75,6 @@ def is_valid_profile_id(profile_id: str) -> bool:
     return True
 
 def read_error_body(error):
-    """Safely read HTTPError response body for debugging."""
     try:
         body = error.read().decode('utf-8', errors='replace')
         return body[:500] if body else '(empty)'
@@ -83,23 +82,19 @@ def read_error_body(error):
         return '(unreadable)'
 
 def send_telegram_message(text: str, parse_mode: str = "HTML"):
-    """Send message to Telegram"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = json.dumps({
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": parse_mode
     }).encode('utf-8')
-    
     req = urllib.request.Request(url, data=payload, headers={
         'Content-Type': 'application/json',
         'User-Agent': USER_AGENT,
         'Accept': 'application/json'
     })
-    
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
             if response.status != 200:
@@ -125,7 +120,6 @@ def update_worker_state(stream_id: str, state: dict):
         print(f"[WORKER] Error updating state: {e}")
 
 def cleanup_failed_recording(stream_id: str, reason: str):
-    """Immediately remove failed recording from active list in Worker KV."""
     if not WORKER_API_URL or not AUTO_API_TOKEN:
         return
     url = f"{WORKER_API_URL}/api/cleanup-failed/{stream_id}"
@@ -140,43 +134,21 @@ def cleanup_failed_recording(stream_id: str, reason: str):
     except Exception as e:
         print(f"[WORKER] Error cleaning up {stream_id}: {e}")
 
-def is_valid_stream_id(stream_id: str, user_id: str) -> bool:
-    stream_id_str = str(stream_id)
-    user_id_str = str(user_id)
-    if stream_id_str == user_id_str:
-        return False
-    if len(stream_id_str) < 9:
-        return False
-    if not stream_id_str.isdigit():
-        return False
-    return True
-
 def sanitize_filename(name: str) -> str:
-    """Sanitize a string to be used as a filename."""
     if not name:
         return "unknown"
-    # Remove or replace invalid characters
     safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
-    # Remove leading/trailing dots and spaces
     safe = safe.strip('. ')
-    # Limit length
     return safe[:100] if safe else "unknown"
 
-# ═══════════════════════════════════════════════════════════
-# FIX: Kill orphan ffmpeg/yt-dlp processes to ensure files are closed
-# ═══════════════════════════════════════════════════════════
 def kill_orphan_processes():
     print("[LAUNCHER] Killing orphan ffmpeg/yt-dlp processes to ensure files are closed...")
     try:
         subprocess.run("pkill -f 'ffmpeg'", shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         subprocess.run("pkill -f 'yt-dlp'", shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-        subprocess.run("pkill -f 'record_once'", shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     except Exception as e:
         print(f"[LAUNCHER] Kill error: {e}")
 
-# ═══════════════════════════════════════════════════════════
-# FILE PRESERVER — watches MKV, H264, WEBM in background thread
-# ═══════════════════════════════════════════════════════════
 class FilePreserverThread:
     def __init__(self, watch_dirs, preserve_dir, poll_interval=0.3):
         self.watch_dirs = [Path(d) for d in watch_dirs]
@@ -229,15 +201,59 @@ class FilePreserverThread:
                     except Exception as e:
                         print(f"[PRESERVE] ✗ copy failed for {f.name}: {e}")
 
-# ═══════════════════════════════════════════════════════════
-# RECOVERY: Mux raw video+audio into MKV after timeout/stop
-# ═══════════════════════════════════════════════════════════
+def validate_mkv_file(path: str) -> dict:
+    """Validate an MKV file has real content."""
+    result = {"valid": False, "duration": 0.0, "size": 0, "video": None, "audio": None, "reason": ""}
+    try:
+        p = Path(path)
+        if not p.exists():
+            result["reason"] = "file not found"
+            return result
+        size = p.stat().st_size
+        result["size"] = size
+        if size < MIN_MKV_SIZE:
+            result["reason"] = f"too small ({size} bytes < {MIN_MKV_SIZE})"
+            return result
+        
+        r = subprocess.run(
+            f'ffprobe -v quiet -print_format json -show_format -show_streams "{path}"',
+            shell=True, capture_output=True, text=True, timeout=60
+        )
+        if r.returncode != 0:
+            result["reason"] = "ffprobe failed"
+            return result
+        
+        data = json.loads(r.stdout)
+        duration = float(data.get("format", {}).get("duration", 0))
+        result["duration"] = duration
+        
+        if duration < MIN_MKV_DURATION:
+            result["reason"] = f"duration too short ({duration:.1f}s < {MIN_MKV_DURATION}s)"
+            return result
+        
+        for s in data.get("streams", []):
+            ct = s.get("codec_type")
+            cn = (s.get("codec_name") or "").lower()
+            if ct == "video" and result["video"] is None:
+                result["video"] = cn
+            elif ct == "audio" and result["audio"] is None:
+                result["audio"] = cn
+        
+        if not result["video"]:
+            result["reason"] = "no video stream"
+            return result
+        
+        result["valid"] = True
+        result["reason"] = "ok"
+    except Exception as e:
+        result["reason"] = str(e)
+    return result
+
 def recover_and_mux_recording() -> list:
     """
     After record_once.py is cancelled (timeout or manual stop),
-    the muxing step inside record_once.py never runs.
-    This function finds raw video and audio files and muxes them
-    into a proper MKV using FFmpeg stream copy (no re-encoding).
+    find raw video and audio files and mux them into a proper MKV.
+    CRITICAL: Rejects empty/corrupt files and validates the result.
     """
     print("\n" + "=" * 70)
     print("[RECOVERY] Searching for raw recording files to mux...")
@@ -246,6 +262,22 @@ def recover_and_mux_recording() -> list:
     created_mkvs = []
     search_dirs = [TEMP_DIR, RECORDINGS_DIR, PRESERVED_DIR]
 
+    # First, check for existing valid MKV files
+    for d in search_dirs:
+        if not d.exists():
+            continue
+        for f in d.glob("*_av.mkv"):
+            validation = validate_mkv_file(str(f))
+            if validation["valid"]:
+                print(f"[RECOVERY] ✓ Existing valid MKV: {f.name} ({validation['size']/1024/1024:.1f} MB, {validation['duration']:.1f}s)")
+                created_mkvs.append(str(f))
+            else:
+                print(f"[RECOVERY] ✗ Skipping invalid MKV: {f.name} — {validation['reason']}")
+
+    if created_mkvs:
+        return created_mkvs
+
+    # Find raw video and audio files with MINIMUM SIZE CHECKS
     video_files = []
     audio_files = []
 
@@ -253,96 +285,116 @@ def recover_and_mux_recording() -> list:
         if not d.exists():
             continue
         for f in d.glob("*.h264"):
-            if f.stat().st_size > 0:
-                video_files.append(f)
-                print(f"[RECOVERY] Found video: {f.name} ({f.stat().st_size / 1024 / 1024:.1f} MB)")
+            size = f.stat().st_size
+            if size >= MIN_VIDEO_SIZE:
+                video_files.append((f, size))
+                print(f"[RECOVERY] Found video: {f.name} ({size / 1024 / 1024:.1f} MB)")
+            else:
+                print(f"[RECOVERY] ✗ Skipping small video: {f.name} ({size} bytes)")
         for f in d.glob("*_video.webm"):
-            if f.stat().st_size > 0:
-                video_files.append(f)
-                print(f"[RECOVERY] Found video: {f.name} ({f.stat().st_size / 1024 / 1024:.1f} MB)")
+            size = f.stat().st_size
+            if size >= MIN_VIDEO_SIZE:
+                video_files.append((f, size))
+                print(f"[RECOVERY] Found video: {f.name} ({size / 1024 / 1024:.1f} MB)")
+            else:
+                print(f"[RECOVERY] ✗ Skipping small video: {f.name} ({size} bytes)")
         for f in d.glob("*_audio.webm"):
-            if f.stat().st_size > 0:
-                audio_files.append(f)
-                print(f"[RECOVERY] Found audio: {f.name} ({f.stat().st_size / 1024 / 1024:.1f} MB)")
+            size = f.stat().st_size
+            if size >= MIN_AUDIO_SIZE:
+                audio_files.append((f, size))
+                print(f"[RECOVERY] Found audio: {f.name} ({size / 1024 / 1024:.1f} MB)")
+            else:
+                print(f"[RECOVERY] ✗ Skipping small audio: {f.name} ({size} bytes)")
         for f in d.glob("*.opus"):
-            if f.stat().st_size > 0:
-                audio_files.append(f)
-                print(f"[RECOVERY] Found audio: {f.name} ({f.stat().st_size / 1024 / 1024:.1f} MB)")
-
-    # Check for existing MKV files
-    for d in search_dirs:
-        if not d.exists():
-            continue
-        for f in d.glob("*_av.mkv"):
-            if f.stat().st_size > 0:
-                print(f"[RECOVERY] Existing MKV found: {f.name}")
-                created_mkvs.append(str(f))
-
-    if created_mkvs:
-        return created_mkvs
+            size = f.stat().st_size
+            if size >= MIN_AUDIO_SIZE:
+                audio_files.append((f, size))
+                print(f"[RECOVERY] Found audio: {f.name} ({size / 1024 / 1024:.1f} MB)")
+            else:
+                print(f"[RECOVERY] ✗ Skipping small audio: {f.name} ({size} bytes)")
 
     if not video_files and not audio_files:
-        print("[RECOVERY] No raw files found")
+        print("[RECOVERY] ✗ No valid raw files found (all empty or too small)")
         return []
 
-    # Match by timestamp
+    # Match by timestamp — pick LARGEST file for each timestamp
     video_by_ts = {}
     audio_by_ts = {}
 
-    for f in video_files:
+    for f, size in video_files:
         match = re.search(r'recording_(\d{8}_\d{6})', f.name)
         ts = match.group(1) if match else 'unknown'
-        video_by_ts[ts] = f
+        # Keep the LARGEST file for each timestamp
+        if ts not in video_by_ts or size > video_by_ts[ts][1]:
+            video_by_ts[ts] = (f, size)
 
-    for f in audio_files:
+    for f, size in audio_files:
         match = re.search(r'recording_(\d{8}_\d{6})', f.name)
         ts = match.group(1) if match else 'unknown'
-        audio_by_ts[ts] = f
+        if ts not in audio_by_ts or size > audio_by_ts[ts][1]:
+            audio_by_ts[ts] = (f, size)
 
     all_ts = set(list(video_by_ts.keys()) + list(audio_by_ts.keys()))
 
     for ts in all_ts:
-        vf = video_by_ts.get(ts)
-        af = audio_by_ts.get(ts)
+        vf_entry = video_by_ts.get(ts)
+        af_entry = audio_by_ts.get(ts)
 
         PRESERVED_DIR.mkdir(parents=True, exist_ok=True)
         out_name = f"recording_{ts}_av.mkv" if ts != 'unknown' else f"recovered_av.mkv"
         out_path = PRESERVED_DIR / out_name
 
-        if out_path.exists() and out_path.stat().st_size > 0:
-            created_mkvs.append(str(out_path))
-            continue
+        # Don't overwrite existing valid files
+        if out_path.exists():
+            validation = validate_mkv_file(str(out_path))
+            if validation["valid"]:
+                print(f"[RECOVERY] ✓ Existing valid output: {out_name}")
+                created_mkvs.append(str(out_path))
+                continue
+            else:
+                print(f"[RECOVERY] ⚠️ Existing output invalid ({validation['reason']}), will recreate")
+
+        vf = vf_entry[0] if vf_entry else None
+        af = af_entry[0] if af_entry else None
+
+        # Use a temp file first, then validate, then move
+        tmp_path = PRESERVED_DIR / f"{out_name}.tmp"
 
         if vf and af:
             print(f"[RECOVERY] Muxing video + audio → {out_name}")
-            cmd = f'ffmpeg -y -i "{vf}" -i "{af}" -c:v copy -c:a copy -movflags +faststart "{out_path}"'
+            cmd = f'ffmpeg -y -i "{vf}" -i "{af}" -c:v copy -c:a copy -movflags +faststart "{tmp_path}"'
         elif vf:
             print(f"[RECOVERY] Muxing video only → {out_name}")
-            cmd = f'ffmpeg -y -i "{vf}" -c:v copy -movflags +faststart "{out_path}"'
+            cmd = f'ffmpeg -y -i "{vf}" -c:v copy -movflags +faststart "{tmp_path}"'
         elif af:
             print(f"[RECOVERY] Muxing audio only → {out_name}")
-            cmd = f'ffmpeg -y -i "{af}" -c:a copy "{out_path}"'
+            cmd = f'ffmpeg -y -i "{af}" -c:a copy "{tmp_path}"'
         else:
             continue
 
         try:
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
-            if result.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
-                print(f"[RECOVERY] ✓ Created: {out_name} ({out_path.stat().st_size / 1024 / 1024:.1f} MB)")
-                created_mkvs.append(str(out_path))
+            if result.returncode == 0 and tmp_path.exists():
+                # CRITICAL: Validate the output before accepting it
+                validation = validate_mkv_file(str(tmp_path))
+                if validation["valid"]:
+                    shutil.move(str(tmp_path), str(out_path))
+                    print(f"[RECOVERY] ✓ Created and validated: {out_name} ({validation['size']/1024/1024:.1f} MB, {validation['duration']:.1f}s)")
+                    created_mkvs.append(str(out_path))
+                else:
+                    print(f"[RECOVERY] ✗ Output validation failed: {validation['reason']}")
+                    tmp_path.unlink(missing_ok=True)
             else:
                 print(f"[RECOVERY] ✗ FFmpeg failed: {(result.stderr or '')[-200:]}")
+                tmp_path.unlink(missing_ok=True)
         except Exception as e:
             print(f"[RECOVERY] ✗ Error: {e}")
+            tmp_path.unlink(missing_ok=True)
 
-    print(f"[RECOVERY] Result: {len(created_mkvs)} MKV file(s) available")
+    print(f"[RECOVERY] Result: {len(created_mkvs)} valid MKV file(s) available")
     return created_mkvs
 
-# ═══════════════════════════════════════════════════════════
-# STOP SIGNAL CHECKER
-# ═══════════════════════════════════════════════════════════
 async def stop_signal_checker(stream_id: str, stop_event: asyncio.Event):
-    """Polls /api/check-stop/{stream_id} for manual stop from Telegram."""
     print(f"[STOP-CHECK] Monitoring (interval={STOP_CHECK_INTERVAL}s)")
     while not stop_event.is_set():
         try:
@@ -554,18 +606,6 @@ async def pre_flight_check(stream_url: str, stream_id: str) -> dict:
             "actual_stream_id": stream_id, "error": str(e)
         }
 
-def get_latest_files(before_time: float) -> list:
-    files = []
-    for ext in ['*.mkv', '*.webm', '*.mp4']:
-        for pattern in [str(RECORDINGS_DIR / ext), str(TEMP_DIR / ext)]:
-            for f in glob.glob(pattern):
-                try:
-                    if os.path.getmtime(f) >= before_time:
-                        files.append(f)
-                except:
-                    pass
-    return files
-
 def rename_files_by_username(files: list, username: str) -> list:
     if not files or not username or username.startswith("user_"):
         return []
@@ -655,12 +695,7 @@ async def main():
         else:
             msg = f"❌ <b>فشل التحقق</b>\n👤 المستخدم: <code>{actual_stream_id}</code>\n⚠️ {error}"
         send_telegram_message(msg)
-        
-        # ═══════════════════════════════════════════════════════════
-        # IMMEDIATE CLEANUP: Remove from active recordings
-        # ═══════════════════════════════════════════════════════════
         cleanup_failed_recording(actual_stream_id, f"pre_flight_{status}")
-        
         update_worker_state(actual_stream_id, {
             "status": "failed", "error": error,
             "failed_at": datetime.now(timezone.utc).isoformat()
@@ -709,7 +744,6 @@ async def main():
     print(f"TIME LIMIT: {RECORDING_MAX_SECONDS}s | STOP CHECK: {STOP_CHECK_INTERVAL}s")
     print("=" * 70)
 
-    # Start FilePreserver
     PRESERVED_DIR.mkdir(parents=True, exist_ok=True)
     preserver = FilePreserverThread(
         watch_dirs=[RECORDINGS_DIR, TEMP_DIR],
@@ -718,7 +752,6 @@ async def main():
     )
     preserver.start()
 
-    # ── Recording with timeout + stop signal ──
     stop_event = asyncio.Event()
     stop_checker_task = asyncio.create_task(stop_signal_checker(stream_id, stop_event))
     recording_stopped_manually = False
@@ -729,7 +762,6 @@ async def main():
         recording_task = asyncio.create_task(record_once.main())
         stop_waiter = asyncio.create_task(stop_event.wait())
 
-        # Wait for: recording finishes, OR stop signal, OR timeout
         done, pending = await asyncio.wait(
             [recording_task, stop_waiter],
             timeout=RECORDING_MAX_SECONDS,
@@ -737,7 +769,6 @@ async def main():
         )
 
         if stop_event.is_set() and recording_task not in done:
-            # ── MANUAL STOP from Telegram ──
             recording_stopped_manually = True
             print(f"\n[LAUNCHER] 🛑 STOP SIGNAL — cancelling recording")
             recording_task.cancel()
@@ -749,8 +780,6 @@ async def main():
             except Exception as e:
                 print(f"[LAUNCHER] Recording ended during stop: {e}")
             stop_waiter.cancel()
-            
-            # FIX: Transition to 'processing' to free the recording slot
             update_worker_state(stream_id, {
                 "status": "processing",
                 "stopped_at": datetime.now(timezone.utc).isoformat(),
@@ -766,13 +795,10 @@ async def main():
             )
 
         elif recording_task in done:
-            # ── Natural completion or exception ──
             stop_waiter.cancel()
             try:
                 await recording_task
                 print("\n[LAUNCHER] ✓ record_once.py completed successfully")
-                
-                # FIX: Transition to 'processing' to free the recording slot
                 update_worker_state(stream_id, {
                     "status": "processing",
                     "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -786,12 +812,7 @@ async def main():
                 })
             except Exception as e:
                 error_str = str(e)
-                
-                # ═══════════════════════════════════════════════════
-                # IMMEDIATE CLEANUP on recording failure
-                # ═══════════════════════════════════════════════════
                 cleanup_failed_recording(stream_id, f"recording_error:{error_str[:50]}")
-                
                 if "Unable to split Matroska" in error_str:
                     print("[LAUNCHER] Matroska split failed — RESCUE MODE")
                     send_telegram_message(
@@ -800,8 +821,6 @@ async def main():
                         f"🆔 ID: <code>{stream_id}</code>\n"
                         f"📦 مرحلة المعالجة اللاحقة ستُكمل التقسيم والإرسال."
                     )
-                    
-                    # FIX: Transition to 'processing' to free the recording slot
                     update_worker_state(stream_id, {
                         "split_error": error_str[:300],
                         "rescue_pending": True,
@@ -814,7 +833,6 @@ async def main():
                     raise
 
         else:
-            # ── TIMEOUT: 3600 seconds reached ──
             recording_timed_out = True
             elapsed = datetime.now().timestamp() - start_time
             print(f"\n[LAUNCHER] ⏰ Recording reached {RECORDING_MAX_SECONDS}s — STOPPING NOW")
@@ -829,7 +847,6 @@ async def main():
             except Exception as e:
                 print(f"[LAUNCHER] Recording ended during timeout: {e}")
 
-            # FIX: Transition to 'processing' to free the recording slot
             update_worker_state(stream_id, {
                 "status": "processing",
                 "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -853,16 +870,9 @@ async def main():
         })
     except Exception as e:
         error_str = str(e)
-        
-        # ═══════════════════════════════════════════════════════════
-        # IMMEDIATE CLEANUP on any unhandled exception
-        # ═══════════════════════════════════════════════════════════
         cleanup_failed_recording(stream_id, f"unhandled_error:{error_str[:50]}")
-        
         if "Unable to split Matroska" in error_str:
             print("[LAUNCHER] Matroska split failed — RESCUE MODE")
-            
-            # FIX: Transition to 'processing' to free the recording slot
             update_worker_state(stream_id, {
                 "split_error": error_str[:300],
                 "rescue_pending": True,
@@ -892,23 +902,20 @@ async def main():
             pass
         print("[STOP-CHECK] Stopped")
 
-    # Wait for file writes to flush
     if recording_stopped_manually or recording_timed_out:
         print("[LAUNCHER] Waiting 15s for file finalization...")
         await asyncio.sleep(15)
 
     preserver.stop()
 
-    # ── RECOVERY: Mux raw files if needed ──
     if recording_stopped_manually or recording_timed_out:
         print("\n[LAUNCHER] RECOVERY: Muxing raw files → MKV")
         recovered = recover_and_mux_recording()
         if recovered:
-            print(f"[LAUNCHER] ✓ Recovery: {len(recovered)} MKV available")
+            print(f"[LAUNCHER] ✓ Recovery: {len(recovered)} valid MKV available")
         else:
-            print("[LAUNCHER] ⚠️ No files recovered")
+            print("[LAUNCHER] ⚠️ No valid files recovered")
 
-    # ── RENAME FILES ──
     print("\n" + "=" * 70)
     print("POST-PROCESSING: Renaming files by username")
     print("=" * 70)
@@ -917,8 +924,6 @@ async def main():
         await asyncio.sleep(2)
         all_current_files = set()
         for ext in ['*.mkv', '*.webm', '*.mp4']:
-            # FIX: Exclude PRESERVED_DIR from renaming!
-            # Files in _preserved must keep original names for postprocess and contact sheet to find them.
             for pattern in [str(RECORDINGS_DIR / ext), str(TEMP_DIR / ext)]:
                 all_current_files.update(glob.glob(pattern))
         new_files = list(all_current_files - existing_files)
@@ -930,14 +935,6 @@ async def main():
                 renamed = rename_files_by_username(files_to_rename, stream_name)
                 if renamed:
                     print(f"[RENAME] ✓ Renamed {len(renamed)} file(s)")
-                    file_list = "\n".join([f"📁 <code>{os.path.basename(new)}</code>" for _, new in renamed[:5]])
-                    send_telegram_message(
-                        f"📦 <b>ملفات التسجيل جاهزة</b>\n"
-                        f"👤 الاسم: <b>{stream_name}</b>\n"
-                        f"🆔 ID: <code>{stream_id}</code>\n"
-                        f"{file_list}",
-                        parse_mode="HTML"
-                    )
             else:
                 print(f"[RENAME] ℹ️ Files already have username")
         else:
@@ -945,7 +942,6 @@ async def main():
     else:
         print(f"[RENAME] ⚠️ No username - skipping")
 
-    # Report preserved files
     preserved = list(PRESERVED_DIR.glob("*.mkv")) if PRESERVED_DIR.exists() else []
     if preserved:
         print(f"\n[PRESERVE] 📦 {len(preserved)} MKV in _preserved/:")
