@@ -6,6 +6,9 @@ Creates EXACTLY ONE portrait JPG containing 12 frames taken from the
 ORIGINAL full recording, distributed across its entire duration.
 
 Grid: 3 columns x 4 rows = 12 frames (optimized for vertical video)
+
+CRITICAL FIX: Uses the same source discovery as postprocess_recording.py
+to ensure it works with the SAME source file, not a partial one.
 """
 
 import json
@@ -50,9 +53,9 @@ MAX_TG_PHOTO = 10 * 1024 * 1024
 
 TEXT_H = FONT_SIZE + 8
 
-# Minimum thresholds
-MIN_SOURCE_SIZE = 1 * 1024 * 1024  # 1 MB
-MIN_SOURCE_DURATION = 5.0          # 5 seconds
+MIN_SOURCE_SIZE = 1 * 1024 * 1024
+MIN_SOURCE_DURATION = 5.0
+MIN_PART_SIZE = 100 * 1024
 
 def log(msg: str, level: str = "INFO") -> None:
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -104,26 +107,20 @@ def validate_source(path: str) -> dict:
         if not p.exists() or p.stat().st_size == 0:
             result["reason"] = "file not found or empty"
             return result
-        
         size = p.stat().st_size
         result["size"] = size
-        
         if size < MIN_SOURCE_SIZE:
             result["reason"] = f"too small ({size} bytes)"
             return result
-        
         dur = get_duration(path)
         result["duration"] = dur
-        
         if dur < MIN_SOURCE_DURATION:
             result["reason"] = f"duration too short ({dur:.1f}s)"
             return result
-        
         r = run_cmd(f'ffprobe -v quiet -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "{path}"', 30)
         if not (r and r.returncode == 0 and 'video' in r.stdout):
             result["reason"] = "no video stream"
             return result
-        
         result["valid"] = True
         result["reason"] = "ok"
     except OSError as e:
@@ -138,37 +135,55 @@ def format_timestamp(seconds: float) -> str:
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
 
-def find_and_concatenate_parts() -> str:
+# ═══════════════════════════════════════════════════════════
+# SOURCE DISCOVERY — Same logic as postprocess_recording.py
+# ═══════════════════════════════════════════════════════════
+def find_all_mkv_parts() -> list:
     parts = []
-    for d in [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]:
-        if not d.exists(): continue
+    search_dirs = [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]
+    for d in search_dirs:
+        if not d.exists():
+            continue
         for f in d.glob("*_av_part_*.mkv"):
-            if f.stat().st_size > 100 * 1024:  # At least 100KB per part
-                parts.append(f)
-    
+            try:
+                size = f.stat().st_size
+                if size >= MIN_PART_SIZE:
+                    parts.append((f, size))
+            except OSError:
+                continue
+        for f in d.glob("*_part_*.mkv"):
+            if "_av_part_" in f.name:
+                continue
+            try:
+                size = f.stat().st_size
+                if size >= MIN_PART_SIZE:
+                    parts.append((f, size))
+            except OSError:
+                continue
     if not parts:
-        return None
-        
-    def get_part_num(f):
-        m = re.search(r'_av_part_(\d+)', f.name)
+        return []
+    def get_part_num(entry):
+        f = entry[0]
+        m = re.search(r'_part_(\d+)', f.name)
         return int(m.group(1)) if m else 0
     parts.sort(key=get_part_num)
-    
-    log(f"🔗 Found {len(parts)} valid parts to concatenate")
-    
+    return parts
+
+def concatenate_parts(parts: list) -> str:
+    if not parts:
+        return None
+    log(f"🔗 Concatenating {len(parts)} parts for contact sheet...")
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(STREAM_ID))
     concat_file = TEMP_DIR / f"cs_concat_{safe_id}.txt"
     with open(concat_file, "w", encoding="utf-8") as f:
-        for p in parts:
-            f.write(f"file '{p}'\n")
-            
+        for part_path, size in parts:
+            f.write(f"file '{part_path}'\n")
     out_file = TEMP_DIR / f"cs_concatenated_{safe_id}.mkv"
     if out_file.exists() and out_file.stat().st_size > MIN_SOURCE_SIZE:
         validation = validate_source(str(out_file))
         if validation["valid"]:
             return str(out_file)
-        
     cmd = f'ffmpeg -y -f concat -safe 0 -i "{concat_file}" -c copy "{out_file}"'
     r = run_cmd(cmd, timeout=1200)
     if r and r.returncode == 0 and out_file.exists():
@@ -177,8 +192,20 @@ def find_and_concatenate_parts() -> str:
             return str(out_file)
     return None
 
-def find_source_mkv():
-    search_dirs = [PRESERVED_DIR, RECORDINGS_DIR, RECORDINGS_DIR / "_temp"]
+def find_source() -> str:
+    """Find the best source, same logic as postprocess_recording.py."""
+    log("🔍 Discovering source for contact sheet...")
+    
+    # Strategy 1: Concatenate parts
+    parts = find_all_mkv_parts()
+    if parts and len(parts) > 1:
+        log(f"📦 Found {len(parts)} parts")
+        concat_path = concatenate_parts(parts)
+        if concat_path:
+            return concat_path
+    
+    # Strategy 2: Single MKV
+    search_dirs = [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]
     candidates = []
     for d in search_dirs:
         if not d.exists():
@@ -193,23 +220,27 @@ def find_source_mkv():
                     candidates.append((f, size))
             except OSError:
                 continue
-    if not candidates:
-        return None
     
-    # Sort by size descending
-    candidates.sort(key=lambda x: x[1], reverse=True)
+    if candidates:
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        for f, size in candidates:
+            validation = validate_source(str(f))
+            if validation["valid"]:
+                log(f"✓ Using single source: {f.name} ({size/1024/1024:.1f} MB, {validation['duration']:.1f}s)")
+                return str(f)
     
-    # Validate and pick the best
-    for f, size in candidates:
+    # Strategy 3: Single part
+    if parts and len(parts) == 1:
+        f, size = parts[0]
         validation = validate_source(str(f))
         if validation["valid"]:
-            log(f"✓ Valid source: {f.name} ({size/1024/1024:.1f} MB, {validation['duration']:.1f}s)")
-            return f
-        else:
-            log(f"⚠️ Skipping invalid source: {f.name} — {validation['reason']}", "WARN")
+            return str(f)
     
     return None
 
+# ═══════════════════════════════════════════════════════════
+# TIMESTAMP CALCULATION
+# ═══════════════════════════════════════════════════════════
 def calculate_timestamps(duration: float, count: int) -> list:
     if duration <= 0 or count <= 0:
         return []
@@ -224,8 +255,10 @@ def calculate_timestamps(duration: float, count: int) -> list:
         timestamps.append(ts)
     return timestamps
 
+# ═══════════════════════════════════════════════════════════
+# FRAME EXTRACTION with duplicate prevention
+# ═══════════════════════════════════════════════════════════
 def get_frame_hash(path: str) -> str:
-    """Get a hash of the frame to detect duplicates."""
     try:
         with open(path, 'rb') as f:
             data = f.read()
@@ -235,7 +268,7 @@ def get_frame_hash(path: str) -> str:
 
 def extract_frames(source: str, timestamps: list, tmpdir: str) -> list:
     frames = []
-    frame_hashes = set()  # Track hashes to prevent duplicates
+    frame_hashes = set()
     source_duration = get_duration(source)
     
     for i, ts in enumerate(timestamps):
@@ -251,8 +284,6 @@ def extract_frames(source: str, timestamps: list, tmpdir: str) -> list:
                 frame_hashes.add(frame_hash)
                 frames.append((out, ts, label))
                 continue
-            else:
-                log(f"Frame {i+1} at {label} is a duplicate, trying alternative", "WARN")
         
         # Strategy 2: Accurate output seeking
         cmd2 = f'ffmpeg -y -i "{source}" -ss {ts:.3f} -frames:v 1 -q:v 2 "{out}"'
@@ -264,7 +295,7 @@ def extract_frames(source: str, timestamps: list, tmpdir: str) -> list:
                 frames.append((out, ts, label))
                 continue
         
-        # Strategy 3: Try nearby timestamps
+        # Strategy 3: Nearby timestamps
         found = False
         for offset in [-5.0, -3.0, -1.0, 1.0, 3.0, 5.0, -10.0, 10.0]:
             nearby_ts = max(0.1, min(ts + offset, source_duration - 0.5))
@@ -284,6 +315,9 @@ def extract_frames(source: str, timestamps: list, tmpdir: str) -> list:
     
     return frames
 
+# ═══════════════════════════════════════════════════════════
+# GRID BUILDING (unchanged design)
+# ═══════════════════════════════════════════════════════════
 def build_contact_sheet(frames: list, output_path: str) -> bool:
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -359,6 +393,9 @@ def build_contact_sheet(frames: list, output_path: str) -> bool:
         log(f"Save failed: {e}", "ERROR")
         return False
 
+# ═══════════════════════════════════════════════════════════
+# TELEGRAM SEND
+# ═══════════════════════════════════════════════════════════
 def send_photo(photo_path: str, caption: str) -> dict:
     result = {"ok": False, "message_id": None, "error": ""}
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -403,6 +440,9 @@ def send_photo(photo_path: str, caption: str) -> dict:
             time.sleep(2 * attempt)
     return result
 
+# ═══════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════
 def main():
     log("=" * 60)
     log("Full Stream Contact Sheet Generator (PORTRAIT 3x4)")
@@ -416,21 +456,16 @@ def main():
         log("⏭️  Already sent — skipping")
         return
 
-    source = find_source_mkv()
+    source = find_source()
     if source is None:
-        log("No valid MKV found. Checking for parts...", "WARN")
-        concat_path = find_and_concatenate_parts()
-        if concat_path:
-            source = Path(concat_path)
-        else:
-            log("✗ No valid source found", "ERROR")
-            st["state"] = "NO_SOURCE"
-            save_state(st)
-            return
+        log("✗ No valid source found", "ERROR")
+        st["state"] = "NO_SOURCE"
+        save_state(st)
+        return
 
-    log(f"📂 Source: {source.name} ({source.stat().st_size / 1024 / 1024:.1f} MB)")
+    log(f"📂 Source: {os.path.basename(source)} ({os.path.getsize(source) / 1024 / 1024:.1f} MB)")
 
-    validation = validate_source(str(source))
+    validation = validate_source(source)
     if not validation["valid"]:
         log(f"✗ Source failed validation: {validation['reason']}", "ERROR")
         st["state"] = "INVALID_SOURCE"
@@ -458,7 +493,7 @@ def main():
         save_state(st)
 
         with tempfile.TemporaryDirectory(prefix="cs_frames_") as tmpdir:
-            frames = extract_frames(str(source), timestamps, tmpdir)
+            frames = extract_frames(source, timestamps, tmpdir)
             log(f"🖼️  Extracted {len(frames)}/{TOTAL_FRAMES} frames")
             
             if len(frames) < 4:
@@ -468,10 +503,10 @@ def main():
                 return
             
             if len(frames) < TOTAL_FRAMES:
-                log(f"⚠️ Only {len(frames)}/{TOTAL_FRAMES} frames extracted, proceeding with available", "WARN")
+                log(f"⚠️ Only {len(frames)}/{TOTAL_FRAMES} frames, proceeding with available", "WARN")
             
             if build_contact_sheet(frames, output_path):
-                log(f"✅ Portrait contact sheet created: {os.path.basename(output_path)}")
+                log(f"✅ Contact sheet created: {os.path.basename(output_path)}")
             else:
                 log("✗ Grid build failed", "ERROR")
                 st["state"] = "FAILED"
