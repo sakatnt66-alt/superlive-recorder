@@ -2,17 +2,12 @@
 """
 postprocess_recording.py — PHASE 2: Per-part MKV→MP4 conversion, delivery.
 
-ARCHITECTURE: Per-part independent processing.
-- Discovers ALL parts for this recording
-- Converts each part independently (no massive concat needed)
-- Validates each output before sending
-- Tracks state per-part for safe resume
-- Never falls back to a small/incomplete source without proof
-
-VIDEO: Stream copy (no re-encode) — preserves H.264, FPS, resolution exactly.
-AUDIO: Re-encoded to AAC 128k for MP4/Telegram compatibility.
-       Opus cannot be stream-copied into MP4 container reliably.
-       This is NOT bit-perfect but is high quality.
+FIXES in this version:
+  1. Logs FFmpeg stderr for diagnosis
+  2. Deduplicates parts found in multiple directories
+  3. Detects and corrects corrupt duration metadata
+  4. Multiple conversion strategies with fallback
+  5. Validates conversion output before accepting
 """
 
 import json
@@ -38,19 +33,17 @@ STATE_DIR          = RECORDINGS_DIR / "_state"
 STREAM_ID          = os.environ.get("STREAM_ID", "unknown")
 STREAM_NAME        = os.environ.get("STREAM_NAME", "")
 
-MAX_SEGMENT_BYTES  = 45 * 1024 * 1024  # Safe limit under Telegram's 50MB
+MAX_SEGMENT_BYTES  = 45 * 1024 * 1024
 TG_HARD_LIMIT      = 50 * 1024 * 1024
 MARKER_SUFFIX      = ".postprocessed"
 MP4_VIDEO_OK       = {"h264", "hevc", "mpeg4", "mjpeg"}
 SEND_DELAY_SECONDS = 3
 MAX_RETRIES        = 3
 
-# Minimum thresholds
-MIN_PART_SIZE_BYTES    = 100 * 1024        # 100 KB per part minimum
-MIN_SINGLE_SOURCE_SIZE = 1 * 1024 * 1024   # 1 MB for single source
-MIN_SOURCE_DURATION    = 5.0               # 5 seconds minimum
+MIN_PART_SIZE_BYTES    = 100 * 1024
+MIN_SINGLE_SOURCE_SIZE = 1 * 1024 * 1024
+MIN_SOURCE_DURATION    = 5.0
 
-# Worker API
 WORKER_API_URL = os.environ.get("WORKER_API_URL", "").strip()
 AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "").strip()
 if WORKER_API_URL and WORKER_API_URL.endswith('/'):
@@ -114,7 +107,6 @@ def safe_id(sid: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(sid))
 
 def file_hash(path: str) -> str:
-    """MD5 hash of first 1MB for quick identity check."""
     try:
         h = hashlib.md5()
         with open(path, 'rb') as f:
@@ -123,9 +115,6 @@ def file_hash(path: str) -> str:
     except Exception:
         return ""
 
-# ═══════════════════════════════════════════════════════════
-# WORKER STATE UPDATE
-# ═══════════════════════════════════════════════════════════
 def update_worker_final_state(sid: str, status: str, extra: dict = None):
     if not WORKER_API_URL or not AUTO_API_TOKEN:
         log("⚠️ Worker API not configured, skipping final state update")
@@ -146,7 +135,7 @@ def update_worker_final_state(sid: str, status: str, extra: dict = None):
         log(f"⚠️ Failed to update worker state: {e}")
 
 # ═══════════════════════════════════════════════════════════
-# MANIFEST — persistent per-recording state
+# MANIFEST
 # ═══════════════════════════════════════════════════════════
 def manifest_path(sid: str) -> Path:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -169,114 +158,98 @@ def save_manifest(sid: str, mf: dict) -> None:
     tmp.replace(p)
 
 # ═══════════════════════════════════════════════════════════
-# PART DISCOVERY — find all parts for THIS recording
+# PART DISCOVERY — deduplicated across directories
 # ═══════════════════════════════════════════════════════════
 def discover_parts() -> list:
     """
-    Find all MKV/WebM parts belonging to this recording.
+    Find all MKV parts, deduplicated by content hash.
+    Prefers files in _preserved over _temp.
     Returns list of (path, part_number, size) sorted by part number.
     """
-    parts = []
-    search_dirs = [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]
-    seen_hashes = set()
+    # Search _preserved FIRST (preferred), then others
+    search_order = [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]
+    parts_by_num = {}  # part_num -> (path, size, hash)
     
-    for d in search_dirs:
+    for d in search_order:
         if not d.exists():
             continue
-        # Look for _av_part_*.mkv and _av_part_*.webm
-        for pattern in ["*_av_part_*.mkv", "*_av_part_*.webm", "*_part_*.mkv", "*_part_*.webm"]:
+        for pattern in ["*_av_part_*.mkv", "*_av_part_*.webm"]:
             for f in d.glob(pattern):
                 try:
                     size = f.stat().st_size
                     if size < MIN_PART_SIZE_BYTES:
-                        log(f"  ⚠️ Skipping small part: {f.name} ({size} bytes)")
                         continue
                     
-                    # Deduplicate by hash
-                    fh = file_hash(str(f))
-                    if fh in seen_hashes:
-                        continue
-                    seen_hashes.add(fh)
-                    
-                    # Extract part number
                     m = re.search(r'_part_(\d+)', f.name)
-                    part_num = int(m.group(1)) if m else 0
+                    part_num = int(m.group(1)) if m else -1
+                    if part_num < 0:
+                        continue
                     
-                    parts.append((f, part_num, size))
+                    fh = file_hash(str(f))
+                    
+                    # If this part number already found, keep the one from _preserved
+                    if part_num in parts_by_num:
+                        existing_path = parts_by_num[part_num][0]
+                        # Prefer _preserved directory
+                        if "_preserved" in str(f) and "_preserved" not in str(existing_path):
+                            parts_by_num[part_num] = (f, size, fh)
+                        # Or keep larger file if same directory
+                        elif size > parts_by_num[part_num][1] and "_preserved" not in str(existing_path):
+                            parts_by_num[part_num] = (f, size, fh)
+                    else:
+                        parts_by_num[part_num] = (f, size, fh)
                 except OSError:
                     continue
     
-    # Sort by part number (numeric, not alphabetical)
-    parts.sort(key=lambda x: x[1])
+    # Build sorted list
+    parts = []
+    for part_num in sorted(parts_by_num.keys()):
+        f, size, fh = parts_by_num[part_num]
+        parts.append((f, part_num, size))
+    
     return parts
 
-def discover_single_source() -> str:
+# ═══════════════════════════════════════════════════════════
+# DURATION VALIDATION — detect corrupt metadata
+# ═══════════════════════════════════════════════════════════
+def estimate_real_duration(part_path: str, declared_duration: float, part_size: int,
+                           all_parts_info: list) -> float:
     """
-    Find a single complete MKV source.
-    CRITICAL: Must validate actual content, not just metadata duration.
+    Detect and correct corrupt duration metadata.
+    
+    If a part declares 2039s but is only 30MB while similar parts
+    are 107s at 35MB, the metadata is corrupt.
     """
-    candidates = []
-    search_dirs = [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]
-    
-    for d in search_dirs:
-        if not d.exists():
+    # Calculate median duration/size ratio from other parts
+    ratios = []
+    for info in all_parts_info:
+        if info["path"] == str(part_path):
             continue
-        for f in d.glob("*.mkv"):
-            name = f.name
-            if "_part_" in name or "_encoded" in name or "concatenated_" in name:
-                continue
-            try:
-                size = f.stat().st_size
-                if size >= MIN_SINGLE_SOURCE_SIZE:
-                    candidates.append((f, size))
-            except OSError:
-                continue
+        if info["size"] > 0 and info["duration"] > 0 and info["duration"] < 600:
+            ratios.append(info["duration"] / info["size"])
     
-    if not candidates:
-        return None
+    if not ratios:
+        return declared_duration
     
-    candidates.sort(key=lambda x: x[1], reverse=True)
+    # Use median ratio to estimate expected duration
+    ratios.sort()
+    median_ratio = ratios[len(ratios) // 2]
+    estimated_duration = part_size * median_ratio
     
-    for f, size in candidates:
-        info = ffprobe_json(str(f))
-        if not info:
-            continue
-        dur = get_duration(info)
-        vc, ac = get_codecs(info)
-        if not vc:
-            continue
-        if dur < MIN_SOURCE_DURATION:
-            continue
-        
-        # CRITICAL: Verify actual content by checking video packets
-        r = run(f'ffprobe -v quiet -count_packets -select_streams v:0 -show_entries stream=nb_read_packets -of csv=p=0 "{f}"', 120)
-        video_packets = 0
-        if r and r.returncode == 0 and r.stdout.strip():
-            try:
-                video_packets = int(r.stdout.strip())
-            except ValueError:
-                pass
-        
-        # Estimate expected packets from duration (assume ~30fps minimum)
-        expected_min_packets = int(dur * 10)  # Very conservative: 10 fps minimum
-        if video_packets < expected_min_packets:
-            log(f"  ⚠️ Rejecting {f.name}: only {video_packets} video packets for {dur:.1f}s duration (expected ≥{expected_min_packets})")
-            continue
-        
-        log(f"  ✓ Single source validated: {f.name} ({human_size(size)}, {dur:.1f}s, {video_packets} packets)")
-        return str(f)
+    # If declared duration is more than 3x the estimate, it's corrupt
+    if declared_duration > estimated_duration * 3:
+        log(f"    ⚠️ Duration metadata corrupt: declared={declared_duration:.1f}s, "
+            f"estimated={estimated_duration:.1f}s (from size {human_size(part_size)})")
+        return estimated_duration
     
-    return None
+    return declared_duration
 
-# ═══════════════════════════════════════════════════════════
-# PART VALIDATION
-# ═══════════════════════════════════════════════════════════
-def validate_part(path: str) -> dict:
-    """Validate a single part file."""
+def validate_part_with_correction(path: str, all_parts_info: list) -> dict:
+    """Validate a part and correct corrupt duration if detected."""
     result = {
         "valid": False, "reason": "", "duration": 0.0,
         "size": 0, "video_codec": None, "audio_codec": None,
-        "width": 0, "height": 0, "video_packets": 0
+        "width": 0, "height": 0
     }
     try:
         p = Path(path)
@@ -294,12 +267,7 @@ def validate_part(path: str) -> dict:
             result["reason"] = "ffprobe failed"
             return result
         
-        dur = get_duration(info)
-        result["duration"] = dur
-        if dur <= 0:
-            result["reason"] = "no duration"
-            return result
-        
+        declared_dur = get_duration(info)
         vc, ac = get_codecs(info)
         result["video_codec"] = vc
         result["audio_codec"] = ac
@@ -307,10 +275,17 @@ def validate_part(path: str) -> dict:
             result["reason"] = "no video"
             return result
         
+        # Correct corrupt duration
+        real_dur = estimate_real_duration(path, declared_dur, size, all_parts_info)
+        result["duration"] = real_dur
+        
+        if real_dur < 1.0:
+            result["reason"] = f"duration too short ({real_dur:.1f}s)"
+            return result
+        
         w, h = get_resolution(info)
         result["width"] = w
         result["height"] = h
-        
         result["valid"] = True
         result["reason"] = "ok"
     except Exception as e:
@@ -318,70 +293,83 @@ def validate_part(path: str) -> dict:
     return result
 
 # ═══════════════════════════════════════════════════════════
-# PART CONVERSION — MKV/WebM → MP4
+# PART CONVERSION — with detailed error logging
 # ═══════════════════════════════════════════════════════════
 def convert_part_to_mp4(part_path: str, output_path: str) -> bool:
     """
-    Convert a single MKV/WebM part to MP4.
-    Video: stream copy (preserves H.264, FPS, resolution exactly)
-    Audio: re-encode to AAC 128k for MP4 compatibility
+    Convert MKV/WebM part to MP4.
+    Video: stream copy. Audio: AAC re-encode.
+    Falls back to video-only if audio fails.
+    LOGS ALL ERRORS for diagnosis.
     """
-    # First try with audio
-    cmd = (
-        f'ffmpeg -y -i "{part_path}" '
+    abs_input = os.path.abspath(part_path)
+    abs_output = os.path.abspath(output_path)
+    
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(abs_output), exist_ok=True)
+    
+    # Strategy 1: Video copy + Audio AAC
+    cmd1 = (
+        f'ffmpeg -y -i "{abs_input}" '
         f'-c:v copy -c:a aac -b:a 128k '
         f'-movflags +faststart '
-        f'"{output_path}"'
+        f'"{abs_output}"'
     )
-    r = run(cmd, timeout=600)
-    if r and r.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-        return True
+    r1 = run(cmd1, timeout=600)
+    if r1 is not None and r1.returncode == 0:
+        if os.path.exists(abs_output) and os.path.getsize(abs_output) > 0:
+            return True
     
-    # If audio encoding failed, try video-only
-    cmd_no_audio = (
-        f'ffmpeg -y -i "{part_path}" '
+    # Log the actual error
+    stderr1 = (r1.stderr or "")[-500:] if r1 else "TIMEOUT"
+    log(f"    ⚠️ Strategy 1 failed: {stderr1}")
+    
+    # Strategy 2: Video copy + Audio copy into MKV, then remux to MP4
+    # (Sometimes direct AAC encoding fails but copy works)
+    tmp_mkv = abs_output + ".tmp_mkv"
+    cmd2 = (
+        f'ffmpeg -y -i "{abs_input}" '
+        f'-c:v copy -c:a copy '
+        f'"{tmp_mkv}"'
+    )
+    r2 = run(cmd2, timeout=300)
+    if r2 is not None and r2.returncode == 0 and os.path.exists(tmp_mkv) and os.path.getsize(tmp_mkv) > 0:
+        # Now convert MKV to MP4
+        cmd3 = (
+            f'ffmpeg -y -i "{tmp_mkv}" '
+            f'-c:v copy -c:a aac -b:a 128k '
+            f'-movflags +faststart '
+            f'"{abs_output}"'
+        )
+        r3 = run(cmd3, timeout=300)
+        try:
+            os.unlink(tmp_mkv)
+        except:
+            pass
+        if r3 is not None and r3.returncode == 0:
+            if os.path.exists(abs_output) and os.path.getsize(abs_output) > 0:
+                return True
+        stderr3 = (r3.stderr or "")[-300:] if r3 else "TIMEOUT"
+        log(f"    ⚠️ Strategy 2 remux failed: {stderr3}")
+    
+    # Strategy 3: Video copy, NO audio (video-only MP4)
+    cmd4 = (
+        f'ffmpeg -y -i "{abs_input}" '
         f'-c:v copy -an '
         f'-movflags +faststart '
-        f'"{output_path}"'
+        f'"{abs_output}"'
     )
-    r2 = run(cmd_no_audio, timeout=600)
-    if r2 and r2.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-        log(f"  ⚠️ Converted without audio (audio encoding failed)")
-        return True
+    r4 = run(cmd4, timeout=300)
+    if r4 is not None and r4.returncode == 0:
+        if os.path.exists(abs_output) and os.path.getsize(abs_output) > 0:
+            log(f"    ⚠️ Converted without audio (audio encoding failed)")
+            return True
     
+    stderr4 = (r4.stderr or "")[-500:] if r4 else "TIMEOUT"
+    log(f"    ✗ All conversion strategies failed. Last error: {stderr4}")
     return False
 
-def split_oversized_mp4(mp4_path: str, outdir: str, idx: int) -> list:
-    """Split an oversized MP4 into smaller segments."""
-    size = os.path.getsize(mp4_path)
-    info = ffprobe_json(mp4_path)
-    if not info:
-        return [mp4_path]
-    dur = get_duration(info)
-    if dur <= 0:
-        return [mp4_path]
-    
-    bitrate = size / dur
-    target_dur = max((MAX_SEGMENT_BYTES * 0.70) / bitrate, 5.0)
-    log(f"  Splitting oversized MP4: {human_size(size)} → ~{target_dur:.0f}s segments")
-    
-    pattern = os.path.join(outdir, f"split_{idx:03d}_%03d.mp4")
-    cmd = (
-        f'ffmpeg -y -i "{mp4_path}" '
-        f'-c:v copy -c:a aac -b:a 128k '
-        f'-f segment -segment_time {target_dur:.1f} '
-        f'-reset_timestamps 1 -movflags +faststart '
-        f'"{pattern}"'
-    )
-    r = run(cmd, timeout=600)
-    if r and r.returncode == 0:
-        subs = [str(s) for s in sorted(Path(outdir).glob(f"split_{idx:03d}_*.mp4")) if s.stat().st_size > 0]
-        if subs:
-            return subs
-    return [mp4_path]
-
 def verify_mp4(path: str) -> dict:
-    """Verify MP4 output is valid."""
     result = {"ok": False, "reason": "", "duration": 0.0, "width": 0, "height": 0, "has_audio": False, "size": 0}
     try:
         if not os.path.exists(path):
@@ -415,6 +403,32 @@ def verify_mp4(path: str) -> dict:
     except Exception as e:
         result["reason"] = str(e)
     return result
+
+def split_oversized_mp4(mp4_path: str, outdir: str, idx: int) -> list:
+    size = os.path.getsize(mp4_path)
+    info = ffprobe_json(mp4_path)
+    if not info:
+        return [mp4_path]
+    dur = get_duration(info)
+    if dur <= 0:
+        return [mp4_path]
+    bitrate = size / dur
+    target_dur = max((MAX_SEGMENT_BYTES * 0.70) / bitrate, 5.0)
+    log(f"  Splitting oversized MP4: {human_size(size)} → ~{target_dur:.0f}s segments")
+    pattern = os.path.join(outdir, f"split_{idx:03d}_%03d.mp4")
+    cmd = (
+        f'ffmpeg -y -i "{mp4_path}" '
+        f'-c:v copy -c:a aac -b:a 128k '
+        f'-f segment -segment_time {target_dur:.1f} '
+        f'-reset_timestamps 1 -movflags +faststart '
+        f'"{pattern}"'
+    )
+    r = run(cmd, timeout=600)
+    if r and r.returncode == 0:
+        subs = [str(s) for s in sorted(Path(outdir).glob(f"split_{idx:03d}_*.mp4")) if s.stat().st_size > 0]
+        if subs:
+            return subs
+    return [mp4_path]
 
 # ═══════════════════════════════════════════════════════════
 # TELEGRAM SENDING
@@ -471,227 +485,138 @@ def tg_send_video(video_path: str, caption: str, duration: int, width: int, heig
             log(f"  sendVideo attempt {attempt}/{MAX_RETRIES}: {e}")
         if attempt < MAX_RETRIES:
             wait = 5 * attempt
-            log(f"  Retrying in {wait}s...")
             time.sleep(wait)
     return result
 
 # ═══════════════════════════════════════════════════════════
-# SINGLE SOURCE PROCESSING (fallback for recordings without parts)
-# ═══════════════════════════════════════════════════════════
-def process_single_source(source_path: str, sid: str, mf: dict) -> bool:
-    """Process a single complete MKV file (no parts)."""
-    log(f"📂 Processing single source: {os.path.basename(source_path)}")
-    
-    info = ffprobe_json(source_path)
-    if not info:
-        return False
-    
-    duration = get_duration(info)
-    src_size = os.path.getsize(source_path)
-    vc, ac = get_codecs(info)
-    
-    log(f"⏱️ Duration: {format_ts(duration)} ({duration:.1f}s)")
-    log(f"📦 Size: {human_size(src_size)}")
-    log(f"🎬 Video: {vc}, Audio: {ac or 'NONE'}")
-    
-    if src_size < MIN_SINGLE_SOURCE_SIZE or duration < MIN_SOURCE_DURATION or not vc:
-        log("✗ Source validation failed")
-        return False
-    
-    # Split into segments
-    seg_dur = duration + 10 if src_size <= MAX_SEGMENT_BYTES else (MAX_SEGMENT_BYTES / (src_size / duration)) * 0.75
-    seg_dur = max(seg_dur, 10.0)
-    
-    with tempfile.TemporaryDirectory(prefix="pp_single_") as segdir:
-        pattern = os.path.join(segdir, "segment_%03d.mp4")
-        cmd = (
-            f'ffmpeg -y -i "{source_path}" '
-            f'-c:v copy -c:a aac -b:a 128k '
-            f'-f segment -segment_time {seg_dur:.1f} '
-            f'-reset_timestamps 1 -movflags +faststart '
-            f'"{pattern}"'
-        )
-        r = run(cmd, timeout=1800)
-        if not r or r.returncode != 0:
-            log("✗ Segmentation failed")
-            return False
-        
-        segments = [str(s) for s in sorted(Path(segdir).glob("segment_*.mp4")) if s.stat().st_size > 0]
-        if not segments:
-            log("✗ No segments produced")
-            return False
-        
-        total = len(segments)
-        sent_count = 0
-        display_name = STREAM_NAME or os.path.basename(source_path).split('_')[0]
-        
-        for idx, seg_path in enumerate(segments):
-            seg_key = f"single_seg_{idx:04d}"
-            
-            # Skip already sent
-            prev = mf["parts"].get(seg_key, {})
-            if prev.get("sent") and prev.get("message_id"):
-                log(f"  [{idx+1}/{total}] Already sent — skip")
-                sent_count += 1
-                continue
-            
-            verdict = verify_mp4(seg_path)
-            if not verdict["ok"]:
-                log(f"  [{idx+1}/{total}] ✗ {verdict['reason']}")
-                mf["parts"][seg_key] = {"sent": False, "error": verdict["reason"]}
-                continue
-            
-            if verdict["size"] > TG_HARD_LIMIT:
-                log(f"  [{idx+1}/{total}] ✗ Exceeds Telegram limit")
-                mf["parts"][seg_key] = {"sent": False, "error": "too_large"}
-                continue
-            
-            audio_note = "\n⚠️ بدون صوت" if not verdict["has_audio"] else ""
-            caption = (
-                f"🎬 {display_name}\n"
-                f"🆔 {sid}\n"
-                f"📎 المقطع {idx+1} من {total}\n"
-                f"⏱️ {format_ts(verdict['duration'])}"
-                f"{audio_note}"
-            )
-            
-            tg_res = tg_send_video(seg_path, caption, int(verdict["duration"]), verdict["width"], verdict["height"])
-            
-            if tg_res["ok"]:
-                log(f"  [{idx+1}/{total}] 📤 SENT ✅")
-                sent_count += 1
-                mf["parts"][seg_key] = {
-                    "sent": True, "message_id": tg_res["message_id"],
-                    "duration": round(verdict["duration"], 1),
-                    "has_audio": verdict["has_audio"],
-                }
-            else:
-                log(f"  [{idx+1}/{total}] ✗ Send failed: {tg_res['error']}")
-                mf["parts"][seg_key] = {"sent": False, "error": tg_res["error"]}
-            
-            save_manifest(sid, mf)
-            if idx < total - 1:
-                time.sleep(SEND_DELAY_SECONDS)
-        
-        # Coverage check
-        total_sent_dur = sum(p.get("duration", 0) for p in mf["parts"].values() if p.get("sent"))
-        coverage = min(total_sent_dur / duration, 1.0) if duration > 0 else 0
-        log(f"COVERAGE: {total_sent_dur:.1f}s / {duration:.1f}s ({coverage*100:.1f}%)")
-        
-        if coverage >= 0.95 and sent_count == total:
-            mf["state"] = "SENT"
-            save_manifest(sid, mf)
-            update_worker_final_state(sid, "completed", {
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-                "segments_sent": sent_count,
-                "coverage": round(coverage, 3),
-            })
-            return True
-        else:
-            mf["state"] = "PARTIAL"
-            save_manifest(sid, mf)
-            return False
-
-# ═══════════════════════════════════════════════════════════
-# MAIN — Per-part processing pipeline
+# MAIN
 # ═══════════════════════════════════════════════════════════
 def main():
     log("=" * 60)
     log("Post-processing pipeline — PHASE 2 (Per-part)")
     log(f"STREAM_ID={STREAM_ID}")
+    log(f"WORKER_API_URL={'SET' if WORKER_API_URL else 'MISSING'}")
     log("=" * 60)
     
     mf = load_manifest(STREAM_ID)
     
-    # If already completed, skip
     if mf.get("state") == "SENT":
         log("⏭️ Already completed — skipping")
         return
     
-    # ── Step 1: Discover parts ──
+    # ── Step 1: Discover parts (deduplicated) ──
     parts = discover_parts()
     
-    if parts and len(parts) > 0:
-        log(f"📦 Found {len(parts)} parts")
-        total_parts_size = sum(size for _, _, size in parts)
-        log(f"  Total parts size: {human_size(total_parts_size)}")
-    else:
-        log("📦 No parts found, checking for single source...")
-        single = discover_single_source()
-        if single:
-            success = process_single_source(single, STREAM_ID, mf)
-            if success:
-                log("✅ Single source processing completed")
+    if not parts:
+        log("✗ No parts found — checking for single source...")
+        # Try single source as last resort
+        candidates = []
+        for d in [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]:
+            if not d.exists():
+                continue
+            for f in d.glob("*.mkv"):
+                if "_part_" in f.name or "_encoded" in f.name or "concatenated_" in f.name:
+                    continue
+                try:
+                    size = f.stat().st_size
+                    if size >= MIN_SINGLE_SOURCE_SIZE:
+                        candidates.append((f, size))
+                except OSError:
+                    continue
+        if candidates:
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            f, size = candidates[0]
+            dur = get_duration_file(str(f))
+            if dur >= MIN_SOURCE_DURATION:
+                log(f"✓ Using single source: {f.name} ({human_size(size)}, {dur:.1f}s)")
+                parts = [(f, 0, size)]
             else:
-                log("⚠️ Single source processing incomplete")
-            return
+                log(f"✗ Single source too short: {dur:.1f}s")
+                mf["state"] = "FAILED_NO_SOURCE"
+                save_manifest(STREAM_ID, mf)
+                return
         else:
             log("✗ No valid source found — ABORTING")
             mf["state"] = "FAILED_NO_SOURCE"
             save_manifest(STREAM_ID, mf)
-            update_worker_final_state(STREAM_ID, "failed", {
-                "failed_at": datetime.now(timezone.utc).isoformat(),
-                "error": "no_source_found",
-            })
+            update_worker_final_state(STREAM_ID, "failed", {"error": "no_source_found"})
             return
+    
+    total_size = sum(size for _, _, size in parts)
+    log(f"📦 Found {len(parts)} unique parts, total size: {human_size(total_size)}")
     
     # ── Step 2: Validate all parts ──
     log("\n" + "=" * 60)
     log("PHASE 2a: Validating all parts")
     log("=" * 60)
     
+    # First pass: collect basic info for duration estimation
+    all_parts_info = []
+    for f, part_num, size in parts:
+        info = ffprobe_json(str(f))
+        dur = get_duration(info) if info else 0.0
+        vc, ac = get_codecs(info) if info else (None, None)
+        all_parts_info.append({
+            "path": str(f), "part_num": part_num, "size": size,
+            "duration": dur, "video_codec": vc, "audio_codec": ac
+        })
+    
+    # Second pass: validate with duration correction
     valid_parts = []
     total_expected_duration = 0.0
     
-    for f, part_num, size in parts:
-        part_key = f"part_{part_num:04d}"
+    for info in all_parts_info:
+        part_key = f"part_{info['part_num']:04d}"
         
-        # Check if already processed in manifest
+        # Check manifest cache
         prev = mf["parts"].get(part_key, {})
-        if prev.get("valid") is not None and prev.get("duration", 0) > 0:
-            # Use cached validation
-            valid_parts.append((f, part_num, size, prev["duration"]))
+        if prev.get("valid") is True and prev.get("duration", 0) > 0 and prev.get("sent"):
+            valid_parts.append(info)
             total_expected_duration += prev["duration"]
-            log(f"  Part {part_num}: cached (dur={prev['duration']:.1f}s)")
+            log(f"  Part {info['part_num']}: cached & sent")
             continue
         
-        validation = validate_part(str(f))
-        if validation["valid"]:
-            valid_parts.append((f, part_num, size, validation["duration"]))
-            total_expected_duration += validation["duration"]
-            mf["parts"][part_key] = {
-                "valid": True,
-                "path": str(f),
-                "size": size,
-                "duration": round(validation["duration"], 2),
-                "video_codec": validation["video_codec"],
-                "audio_codec": validation["audio_codec"],
-                "width": validation["width"],
-                "height": validation["height"],
-            }
-            log(f"  Part {part_num}: ✓ {validation['duration']:.1f}s, {human_size(size)}, v={validation['video_codec']}, a={validation['audio_codec'] or 'NONE'}")
-        else:
-            mf["parts"][part_key] = {
-                "valid": False,
-                "path": str(f),
-                "error": validation["reason"],
-            }
-            mf["errors"].append(f"part_{part_num}: {validation['reason']}")
-            log(f"  Part {part_num}: ✗ {validation['reason']}")
+        corrected_dur = estimate_real_duration(
+            info["path"], info["duration"], info["size"], all_parts_info
+        )
+        
+        if not info["video_codec"]:
+            log(f"  Part {info['part_num']}: ✗ no video")
+            mf["parts"][part_key] = {"valid": False, "error": "no_video"}
+            continue
+        
+        if corrected_dur < 1.0:
+            log(f"  Part {info['part_num']}: ✗ duration too short")
+            mf["parts"][part_key] = {"valid": False, "error": "too_short"}
+            continue
+        
+        info["duration"] = corrected_dur
+        valid_parts.append(info)
+        total_expected_duration += corrected_dur
+        
+        mf["parts"][part_key] = {
+            "valid": True,
+            "path": info["path"],
+            "size": info["size"],
+            "duration": round(corrected_dur, 2),
+            "video_codec": info["video_codec"],
+            "audio_codec": info["audio_codec"],
+        }
+        
+        dur_note = f" (corrected from {info['duration']:.0f}s)" if abs(corrected_dur - info['duration']) > 1 else ""
+        log(f"  Part {info['part_num']}: ✓ {corrected_dur:.1f}s, {human_size(info['size'])}, "
+            f"v={info['video_codec']}, a={info['audio_codec'] or 'NONE'}{dur_note}")
     
     save_manifest(STREAM_ID, mf)
     
     if not valid_parts:
-        log("✗ No valid parts found — ABORTING")
+        log("✗ No valid parts — ABORTING")
         mf["state"] = "FAILED_NO_VALID_PARTS"
         save_manifest(STREAM_ID, mf)
-        update_worker_final_state(STREAM_ID, "failed", {
-            "failed_at": datetime.now(timezone.utc).isoformat(),
-            "error": "no_valid_parts",
-        })
+        update_worker_final_state(STREAM_ID, "failed", {"error": "no_valid_parts"})
         return
     
-    log(f"\n✓ {len(valid_parts)} valid parts, total expected duration: {format_ts(total_expected_duration)}")
+    log(f"\n✓ {len(valid_parts)} valid parts, expected duration: {format_ts(total_expected_duration)}")
     
     # ── Step 3: Convert each part to MP4 ──
     log("\n" + "=" * 60)
@@ -708,11 +633,14 @@ def main():
     failed_count = 0
     total = len(valid_parts)
     
-    for idx, (part_path, part_num, part_size, part_duration) in enumerate(valid_parts):
+    for idx, part_info in enumerate(valid_parts):
+        part_num = part_info["part_num"]
+        part_path = part_info["path"]
+        part_size = part_info["size"]
+        part_duration = part_info["duration"]
         part_key = f"part_{part_num:04d}"
-        prev = mf["parts"].get(part_key, {})
         
-        # Skip already sent parts
+        prev = mf["parts"].get(part_key, {})
         if prev.get("sent") and prev.get("message_id"):
             log(f"  [{idx+1}/{total}] Part {part_num}: Already sent (msg={prev['message_id']}) — skip")
             sent_count += 1
@@ -721,22 +649,26 @@ def main():
         
         log(f"  [{idx+1}/{total}] Part {part_num}: Converting {human_size(part_size)}, {part_duration:.1f}s")
         
-        # Output path
         mp4_path = str(mp4_dir / f"part_{part_num:04d}.mp4")
+        tmp_mp4 = mp4_path + ".tmp"
         
-        # Check if MP4 already exists and is valid
+        # Check if already converted and valid
         need_convert = True
         if os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0:
             existing = verify_mp4(mp4_path)
-            if existing["ok"] and abs(existing["duration"] - part_duration) < 5.0:
+            if existing["ok"]:
                 log(f"    ✓ MP4 already exists and valid")
                 need_convert = False
         
         if need_convert:
-            # Use temp file first, then rename (atomic)
-            tmp_mp4 = mp4_path + ".tmp"
-            if not convert_part_to_mp4(str(part_path), tmp_mp4):
-                log(f"    ✗ Conversion failed")
+            if os.path.exists(tmp_mp4):
+                try:
+                    os.unlink(tmp_mp4)
+                except:
+                    pass
+            
+            if not convert_part_to_mp4(part_path, tmp_mp4):
+                log(f"    ✗ Conversion failed for part {part_num}")
                 mf["parts"][part_key]["sent"] = False
                 mf["parts"][part_key]["error"] = "conversion_failed"
                 mf["errors"].append(f"part_{part_num}: conversion_failed")
@@ -744,21 +676,24 @@ def main():
                 save_manifest(STREAM_ID, mf)
                 continue
             
-            # Validate the output
             tmp_verdict = verify_mp4(tmp_mp4)
             if not tmp_verdict["ok"]:
                 log(f"    ✗ Converted MP4 invalid: {tmp_verdict['reason']}")
-                os.unlink(tmp_mp4)
+                try:
+                    os.unlink(tmp_mp4)
+                except:
+                    pass
                 mf["parts"][part_key]["sent"] = False
                 mf["parts"][part_key]["error"] = f"invalid_mp4: {tmp_verdict['reason']}"
-                mf["errors"].append(f"part_{part_num}: invalid_mp4")
                 failed_count += 1
                 save_manifest(STREAM_ID, mf)
                 continue
             
-            # Atomic rename
             if os.path.exists(mp4_path):
-                os.unlink(mp4_path)
+                try:
+                    os.unlink(mp4_path)
+                except:
+                    pass
             os.rename(tmp_mp4, mp4_path)
         
         # Verify final MP4
@@ -771,53 +706,43 @@ def main():
             save_manifest(STREAM_ID, mf)
             continue
         
-        # Check size limit
+        # Handle oversized
         if verdict["size"] > MAX_SEGMENT_BYTES:
-            log(f"    ⚠️ MP4 oversized ({human_size(verdict['size'])}), splitting...")
+            log(f"    ⚠️ Oversized ({human_size(verdict['size'])}), splitting...")
             subs = split_oversized_mp4(mp4_path, str(mp4_dir), part_num)
-            if len(subs) > 1:
-                # Send each sub-segment
-                for sub_idx, sub_path in enumerate(subs):
-                    sub_verdict = verify_mp4(sub_path)
-                    if not sub_verdict["ok"]:
-                        continue
-                    if sub_verdict["size"] > TG_HARD_LIMIT:
-                        continue
-                    
-                    sub_key = f"{part_key}_sub{sub_idx:02d}"
-                    sub_prev = mf["parts"].get(sub_key, {})
-                    if sub_prev.get("sent") and sub_prev.get("message_id"):
-                        sent_count += 1
-                        total_sent_duration += sub_verdict["duration"]
-                        continue
-                    
-                    audio_note = "\n⚠️ بدون صوت" if not sub_verdict["has_audio"] else ""
-                    caption = (
-                        f"🎬 {display_name}\n"
-                        f"🆔 {STREAM_ID}\n"
-                        f"📎 الجزء {part_num+1}.{sub_idx+1}\n"
-                        f"⏱️ {format_ts(sub_verdict['duration'])}"
-                        f"{audio_note}"
-                    )
-                    tg_res = tg_send_video(sub_path, caption, int(sub_verdict["duration"]), sub_verdict["width"], sub_verdict["height"])
-                    if tg_res["ok"]:
-                        log(f"    📤 Sub {sub_idx+1} SENT ✅")
-                        sent_count += 1
-                        total_sent_duration += sub_verdict["duration"]
-                        mf["parts"][sub_key] = {
-                            "sent": True, "message_id": tg_res["message_id"],
-                            "duration": round(sub_verdict["duration"], 1),
-                            "has_audio": sub_verdict["has_audio"],
-                        }
-                    else:
-                        failed_count += 1
-                        mf["parts"][sub_key] = {"sent": False, "error": tg_res["error"]}
-                    save_manifest(STREAM_ID, mf)
-                    time.sleep(SEND_DELAY_SECONDS)
-                continue
+            for sub_idx, sub_path in enumerate(subs):
+                sub_verdict = verify_mp4(sub_path)
+                if not sub_verdict["ok"] or sub_verdict["size"] > TG_HARD_LIMIT:
+                    continue
+                sub_key = f"{part_key}_sub{sub_idx:02d}"
+                sub_prev = mf["parts"].get(sub_key, {})
+                if sub_prev.get("sent") and sub_prev.get("message_id"):
+                    sent_count += 1
+                    total_sent_duration += sub_verdict["duration"]
+                    continue
+                
+                audio_note = "\n⚠️ بدون صوت" if not sub_verdict["has_audio"] else ""
+                caption = (
+                    f"🎬 {display_name}\n🆔 {STREAM_ID}\n"
+                    f"📎 الجزء {part_num+1}.{sub_idx+1}\n"
+                    f"⏱️ {format_ts(sub_verdict['duration'])}{audio_note}"
+                )
+                tg_res = tg_send_video(sub_path, caption, int(sub_verdict["duration"]),
+                                       sub_verdict["width"], sub_verdict["height"])
+                if tg_res["ok"]:
+                    sent_count += 1
+                    total_sent_duration += sub_verdict["duration"]
+                    mf["parts"][sub_key] = {"sent": True, "message_id": tg_res["message_id"],
+                                            "duration": round(sub_verdict["duration"], 1)}
+                else:
+                    failed_count += 1
+                    mf["parts"][sub_key] = {"sent": False, "error": tg_res["error"]}
+                save_manifest(STREAM_ID, mf)
+                time.sleep(SEND_DELAY_SECONDS)
+            continue
         
         if verdict["size"] > TG_HARD_LIMIT:
-            log(f"    ✗ Exceeds Telegram limit: {human_size(verdict['size'])}")
+            log(f"    ✗ Exceeds Telegram limit")
             mf["parts"][part_key]["sent"] = False
             mf["parts"][part_key]["error"] = "exceeds_tg_limit"
             failed_count += 1
@@ -827,24 +752,22 @@ def main():
         # Send
         audio_note = "\n⚠️ بدون صوت" if not verdict["has_audio"] else ""
         caption = (
-            f"🎬 {display_name}\n"
-            f"🆔 {STREAM_ID}\n"
+            f"🎬 {display_name}\n🆔 {STREAM_ID}\n"
             f"📎 المقطع {idx+1} من {total}\n"
-            f"⏱️ {format_ts(verdict['duration'])}"
-            f"{audio_note}"
+            f"⏱️ {format_ts(verdict['duration'])}{audio_note}"
         )
         
-        tg_res = tg_send_video(mp4_path, caption, int(verdict["duration"]), verdict["width"], verdict["height"])
+        tg_res = tg_send_video(mp4_path, caption, int(verdict["duration"]),
+                               verdict["width"], verdict["height"])
         
         if tg_res["ok"]:
-            log(f"    📤 SENT ✅ (msg={tg_res['message_id']}, {verdict['duration']:.1f}s, audio={'YES' if verdict['has_audio'] else 'NO'})")
+            log(f"    📤 SENT ✅ (msg={tg_res['message_id']}, {verdict['duration']:.1f}s, "
+                f"audio={'YES' if verdict['has_audio'] else 'NO'})")
             sent_count += 1
             total_sent_duration += verdict["duration"]
             mf["parts"][part_key].update({
-                "sent": True,
-                "message_id": tg_res["message_id"],
-                "mp4_path": mp4_path,
-                "mp4_size": verdict["size"],
+                "sent": True, "message_id": tg_res["message_id"],
+                "mp4_path": mp4_path, "mp4_size": verdict["size"],
                 "mp4_duration": round(verdict["duration"], 1),
                 "has_audio": verdict["has_audio"],
             })
@@ -852,15 +775,13 @@ def main():
             log(f"    ✗ Send failed: {tg_res['error']}")
             mf["parts"][part_key]["sent"] = False
             mf["parts"][part_key]["send_error"] = tg_res["error"]
-            mf["errors"].append(f"part_{part_num}: send_{tg_res['error']}")
             failed_count += 1
         
         save_manifest(STREAM_ID, mf)
-        
         if idx < total - 1:
             time.sleep(SEND_DELAY_SECONDS)
     
-    # ── Step 4: Final coverage check ──
+    # ── Step 4: Coverage ──
     log("\n" + "=" * 60)
     log("PHASE 2c: Final Coverage Verification")
     log("=" * 60)
@@ -873,41 +794,23 @@ def main():
     if coverage >= 0.95 and failed_count == 0:
         mf["state"] = "SENT"
         mf["coverage"] = round(coverage, 3)
-        mf["total_sent_duration"] = round(total_sent_duration, 1)
-        mf["total_expected_duration"] = round(total_expected_duration, 1)
         save_manifest(STREAM_ID, mf)
-        
-        # Create marker file
-        marker_path = str(mp4_dir / f"{safe_id(STREAM_ID)}{MARKER_SUFFIX}")
-        with open(marker_path, "w") as f:
-            json.dump({
-                "sent_at": datetime.now(timezone.utc).isoformat(),
-                "parts": sent_count,
-                "coverage": round(coverage, 3),
-                "total_duration": round(total_sent_duration, 1),
-            }, f)
-        
-        log("✅ ALL parts sent successfully with full coverage")
+        log("✅ ALL parts sent with full coverage")
         update_worker_final_state(STREAM_ID, "completed", {
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "segments_sent": sent_count,
             "coverage": round(coverage, 3),
-            "total_duration": round(total_sent_duration, 1),
         })
     elif sent_count > 0:
         mf["state"] = "PARTIAL"
         mf["coverage"] = round(coverage, 3)
         save_manifest(STREAM_ID, mf)
-        log(f"⚠️ PARTIAL: {sent_count}/{total} sent. Manifest preserved for retry.")
-        log(f"  Re-run this script to retry failed parts only.")
+        log(f"⚠️ PARTIAL: {sent_count}/{total}. Re-run to retry failed parts.")
     else:
         mf["state"] = "FAILED"
         save_manifest(STREAM_ID, mf)
         log("✗ No parts sent.")
-        update_worker_final_state(STREAM_ID, "failed", {
-            "failed_at": datetime.now(timezone.utc).isoformat(),
-            "error": "no_parts_sent",
-        })
+        update_worker_final_state(STREAM_ID, "failed", {"error": "no_parts_sent"})
     
     log("Source files NEVER deleted by this pipeline.")
 
