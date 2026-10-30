@@ -114,12 +114,14 @@ jobs:
           STREAM_NAME: ${{ github.event.client_payload.stream_name || '' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WORKER_API_URL: ${{ secrets.WORKER_API_URL }}
+          AUTO_API_TOKEN: ${{ secrets.AUTO_API_TOKEN }}
         run: |
           echo "========================================"
           echo "POST-PROCESSING PIPELINE"
           echo "========================================"
           echo "--- Directory contents ---"
-          find recordings/ -type f \( -name "*.mkv" -o -name "*.mp4" -o -name "*.h264" -o -name "*.webm" \) 2>/dev/null | head -30
+          find recordings/ -type f \( -name "*.mkv" -o -name "*.mp4" -o -name "*.h264" -o -name "*.webm" \) 2>/dev/null | head -50
           echo "--- Starting postprocess ---"
           python postprocess_recording.py
 
@@ -132,15 +134,17 @@ jobs:
           STREAM_NAME: ${{ github.event.client_payload.stream_name || '' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          CS_COLS: "2"
-          CS_ROWS: "6"
-          CS_CELL_W: "320"
-          CS_CELL_H: "180"
-          CS_GAP: "4"
-          CS_QUALITY: "85"
+          CS_COLS: "3"
+          CS_ROWS: "4"
+          CS_CELL_W: "360"
+          CS_CELL_H: "640"
+          CS_GAP: "1"
+          CS_MARGIN: "5"
+          CS_QUALITY: "92"
+          CS_FONT_SIZE: "28"
         run: |
           echo "========================================"
-          echo "FULL STREAM CONTACT SHEET (PORTRAIT 2x6)"
+          echo "FULL STREAM CONTACT SHEET (PORTRAIT 3x4)"
           echo "========================================"
           python full_stream_contact_sheet.py || true
 
