@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 """
 full_stream_contact_sheet.py — Contact Sheet from Per-part sources.
-
-Creates ONE portrait JPG with 12 frames from the FULL recording.
-Extracts frames directly from individual parts (no massive concat needed).
-
-Grid: 3 columns x 4 rows = 12 frames.
-Design: UNCHANGED from previous version.
+FIXES: Deduplicates parts, corrects corrupt durations, extracts from correct part.
+Design: UNCHANGED (3x4 grid, crop-to-fill, timestamp overlay).
 """
 
 import json
@@ -47,7 +43,6 @@ FONT_SIZE    = int(os.environ.get("CS_FONT_SIZE", "28"))
 BG_COLOR     = os.environ.get("CS_BG_COLOR", "black")
 MAX_TG_PHOTO = 10 * 1024 * 1024
 TEXT_H       = FONT_SIZE + 8
-
 MIN_PART_SIZE = 100 * 1024
 
 def log(msg: str, level: str = "INFO") -> None:
@@ -101,76 +96,88 @@ def format_timestamp(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 # ═══════════════════════════════════════════════════════════
-# PART DISCOVERY — same logic as postprocess_recording.py
+# PART DISCOVERY — deduplicated, duration-corrected
 # ═══════════════════════════════════════════════════════════
 def discover_parts_with_durations() -> list:
-    """
-    Find all parts and their durations.
-    Returns list of (path, part_num, duration, start_offset) sorted by part_num.
-    """
-    parts = []
-    search_dirs = [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]
+    """Find deduplicated parts with corrected durations."""
+    search_order = [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]
+    parts_by_num = {}
     
-    for d in search_dirs:
+    for d in search_order:
         if not d.exists():
             continue
-        for pattern in ["*_av_part_*.mkv", "*_av_part_*.webm", "*_part_*.mkv", "*_part_*.webm"]:
+        for pattern in ["*_av_part_*.mkv", "*_av_part_*.webm"]:
             for f in d.glob(pattern):
                 try:
                     size = f.stat().st_size
                     if size < MIN_PART_SIZE:
                         continue
                     m = re.search(r'_part_(\d+)', f.name)
-                    part_num = int(m.group(1)) if m else 0
-                    dur = get_duration(str(f))
-                    if dur > 0:
-                        parts.append((str(f), part_num, dur))
+                    part_num = int(m.group(1)) if m else -1
+                    if part_num < 0:
+                        continue
+                    if part_num in parts_by_num:
+                        # Prefer _preserved
+                        if "_preserved" in str(f):
+                            parts_by_num[part_num] = (str(f), part_num, size)
+                    else:
+                        parts_by_num[part_num] = (str(f), part_num, size)
                 except OSError:
                     continue
     
-    if not parts:
+    if not parts_by_num:
         return []
     
-    # Sort by part number
-    parts.sort(key=lambda x: x[1])
+    # Get durations and correct corrupt ones
+    raw_parts = []
+    for part_num in sorted(parts_by_num.keys()):
+        path, num, size = parts_by_num[part_num]
+        dur = get_duration(path)
+        raw_parts.append((path, num, size, dur))
     
-    # Calculate start offsets
+    # Calculate median duration/size ratio for correction
+    valid_ratios = [(dur / size) for _, _, size, dur in raw_parts
+                    if size > 0 and 0 < dur < 600]
+    
     result = []
     cumulative = 0.0
-    for path, part_num, dur in parts:
-        result.append((path, part_num, dur, cumulative))
+    
+    for path, num, size, dur in raw_parts:
+        # Detect corrupt duration
+        if valid_ratios:
+            valid_ratios.sort()
+            median_ratio = valid_ratios[len(valid_ratios) // 2]
+            estimated = size * median_ratio
+            if dur > estimated * 3:
+                log(f"Part {num}: correcting duration {dur:.0f}s → {estimated:.0f}s", "WARN")
+                dur = estimated
+        
+        if dur < 0.5:
+            dur = max(size * valid_ratios[len(valid_ratios)//2], 1.0) if valid_ratios else 1.0
+        
+        result.append((path, num, dur, cumulative))
         cumulative += dur
     
     return result
 
 def find_single_source() -> str:
-    """Find a single complete MKV source."""
-    search_dirs = [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]
-    candidates = []
-    for d in search_dirs:
+    for d in [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]:
         if not d.exists():
             continue
         for f in d.glob("*.mkv"):
-            name = f.name
-            if "_part_" in name or "_encoded" in name or "concatenated_" in name:
+            if "_part_" in f.name or "_encoded" in f.name or "concatenated_" in f.name:
                 continue
             try:
-                size = f.stat().st_size
-                if size >= 1024 * 1024:
-                    candidates.append((f, size))
+                if f.stat().st_size >= 1024 * 1024:
+                    dur = get_duration(str(f))
+                    if dur >= 5.0:
+                        return str(f)
             except OSError:
                 continue
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    for f, size in candidates:
-        dur = get_duration(str(f))
-        if dur >= 5.0:
-            return str(f)
     return None
 
 # ═══════════════════════════════════════════════════════════
-# TIMESTAMP CALCULATION
+# TIMESTAMPS
 # ═══════════════════════════════════════════════════════════
 def calculate_timestamps(duration: float, count: int) -> list:
     if duration <= 0 or count <= 0:
@@ -182,91 +189,82 @@ def calculate_timestamps(duration: float, count: int) -> list:
     timestamps = []
     for i in range(count):
         ts = margin + usable * i / (count - 1)
-        ts = max(0, min(ts, duration - 0.1))
-        timestamps.append(ts)
+        timestamps.append(max(0, min(ts, duration - 0.1)))
     return timestamps
 
 # ═══════════════════════════════════════════════════════════
-# FRAME EXTRACTION — from individual parts (no concat needed)
+# FRAME EXTRACTION
 # ═══════════════════════════════════════════════════════════
 def get_frame_hash(path: str) -> str:
     try:
         with open(path, 'rb') as f:
-            data = f.read()
-        return hashlib.md5(data).hexdigest()
+            return hashlib.md5(f.read()).hexdigest()
     except Exception:
         return ""
 
-def extract_frame_from_part(part_path: str, offset_in_part: float, out_path: str) -> bool:
-    """Extract a single frame from a part at the given offset."""
-    # Strategy 1: Fast seek
-    cmd = f'ffmpeg -y -ss {offset_in_part:.3f} -i "{part_path}" -frames:v 1 -q:v 2 "{out_path}"'
+def extract_frame_from_part(part_path: str, offset: float, out_path: str) -> bool:
+    abs_part = os.path.abspath(part_path)
+    abs_out = os.path.abspath(out_path)
+    
+    cmd = f'ffmpeg -y -ss {offset:.3f} -i "{abs_part}" -frames:v 1 -q:v 2 "{abs_out}"'
     r = run_cmd(cmd, timeout=30)
-    if r and r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+    if r and r.returncode == 0 and os.path.exists(abs_out) and os.path.getsize(abs_out) > 0:
         return True
     
-    # Strategy 2: Accurate seek
-    cmd2 = f'ffmpeg -y -i "{part_path}" -ss {offset_in_part:.3f} -frames:v 1 -q:v 2 "{out_path}"'
+    cmd2 = f'ffmpeg -y -i "{abs_part}" -ss {offset:.3f} -frames:v 1 -q:v 2 "{abs_out}"'
     r2 = run_cmd(cmd2, timeout=60)
-    if r2 and r2.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+    if r2 and r2.returncode == 0 and os.path.exists(abs_out) and os.path.getsize(abs_out) > 0:
         return True
     
     return False
 
 def extract_frames_from_parts(parts: list, timestamps: list, tmpdir: str) -> list:
-    """
-    Extract frames from individual parts.
-    Each timestamp is mapped to the correct part based on cumulative offsets.
-    """
     frames = []
     frame_hashes = set()
-    total_duration = sum(dur for _, _, dur, _ in parts)
     
     for i, ts in enumerate(timestamps):
         out = os.path.join(tmpdir, f"frame_{i:03d}.jpg")
         label = format_timestamp(ts)
         
-        # Find which part contains this timestamp
         target_part = None
         offset_in_part = 0.0
+        part_duration = 0.0
         
         for part_path, part_num, part_dur, start_offset in parts:
             if start_offset <= ts < start_offset + part_dur:
                 target_part = part_path
                 offset_in_part = ts - start_offset
+                part_duration = part_dur
                 break
         
-        if target_part is None:
-            # Timestamp beyond last part, use last part
-            if parts:
-                target_part = parts[-1][0]
-                offset_in_part = max(0, parts[-1][2] - 1.0)
-            else:
-                log(f"Frame {i+1}/{len(timestamps)} at {label}: no part available", "ERROR")
-                continue
+        if target_part is None and parts:
+            target_part = parts[-1][0]
+            offset_in_part = max(0.1, parts[-1][2] - 1.0)
+            part_duration = parts[-1][2]
         
-        # Try to extract
+        if target_part is None:
+            log(f"Frame {i+1}/{len(timestamps)} at {label}: no part", "ERROR")
+            continue
+        
         success = extract_frame_from_part(target_part, offset_in_part, out)
         
         if success:
-            frame_hash = get_frame_hash(out)
-            if frame_hash and frame_hash not in frame_hashes:
-                frame_hashes.add(frame_hash)
+            fh = get_frame_hash(out)
+            if fh and fh not in frame_hashes:
+                frame_hashes.add(fh)
                 frames.append((out, ts, label))
                 continue
-            else:
-                log(f"Frame {i+1} at {label}: duplicate detected, trying nearby", "WARN")
         
-        # Fallback: try nearby offsets within the same part
+        # Fallback: nearby offsets
         found = False
-        for offset_delta in [-3.0, -1.0, 1.0, 3.0, -5.0, 5.0]:
-            nearby_offset = max(0.1, min(offset_in_part + offset_delta, parts[-1][2] - 0.5))
-            if extract_frame_from_part(target_part, nearby_offset, out):
-                frame_hash = get_frame_hash(out)
-                if frame_hash and frame_hash not in frame_hashes:
-                    frame_hashes.add(frame_hash)
+        for delta in [-3.0, -1.0, 1.0, 3.0, -5.0, 5.0, -10.0, 10.0]:
+            nearby = max(0.1, min(offset_in_part + delta, part_duration - 0.5))
+            if extract_frame_from_part(target_part, nearby, out):
+                fh = get_frame_hash(out)
+                if fh and fh not in frame_hashes:
+                    frame_hashes.add(fh)
                     frames.append((out, ts, label))
-                    log(f"Frame {i+1}/{len(timestamps)} at {label}: recovered from nearby offset", "WARN")
+                    log(f"Frame {i+1} at {label}: recovered from offset {nearby:.1f}s", "WARN")
                     found = True
                     break
         
@@ -276,7 +274,6 @@ def extract_frames_from_parts(parts: list, timestamps: list, tmpdir: str) -> lis
     return frames
 
 def extract_frames_from_single(source: str, timestamps: list, tmpdir: str) -> list:
-    """Extract frames from a single source file."""
     frames = []
     frame_hashes = set()
     source_duration = get_duration(source)
@@ -285,39 +282,17 @@ def extract_frames_from_single(source: str, timestamps: list, tmpdir: str) -> li
         out = os.path.join(tmpdir, f"frame_{i:03d}.jpg")
         label = format_timestamp(ts)
         
-        cmd = f'ffmpeg -y -ss {ts:.3f} -i "{source}" -frames:v 1 -q:v 2 "{out}"'
-        r = run_cmd(cmd, timeout=30)
-        if r and r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
-            frame_hash = get_frame_hash(out)
-            if frame_hash and frame_hash not in frame_hashes:
-                frame_hashes.add(frame_hash)
-                frames.append((out, ts, label))
-                continue
-        
-        cmd2 = f'ffmpeg -y -i "{source}" -ss {ts:.3f} -frames:v 1 -q:v 2 "{out}"'
-        r2 = run_cmd(cmd2, timeout=60)
-        if r2 and r2.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
-            frame_hash = get_frame_hash(out)
-            if frame_hash and frame_hash not in frame_hashes:
-                frame_hashes.add(frame_hash)
-                frames.append((out, ts, label))
-                continue
-        
-        # Nearby fallback
-        found = False
-        for offset in [-5.0, -3.0, -1.0, 1.0, 3.0, 5.0]:
-            nearby_ts = max(0.1, min(ts + offset, source_duration - 0.5))
-            cmd3 = f'ffmpeg -y -ss {nearby_ts:.3f} -i "{source}" -frames:v 1 -q:v 2 "{out}"'
-            r3 = run_cmd(cmd3, timeout=30)
-            if r3 and r3.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
-                frame_hash = get_frame_hash(out)
-                if frame_hash and frame_hash not in frame_hashes:
-                    frame_hashes.add(frame_hash)
-                    frames.append((out, nearby_ts, label))
-                    found = True
+        for seek_ts in [ts] + [max(0.1, min(ts + d, source_duration - 0.5))
+                                for d in [-3, -1, 1, 3, -5, 5]]:
+            cmd = f'ffmpeg -y -ss {seek_ts:.3f} -i "{source}" -frames:v 1 -q:v 2 "{out}"'
+            r = run_cmd(cmd, timeout=30)
+            if r and r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+                fh = get_frame_hash(out)
+                if fh and fh not in frame_hashes:
+                    frame_hashes.add(fh)
+                    frames.append((out, ts, label))
                     break
-        
-        if not found:
+        else:
             log(f"Frame {i+1}/{len(timestamps)} at {label}: FAILED", "ERROR")
     
     return frames
@@ -406,10 +381,10 @@ def build_contact_sheet(frames: list, output_path: str) -> bool:
 def send_photo(photo_path: str, caption: str) -> dict:
     result = {"ok": False, "message_id": None, "error": ""}
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        result["error"] = "Telegram credentials not configured"
+        result["error"] = "no credentials"
         return result
     if os.path.getsize(photo_path) > MAX_TG_PHOTO:
-        result["error"] = "Photo too large"
+        result["error"] = "too large"
         return result
 
     boundary = uuid.uuid4().hex
@@ -463,14 +438,12 @@ def main():
         log("⏭️  Already sent — skipping")
         return
 
-    # Try per-part extraction first
     parts = discover_parts_with_durations()
     single_source = None
-    
+
     if parts and len(parts) > 0:
         total_duration = sum(dur for _, _, dur, _ in parts)
-        log(f"📦 Found {len(parts)} parts, total duration: {format_timestamp(total_duration)}")
-        
+        log(f"📦 Found {len(parts)} unique parts, total duration: {format_timestamp(total_duration)}")
         if total_duration < 5.0:
             log("✗ Total duration too short", "ERROR")
             st["state"] = "INVALID_SOURCE"
@@ -508,22 +481,22 @@ def main():
         save_state(st)
 
         with tempfile.TemporaryDirectory(prefix="cs_frames_") as tmpdir:
-            if parts and len(parts) > 0:
+            if parts:
                 frames = extract_frames_from_parts(parts, timestamps, tmpdir)
             else:
                 frames = extract_frames_from_single(single_source, timestamps, tmpdir)
-            
+
             log(f"🖼️  Extracted {len(frames)}/{TOTAL_FRAMES} frames")
-            
+
             if len(frames) < 4:
                 log("✗ Not enough frames extracted", "ERROR")
                 st["state"] = "FAILED"
                 save_state(st)
                 return
-            
+
             if len(frames) < TOTAL_FRAMES:
-                log(f"⚠️ Only {len(frames)}/{TOTAL_FRAMES} frames, proceeding", "WARN")
-            
+                log(f"⚠️ Only {len(frames)}/{TOTAL_FRAMES} frames", "WARN")
+
             if build_contact_sheet(frames, output_path):
                 log(f"✅ Contact sheet created: {os.path.basename(output_path)}")
             else:
@@ -567,5 +540,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log(f"❌ Fatal error (isolated): {e}", "ERROR")
+        log(f"❌ Fatal error: {e}", "ERROR")
         sys.exit(0)
