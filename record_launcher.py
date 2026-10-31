@@ -12,6 +12,7 @@ TARGETED FIX APPLIED:
 
 ALL OTHER FUNCTIONS: UNCHANGED.
 record_once.py: NOT MODIFIED.
+3600-second limit: PRESERVED.
 """
 
 import asyncio
@@ -228,7 +229,7 @@ def recover_and_mux_recording() -> list:
     FIXES APPLIED:
     - Temp file uses .tmp.mkv extension (NOT .mkv.tmp) so FFmpeg
       correctly infers the Matroska muxer from the final extension.
-    - Added explicit '-f matroska' as additional safety.
+    - Added explicit '-f matroska' flag as additional safety.
     - Validates output duration and streams before accepting.
     - Uses atomic rename only after successful verification.
     - Minimum size checks prevent selecting empty/tiny raw files.
