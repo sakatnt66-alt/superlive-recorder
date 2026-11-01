@@ -3,15 +3,13 @@
 postprocess_recording.py — PHASE 2: MKV→MP4 segmentation, verification, delivery.
 
 CRITICAL FIXES:
-  1. Source integrity verification: detects truncated MKV by comparing
-     actual file size against expected size from packet counts and bitrate.
-  2. Automatic rebuild from raw H.264 + audio when truncation detected.
-  3. Proper source interval tracking for timeline coverage verification.
-  4. Size-aware segmentation targeting ~40 MiB, hard limit < 45 MiB.
-  5. Audio is OPTIONAL. Video-only segments are always accepted.
-  6. Isolated attempt directories prevent contamination.
-  7. Atomic operations with validation before rename.
-  8. Worker API errors isolated from media processing status.
+  1. verify_source_integrity() now accepts expected_duration and rejects files
+     where actual duration deviates >10% from expected (prevents accepting
+     2.1s rebuilt files for 16-minute recordings).
+  2. rebuild_from_raw() now specifies -framerate to prevent FFmpeg from
+     assigning incorrect timestamps to raw H.264 streams.
+  3. find_best_source() passes expected duration and FPS from truncated MKV
+     to the rebuild function for accurate reconstruction.
 """
 
 import json
@@ -211,14 +209,13 @@ def save_manifest(sid: str, mf: dict) -> None:
 # ═══════════════════════════════════════════════════════════
 # SOURCE INTEGRITY VERIFICATION
 # ═══════════════════════════════════════════════════════════
-def verify_source_integrity(path: str) -> dict:
+def verify_source_integrity(path: str, expected_duration: float = 0.0) -> dict:
     """
-    Verify source file integrity by cross-checking:
-    - File size vs expected size from packet counts
-    - Duration from metadata vs duration from packet count / fps
-    - Actual decodable content vs claimed duration
-    
+    Verify source file integrity.
     ALWAYS returns a dict. Never returns bool.
+    
+    FIX: Now checks if actual duration matches expected_duration.
+    Rejects files where duration deviates >10% from expected.
     """
     result = {
         "valid": False,
@@ -279,11 +276,19 @@ def verify_source_integrity(path: str) -> dict:
         if ac:
             result["audio_packets"] = ffprobe_packets(str(p), "a")
 
-        # CRITICAL: Check if file is truncated
-        # Method 1: Compare packet-derived duration with container duration
+        # CRITICAL FIX: Cross-check expected duration
+        if expected_duration > 0:
+            tolerance = max(5.0, expected_duration * 0.10)
+            if abs(dur - expected_duration) > tolerance:
+                result["valid"] = False
+                result["reason"] = (
+                    f"DURATION_MISMATCH: expected ~{expected_duration:.1f}s, got {dur:.1f}s"
+                )
+                return result
+
+        # Check if file is truncated (container duration vs packet duration)
         if result["fps"] > 0 and result["video_packets"] > 0:
             packet_duration = result["video_packets"] / result["fps"]
-            # If container says 1651s but packets only cover 998s, file is truncated
             if dur > packet_duration * 1.15:  # 15% tolerance
                 result["truncated"] = True
                 result["reason"] = (
@@ -291,7 +296,6 @@ def verify_source_integrity(path: str) -> dict:
                     f"packet count {result['video_packets']} @ {result['fps']:.1f}fps "
                     f"only covers {packet_duration:.1f}s"
                 )
-                # Use packet-derived duration as the REAL duration
                 result["duration"] = packet_duration
                 return result
 
@@ -332,37 +336,51 @@ def find_raw_sources() -> dict:
         if not d.exists():
             continue
         for f in d.glob("*_encoded.h264"):
-            size = f.stat().st_size
+            try:
+                size = f.stat().st_size
+            except OSError:
+                continue
             if size > MIN_FILE_SIZE:
                 if sources["video"] is None or size > sources["video"].stat().st_size:
                     sources["video"] = f
         for f in d.glob("*_audio.webm"):
-            size = f.stat().st_size
+            try:
+                size = f.stat().st_size
+            except OSError:
+                continue
             if size > MIN_FILE_SIZE:
                 if sources["audio"] is None or size > sources["audio"].stat().st_size:
                     sources["audio"] = f
     return sources
 
 
-def rebuild_from_raw(video_path: str, audio_path: str, output_path: str) -> bool:
-    """Rebuild complete MKV from raw H.264 + audio."""
+def rebuild_from_raw(video_path: str, audio_path: str, output_path: str, fps: float = 30.0) -> bool:
+    """
+    Rebuild complete MKV from raw H.264 + audio.
+    
+    FIX: Now specifies -framerate to prevent FFmpeg from assigning
+    incorrect timestamps to raw H.264 streams.
+    """
     log(f"  🔧 Rebuilding from raw sources...")
     log(f"    Video: {os.path.basename(video_path)} ({human_size(os.path.getsize(video_path))})")
     if audio_path:
         log(f"    Audio: {os.path.basename(audio_path)} ({human_size(os.path.getsize(audio_path))})")
+    log(f"    Target FPS: {fps}")
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     tmp_out = output_path.replace(".mkv", ".tmp.mkv")
 
+    fps_flag = f"-framerate {fps}" if fps > 0 else ""
+
     if audio_path:
         cmd = (
-            f'ffmpeg -y -i "{os.path.abspath(video_path)}" '
+            f'ffmpeg -y {fps_flag} -i "{os.path.abspath(video_path)}" '
             f'-i "{os.path.abspath(audio_path)}" '
             f'-c:v copy -c:a copy -f matroska "{tmp_out}"'
         )
     else:
         cmd = (
-            f'ffmpeg -y -i "{os.path.abspath(video_path)}" '
+            f'ffmpeg -y {fps_flag} -i "{os.path.abspath(video_path)}" '
             f'-c:v copy -an -f matroska "{tmp_out}"'
         )
 
@@ -447,10 +465,14 @@ def find_best_source() -> dict:
                 os.makedirs(rebuild_dir, exist_ok=True)
                 rebuild_path = os.path.join(rebuild_dir, f"rebuilt_{sid}.mkv")
 
+                # FIX: Pass expected duration and FPS from truncated MKV
+                expected_dur = validation["duration"]
+                expected_fps = validation["fps"]
+
                 audio_str = str(raw["audio"]) if raw["audio"] else None
-                if rebuild_from_raw(str(raw["video"]), audio_str, rebuild_path):
-                    # Verify the rebuild
-                    rebuild_validation = verify_source_integrity(rebuild_path)
+                if rebuild_from_raw(str(raw["video"]), audio_str, rebuild_path, expected_fps):
+                    # FIX: Verify the rebuild against expected duration
+                    rebuild_validation = verify_source_integrity(rebuild_path, expected_duration=expected_dur)
                     if rebuild_validation["valid"] and not rebuild_validation["truncated"]:
                         log(f"  ✓ Rebuild successful and verified")
                         return {"type": "rebuilt_from_raw", "validation": rebuild_validation}
