@@ -2,14 +2,11 @@
 """
 postprocess_recording.py — PHASE 2: MKV→MP4 segmentation, verification, delivery.
 
-CRITICAL FIXES:
-  1. verify_source_integrity() now accepts expected_duration and rejects files
-     where actual duration deviates >10% from expected (prevents accepting
-     2.1s rebuilt files for 16-minute recordings).
-  2. rebuild_from_raw() now specifies -framerate to prevent FFmpeg from
-     assigning incorrect timestamps to raw H.264 streams.
-  3. find_best_source() passes expected duration and FPS from truncated MKV
-     to the rebuild function for accurate reconstruction.
+PROJECT-WIDE FIXES:
+  1. Removed flawed 'tail -1' PTS check that falsely flagged long recordings as truncated.
+  2. Raw source discovery now filters by recording timestamp to prevent stale file mixing.
+  3. Rebuild validation uses packet-derived duration, not corrupted container metadata.
+  4. Audio is strictly OPTIONAL. Video-only segments are always accepted.
 """
 
 import json
@@ -76,7 +73,7 @@ def sha256_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> str:
 
 
 def ffprobe_json(path: str):
-    r = run(f'ffprobe -v quiet -print_format json -show_format -show_streams "{path}"', 60)
+    r = run(f'ffprobe -v quiet -print_format json -show_format -show_streams "{path}"', 120)
     if r and r.returncode == 0:
         try:
             return json.loads(r.stdout)
@@ -212,27 +209,16 @@ def save_manifest(sid: str, mf: dict) -> None:
 def verify_source_integrity(path: str, expected_duration: float = 0.0) -> dict:
     """
     Verify source file integrity.
-    ALWAYS returns a dict. Never returns bool.
-    
-    FIX: Now checks if actual duration matches expected_duration.
-    Rejects files where duration deviates >10% from expected.
+    FIX: Removed flawed 'tail -1' PTS check. Relies on format.duration
+    and packet_count/fps consistency.
     """
     result = {
-        "valid": False,
-        "reason": "",
-        "path": str(path),
-        "size": 0,
-        "sha256": "",
-        "duration": 0.0,
-        "video_codec": None,
-        "audio_codec": None,
-        "width": 0,
-        "height": 0,
-        "fps": 0.0,
-        "video_packets": 0,
-        "audio_packets": 0,
-        "truncated": False,
-        "expected_size": 0,
+        "valid": False, "reason": "", "path": str(path),
+        "size": 0, "sha256": "", "duration": 0.0,
+        "video_codec": None, "audio_codec": None,
+        "width": 0, "height": 0, "fps": 0.0,
+        "video_packets": 0, "audio_packets": 0,
+        "truncated": False, "expected_size": 0,
     }
     try:
         p = Path(path)
@@ -271,12 +257,11 @@ def verify_source_integrity(path: str, expected_duration: float = 0.0) -> dict:
         result["height"] = h
         result["fps"] = get_fps(info)
 
-        # Count actual packets
         result["video_packets"] = ffprobe_packets(str(p), "v")
         if ac:
             result["audio_packets"] = ffprobe_packets(str(p), "a")
 
-        # CRITICAL FIX: Cross-check expected duration
+        # Cross-check expected duration if provided
         if expected_duration > 0:
             tolerance = max(5.0, expected_duration * 0.10)
             if abs(dur - expected_duration) > tolerance:
@@ -286,38 +271,26 @@ def verify_source_integrity(path: str, expected_duration: float = 0.0) -> dict:
                 )
                 return result
 
-        # Check if file is truncated (container duration vs packet duration)
+        # Check consistency between container duration and packet count
         if result["fps"] > 0 and result["video_packets"] > 0:
             packet_duration = result["video_packets"] / result["fps"]
-            if dur > packet_duration * 1.15:  # 15% tolerance
+            # If they match within 15%, the file is structurally sound
+            if abs(dur - packet_duration) / max(dur, 1.0) < 0.15:
+                result["valid"] = True
+                result["reason"] = "ok"
+                return result
+            
+            # If container duration is wildly different from packet duration,
+            # trust the packet duration (container metadata might be corrupt)
+            if dur > packet_duration * 1.5:
                 result["truncated"] = True
+                result["duration"] = packet_duration
                 result["reason"] = (
                     f"TRUNCATED: container duration {dur:.1f}s but "
                     f"packet count {result['video_packets']} @ {result['fps']:.1f}fps "
                     f"only covers {packet_duration:.1f}s"
                 )
-                result["duration"] = packet_duration
                 return result
-
-        # Method 2: Check if last packet timestamp matches duration
-        r = run(
-            f'ffprobe -v quiet -select_streams v:0 -show_entries packet=pts_time '
-            f'-of csv=p=0 "{path}" | tail -1',
-            120
-        )
-        if r and r.returncode == 0 and r.stdout.strip():
-            try:
-                last_pts = float(r.stdout.strip())
-                if dur > last_pts * 1.15 and last_pts > 0:
-                    result["truncated"] = True
-                    result["duration"] = last_pts
-                    result["reason"] = (
-                        f"TRUNCATED: container duration {dur:.1f}s but "
-                        f"last video PTS is {last_pts:.1f}s"
-                    )
-                    return result
-            except ValueError:
-                pass
 
         result["valid"] = True
         result["reason"] = "ok"
@@ -329,13 +302,18 @@ def verify_source_integrity(path: str, expected_duration: float = 0.0) -> dict:
 # ═══════════════════════════════════════════════════════════
 # SOURCE SELECTION WITH REBUILD CAPABILITY
 # ═══════════════════════════════════════════════════════════
-def find_raw_sources() -> dict:
-    """Find raw H.264 video and audio files."""
+def find_raw_sources(ts_filter: str = None) -> dict:
+    """
+    Find raw H.264 video and audio files.
+    FIX: Filters by timestamp to prevent mixing stale files from previous runs.
+    """
     sources = {"video": None, "audio": None}
     for d in [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]:
         if not d.exists():
             continue
         for f in d.glob("*_encoded.h264"):
+            if ts_filter and ts_filter not in f.name:
+                continue
             try:
                 size = f.stat().st_size
             except OSError:
@@ -344,6 +322,8 @@ def find_raw_sources() -> dict:
                 if sources["video"] is None or size > sources["video"].stat().st_size:
                     sources["video"] = f
         for f in d.glob("*_audio.webm"):
+            if ts_filter and ts_filter not in f.name:
+                continue
             try:
                 size = f.stat().st_size
             except OSError:
@@ -354,13 +334,8 @@ def find_raw_sources() -> dict:
     return sources
 
 
-def rebuild_from_raw(video_path: str, audio_path: str, output_path: str, fps: float = 30.0) -> bool:
-    """
-    Rebuild complete MKV from raw H.264 + audio.
-    
-    FIX: Now specifies -framerate to prevent FFmpeg from assigning
-    incorrect timestamps to raw H.264 streams.
-    """
+def rebuild_from_raw(video_path: str, audio_path: str, output_path: str, fps: float = 30.0, expected_dur: float = 0.0) -> bool:
+    """Rebuild complete MKV from raw H.264 + audio."""
     log(f"  🔧 Rebuilding from raw sources...")
     log(f"    Video: {os.path.basename(video_path)} ({human_size(os.path.getsize(video_path))})")
     if audio_path:
@@ -387,35 +362,26 @@ def rebuild_from_raw(video_path: str, audio_path: str, output_path: str, fps: fl
     r = run(cmd, timeout=3600)
     if r is None or r.returncode != 0:
         log(f"  ✗ Rebuild failed: {(r.stderr or '')[-200:] if r else 'timeout'}")
-        try:
-            os.unlink(tmp_out)
-        except OSError:
-            pass
+        try: os.unlink(tmp_out)
+        except OSError: pass
         return False
 
     if not os.path.exists(tmp_out) or os.path.getsize(tmp_out) < MIN_FILE_SIZE:
-        try:
-            os.unlink(tmp_out)
-        except OSError:
-            pass
+        try: os.unlink(tmp_out)
+        except OSError: pass
         return False
 
-    # Verify rebuild
     info = ffprobe_json(tmp_out)
     if not info:
-        try:
-            os.unlink(tmp_out)
-        except OSError:
-            pass
+        try: os.unlink(tmp_out)
+        except OSError: pass
         return False
 
     dur = get_duration(info)
     vc, _ = get_codecs(info)
     if not vc or dur < 1.0:
-        try:
-            os.unlink(tmp_out)
-        except OSError:
-            pass
+        try: os.unlink(tmp_out)
+        except OSError: pass
         return False
 
     os.replace(tmp_out, output_path)
@@ -424,15 +390,9 @@ def rebuild_from_raw(video_path: str, audio_path: str, output_path: str, fps: fl
 
 
 def find_best_source() -> dict:
-    """
-    Find the best source for processing.
-    Detects truncated MKV and rebuilds from raw if necessary.
-    ALWAYS returns a dict or None. Never returns bool.
-    """
     log("🔍 SOURCE SELECTION WITH INTEGRITY CHECK")
     log("-" * 50)
 
-    # Step 1: Find complete MKV candidates
     mkv_candidates = []
     for d in [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]:
         if not d.exists():
@@ -458,20 +418,23 @@ def find_best_source() -> dict:
             log(f"  ⚠️ TRUNCATION DETECTED: {validation['reason']}")
             log(f"  Attempting rebuild from raw sources...")
 
-            raw = find_raw_sources()
+            # FIX: Extract timestamp to filter raw files
+            m = re.search(r'(\d{8}_\d{6})', f.name)
+            ts_filter = m.group(1) if m else None
+            
+            raw = find_raw_sources(ts_filter)
             if raw["video"]:
                 sid = safe_id(STREAM_ID)
                 rebuild_dir = str(TEMP_DIR / f"rebuild_{sid}")
                 os.makedirs(rebuild_dir, exist_ok=True)
                 rebuild_path = os.path.join(rebuild_dir, f"rebuilt_{sid}.mkv")
 
-                # FIX: Pass expected duration and FPS from truncated MKV
+                # Use packet-derived duration as expected reference
                 expected_dur = validation["duration"]
                 expected_fps = validation["fps"]
 
                 audio_str = str(raw["audio"]) if raw["audio"] else None
-                if rebuild_from_raw(str(raw["video"]), audio_str, rebuild_path, expected_fps):
-                    # FIX: Verify the rebuild against expected duration
+                if rebuild_from_raw(str(raw["video"]), audio_str, rebuild_path, expected_fps, expected_dur):
                     rebuild_validation = verify_source_integrity(rebuild_path, expected_duration=expected_dur)
                     if rebuild_validation["valid"] and not rebuild_validation["truncated"]:
                         log(f"  ✓ Rebuild successful and verified")
@@ -484,7 +447,6 @@ def find_best_source() -> dict:
             else:
                 log(f"  ✗ No raw video source available for rebuild")
 
-            # Use the truncated file with corrected duration
             log(f"  ⚠️ Using truncated source with corrected duration: {validation['duration']:.1f}s")
             validation["valid"] = True
             return {"type": "truncated_mkv", "validation": validation}
@@ -495,7 +457,6 @@ def find_best_source() -> dict:
         else:
             log(f"  ✗ Rejected: {validation['reason']}")
 
-    # Step 2: Try raw rebuild if no MKV found
     log("  No valid MKV found. Trying raw rebuild...")
     raw = find_raw_sources()
     if raw["video"]:
@@ -527,10 +488,6 @@ def calculate_segment_duration(source_size: int, source_duration: float) -> floa
 
 
 def split_source(source_path: str, work_dir: str, has_audio: bool, source_duration: float) -> list:
-    """
-    Split source into MP4 segments.
-    Uses interval tracking to know exact source positions.
-    """
     source_size = os.path.getsize(source_path)
     seg_dur = calculate_segment_duration(source_size, source_duration)
     expected_count = max(1, int(source_duration / seg_dur) + 1)
@@ -563,7 +520,6 @@ def split_source(source_path: str, work_dir: str, has_audio: bool, source_durati
     if r.returncode != 0:
         stderr = (r.stderr or "")[-500:]
         log(f"✗ Split failed (exit={r.returncode}): {stderr[:300]}")
-        # Fallback: video-only
         if has_audio:
             log("  Retrying video-only...")
             cmd2 = (
@@ -634,7 +590,6 @@ def resplit_oversized(seg_path: str, work_dir: str, idx: int) -> list:
 # VERIFICATION — Audio is OPTIONAL
 # ═══════════════════════════════════════════════════════════
 def verify_segment(path: str) -> dict:
-    """Verify MP4 segment. Audio is OPTIONAL and never causes rejection."""
     result = {
         "ok": False, "reason": "", "duration": 0.0,
         "width": 0, "height": 0, "fps": 0.0,
@@ -672,13 +627,11 @@ def verify_segment(path: str) -> dict:
         result["reason"] = "no video stream"
         return result
 
-    # AUDIO IS OPTIONAL — never reject for missing audio
     w, h = get_resolution(info)
     result["width"] = w
     result["height"] = h
     result["fps"] = get_fps(info)
 
-    # Decode test
     dr = run(f'ffmpeg -v error -i "{path}" -f null -', timeout=120)
     if dr is None:
         result["reason"] = "decode timeout"
@@ -779,7 +732,6 @@ def main():
         log("⏭️ Already completed — skipping")
         return
 
-    # ── Step 1: Source Selection with Integrity Check ──
     source_info = find_best_source()
     if not source_info:
         log("✗ NO VALID SOURCE — ABORTING")
@@ -807,19 +759,14 @@ def main():
     log(f"{'=' * 60}")
 
     mf["source"] = {
-        "type": source_info["type"],
-        "path": source_path,
-        "sha256": v["sha256"],
-        "size": v["size"],
-        "duration": round(source_duration, 1),
-        "has_audio": source_has_audio,
-        "video_packets": v["video_packets"],
-        "audio_packets": v["audio_packets"],
+        "type": source_info["type"], "path": source_path,
+        "sha256": v["sha256"], "size": v["size"],
+        "duration": round(source_duration, 1), "has_audio": source_has_audio,
+        "video_packets": v["video_packets"], "audio_packets": v["audio_packets"],
         "truncated": v.get("truncated", False),
     }
     save_manifest(STREAM_ID, mf)
 
-    # ── Step 2: Split ──
     log(f"\n{'=' * 60}")
     log("STEP 2: SEGMENTATION")
     log(f"{'=' * 60}")
@@ -835,7 +782,6 @@ def main():
         update_worker_final_state(STREAM_ID, "failed", {"error": "split_failed"})
         return
 
-    # Handle oversized segments
     final_segments = []
     for idx, seg in enumerate(segments):
         seg_size = os.path.getsize(seg)
@@ -854,7 +800,6 @@ def main():
     total = len(final_segments)
     log(f"\n📦 Final segment count: {total}")
 
-    # ── Step 3: Verify and Send ──
     log(f"\n{'=' * 60}")
     log("STEP 3: VERIFICATION & DELIVERY")
     log(f"{'=' * 60}")
@@ -905,10 +850,8 @@ def main():
             sent_count += 1
             sent_durations.append(verdict["duration"])
             mf["segments"][seg_key] = {
-                "sent": True,
-                "message_id": tg_res["message_id"],
-                "size": verdict["size"],
-                "duration": round(verdict["duration"], 1),
+                "sent": True, "message_id": tg_res["message_id"],
+                "size": verdict["size"], "duration": round(verdict["duration"], 1),
                 "has_audio": verdict["has_audio"],
             }
         else:
@@ -920,7 +863,6 @@ def main():
         if idx < total - 1:
             time.sleep(SEND_DELAY_SECONDS)
 
-    # ── Step 4: Coverage Report ──
     coverage = calculate_coverage(sent_durations, source_duration)
 
     log(f"\n{'=' * 60}")
@@ -955,9 +897,6 @@ def main():
         if not coverage["complete"]:
             log(f"\n⚠️ PARTIAL — INCOMPLETE COVERAGE ({coverage['coverage_percent']}%)")
             log(f"   Missing: {coverage['gap_seconds']}s")
-            if v.get("truncated"):
-                log(f"   NOTE: Source file was truncated. Missing content")
-                log(f"   was never present in the preserved file.")
     else:
         mf["state"] = "FAILED"
         save_manifest(STREAM_ID, mf)
