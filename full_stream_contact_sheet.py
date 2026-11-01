@@ -4,7 +4,7 @@ full_stream_contact_sheet.py — Portrait 3x4 Contact Sheet Generator.
 
 FIXES:
   1. Uses manifest-verified source from postprocess_recording.py
-  2. Verifies SHA-256 before frame extraction
+  2. Verifies SHA-256 AND duration before frame extraction
   3. Never sums durations from globbed part files
   4. Handles truncated sources gracefully
   5. Robust frame extraction with multiple seek strategies
@@ -118,6 +118,8 @@ def get_authoritative_source() -> tuple:
     Get source from manifest written by postprocess_recording.py.
     Falls back to largest valid MKV if manifest unavailable.
     NEVER sums durations from globbed part files.
+    
+    FIX: Now independently verifies that file duration matches manifest duration.
     """
     safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(STREAM_ID))
     mf_path = STATE_DIR / f"manifest_{safe_id}.json"
@@ -128,20 +130,26 @@ def get_authoritative_source() -> tuple:
             src = mf.get("source", {})
             path = src.get("path")
             sha = src.get("sha256")
-            dur = src.get("duration", 0)
+            expected_dur = src.get("duration", 0)
 
             if path and os.path.exists(path):
-                # Verify SHA-256 if available
-                if sha:
-                    actual_sha = sha256_file(path)
-                    if actual_sha == sha:
-                        log(f"✓ Manifest source verified (SHA-256 match)")
-                        return path, dur
-                    else:
-                        log(f"⚠️ SHA-256 mismatch, using file anyway", "WARN")
-                        return path, dur
+                # CRITICAL FIX: Verify duration matches manifest
+                actual_dur = get_duration(path)
+                tolerance = max(5.0, expected_dur * 0.10)
+                if abs(actual_dur - expected_dur) > tolerance:
+                    log(f"⚠️ Duration mismatch: manifest says {expected_dur:.1f}s, file is {actual_dur:.1f}s. Ignoring manifest.", "WARN")
                 else:
-                    return path, dur
+                    # Verify SHA-256 if available
+                    if sha:
+                        actual_sha = sha256_file(path)
+                        if actual_sha == sha:
+                            log(f"✓ Manifest source verified (SHA-256 and duration match)")
+                            return path, actual_dur
+                        else:
+                            log(f"⚠️ SHA-256 mismatch, using file anyway", "WARN")
+                            return path, actual_dur
+                    else:
+                        return path, actual_dur
         except Exception as e:
             log(f"Manifest read error: {e}", "WARN")
 
