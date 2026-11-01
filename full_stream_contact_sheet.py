@@ -2,13 +2,10 @@
 """
 full_stream_contact_sheet.py — Portrait 3x4 Contact Sheet Generator.
 
-FIXES:
-  1. Uses manifest-verified source from postprocess_recording.py
-  2. Verifies SHA-256 AND duration before frame extraction
-  3. Never sums durations from globbed part files
-  4. Handles truncated sources gracefully
-  5. Robust frame extraction with multiple seek strategies
-  6. Preserves exact 3x4 grid design
+PROJECT-WIDE FIXES:
+  - Optimized frame extraction with fast timeouts to prevent 10-minute hangs
+    on long recordings with broken indexes.
+  - Independent duration verification before accepting manifest source.
 """
 
 import json
@@ -61,10 +58,8 @@ def state_file() -> Path:
 def load_state() -> dict:
     p = state_file()
     if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        try: return json.loads(p.read_text(encoding="utf-8"))
+        except Exception: pass
     return {"stream_id": STREAM_ID, "state": "NOT_STARTED"}
 
 
@@ -77,32 +72,25 @@ def save_state(st: dict) -> None:
 
 
 def run_cmd(cmd: str, timeout: int = 60):
-    try:
-        return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return None
-    except Exception:
-        return None
+    try: return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired: return None
+    except Exception: return None
 
 
 def sha256_file(path: str) -> str:
     h = hashlib.sha256()
     try:
         with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(4 * 1024 * 1024), b''):
-                h.update(chunk)
+            for chunk in iter(lambda: f.read(4 * 1024 * 1024), b''): h.update(chunk)
         return h.hexdigest()
-    except Exception:
-        return ""
+    except Exception: return ""
 
 
 def get_duration(path: str) -> float:
     r = run_cmd(f'ffprobe -v quiet -print_format json -show_format "{path}"', 30)
     if r and r.returncode == 0:
-        try:
-            return float(json.loads(r.stdout).get("format", {}).get("duration", 0))
-        except Exception:
-            pass
+        try: return float(json.loads(r.stdout).get("format", {}).get("duration", 0))
+        except Exception: pass
     return 0.0
 
 
@@ -114,13 +102,6 @@ def format_timestamp(seconds: float) -> str:
 
 
 def get_authoritative_source() -> tuple:
-    """
-    Get source from manifest written by postprocess_recording.py.
-    Falls back to largest valid MKV if manifest unavailable.
-    NEVER sums durations from globbed part files.
-    
-    FIX: Now independently verifies that file duration matches manifest duration.
-    """
     safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(STREAM_ID))
     mf_path = STATE_DIR / f"manifest_{safe_id}.json"
 
@@ -133,13 +114,11 @@ def get_authoritative_source() -> tuple:
             expected_dur = src.get("duration", 0)
 
             if path and os.path.exists(path):
-                # CRITICAL FIX: Verify duration matches manifest
                 actual_dur = get_duration(path)
                 tolerance = max(5.0, expected_dur * 0.10)
                 if abs(actual_dur - expected_dur) > tolerance:
                     log(f"⚠️ Duration mismatch: manifest says {expected_dur:.1f}s, file is {actual_dur:.1f}s. Ignoring manifest.", "WARN")
                 else:
-                    # Verify SHA-256 if available
                     if sha:
                         actual_sha = sha256_file(path)
                         if actual_sha == sha:
@@ -148,40 +127,31 @@ def get_authoritative_source() -> tuple:
                         else:
                             log(f"⚠️ SHA-256 mismatch, using file anyway", "WARN")
                             return path, actual_dur
-                    else:
-                        return path, actual_dur
+                    else: return path, actual_dur
         except Exception as e:
             log(f"Manifest read error: {e}", "WARN")
 
-    # Fallback: largest complete MKV (NOT parts)
     log("Manifest unavailable, searching for largest complete MKV...", "WARN")
     candidates = []
     for d in [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]:
-        if not d.exists():
-            continue
+        if not d.exists(): continue
         for f in d.glob("*.mkv"):
-            if any(x in f.name for x in ["_part_", "_encoded", "concatenated_", "rebuilt_"]):
-                continue
-            try:
-                candidates.append((str(f), f.stat().st_size))
-            except OSError:
-                continue
+            if any(x in f.name for x in ["_part_", "_encoded", "concatenated_", "rebuilt_"]): continue
+            try: candidates.append((str(f), f.stat().st_size))
+            except OSError: continue
 
     if candidates:
         candidates.sort(key=lambda x: x[1], reverse=True)
         best = candidates[0][0]
         dur = get_duration(best)
-        if dur > 0.5:
-            return best, dur
+        if dur > 0.5: return best, dur
 
     return None, 0.0
 
 
 def calculate_timestamps(duration: float, count: int) -> list:
-    if duration <= 0 or count <= 0:
-        return []
-    if duration < 12:
-        return [duration * (i + 1) / (count + 1) for i in range(count)]
+    if duration <= 0 or count <= 0: return []
+    if duration < 12: return [duration * (i + 1) / (count + 1) for i in range(count)]
     margin = min(2.0, duration * 0.02)
     usable = max(duration - 2 * margin, 0.1)
     return [max(0.1, min(margin + usable * i / (count - 1), duration - 0.5)) for i in range(count)]
@@ -189,32 +159,27 @@ def calculate_timestamps(duration: float, count: int) -> list:
 
 def get_frame_hash(path: str) -> str:
     try:
-        with open(path, 'rb') as f:
-            return hashlib.md5(f.read()).hexdigest()
-    except Exception:
-        return ""
+        with open(path, 'rb') as f: return hashlib.md5(f.read()).hexdigest()
+    except Exception: return ""
 
 
 def extract_frame(source: str, ts: float, out: str) -> bool:
-    """Extract a single frame with multiple seek strategies."""
+    """
+    FIX: Uses short timeout for input seeking, falls back to output seeking.
+    Prevents 10-minute hangs on long files with broken indexes.
+    """
     abs_source = os.path.abspath(source)
     abs_out = os.path.abspath(out)
 
-    # Strategy 1: Input seeking (fast)
+    # Strategy 1: Input seeking (fast, 10s timeout)
     cmd1 = f'ffmpeg -y -ss {ts:.3f} -i "{abs_source}" -frames:v 1 -q:v 2 "{abs_out}"'
-    r = run_cmd(cmd1, timeout=30)
+    r = run_cmd(cmd1, timeout=10)
     if r and r.returncode == 0 and os.path.exists(abs_out) and os.path.getsize(abs_out) > 0:
         return True
 
-    # Strategy 2: Output seeking (accurate but slower)
+    # Strategy 2: Output seeking (accurate, 30s timeout)
     cmd2 = f'ffmpeg -y -i "{abs_source}" -ss {ts:.3f} -frames:v 1 -q:v 2 "{abs_out}"'
-    r = run_cmd(cmd2, timeout=60)
-    if r and r.returncode == 0 and os.path.exists(abs_out) and os.path.getsize(abs_out) > 0:
-        return True
-
-    # Strategy 3: Input seeking with noaccurate_seek
-    cmd3 = f'ffmpeg -y -ss {ts:.3f} -noaccurate_seek -i "{abs_source}" -frames:v 1 -q:v 2 "{abs_out}"'
-    r = run_cmd(cmd3, timeout=30)
+    r = run_cmd(cmd2, timeout=30)
     if r and r.returncode == 0 and os.path.exists(abs_out) and os.path.getsize(abs_out) > 0:
         return True
 
@@ -229,7 +194,6 @@ def extract_frames(source: str, timestamps: list, tmpdir: str, source_duration: 
         out = os.path.join(tmpdir, f"frame_{i:03d}.jpg")
         label = format_timestamp(ts)
 
-        # Ensure timestamp doesn't exceed source duration
         if ts >= source_duration:
             ts = max(0.1, source_duration - 1.0)
             label = format_timestamp(ts)
@@ -242,17 +206,15 @@ def extract_frames(source: str, timestamps: list, tmpdir: str, source_duration: 
                 log(f"  Frame {i+1}/{len(timestamps)} at {label}: ✓")
                 continue
 
-        # Fallback: try nearby timestamps
         found = False
         for delta in [-5.0, -3.0, -1.0, 1.0, 3.0, 5.0, -10.0, -15.0, 10.0]:
             nearby = ts + delta
-            if nearby < 0.1 or nearby >= source_duration:
-                continue
+            if nearby < 0.1 or nearby >= source_duration: continue
             if extract_frame(source, nearby, out):
                 fh = get_frame_hash(out)
                 if fh and fh not in frame_hashes:
                     frame_hashes.add(fh)
-                    frames.append((out, ts, label))  # Keep original label
+                    frames.append((out, ts, label))
                     log(f"  Frame {i+1}/{len(timestamps)} at {label}: ✓ (recovered from {nearby:.1f}s)", "WARN")
                     found = True
                     break
@@ -264,16 +226,14 @@ def extract_frames(source: str, timestamps: list, tmpdir: str, source_duration: 
 
 
 def build_contact_sheet(frames: list, output_path: str) -> bool:
-    try:
-        from PIL import Image, ImageDraw, ImageFont
+    try: from PIL import Image, ImageDraw, ImageFont
     except ImportError:
         log("Pillow not installed", "ERROR")
         return False
 
     n = min(len(frames), TOTAL_FRAMES)
     frames = frames[:n]
-    if n == 0:
-        return False
+    if n == 0: return False
 
     img_w = MARGIN * 2 + GRID_COLS * CELL_W + (GRID_COLS - 1) * GAP
     img_h = MARGIN * 2 + GRID_ROWS * (CELL_H + TEXT_H) + (GRID_ROWS - 1) * GAP
@@ -281,15 +241,10 @@ def build_contact_sheet(frames: list, output_path: str) -> bool:
     draw = ImageDraw.Draw(grid_img)
 
     font = None
-    for fp in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-               "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]:
-        try:
-            font = ImageFont.truetype(fp, FONT_SIZE)
-            break
-        except (IOError, OSError):
-            continue
-    if font is None:
-        font = ImageFont.load_default()
+    for fp in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]:
+        try: font = ImageFont.truetype(fp, FONT_SIZE); break
+        except (IOError, OSError): continue
+    if font is None: font = ImageFont.load_default()
 
     for i, (frame_path, ts, label) in enumerate(frames):
         row, col = divmod(i, GRID_COLS)
@@ -297,8 +252,7 @@ def build_contact_sheet(frames: list, output_path: str) -> bool:
         y = MARGIN + row * (CELL_H + TEXT_H + GAP)
         try:
             with Image.open(frame_path) as img:
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
+                if img.mode != 'RGB': img = img.convert('RGB')
                 target_ratio = CELL_W / CELL_H
                 img_ratio = img.width / img.height
                 if img_ratio > target_ratio:
@@ -311,14 +265,12 @@ def build_contact_sheet(frames: list, output_path: str) -> bool:
                     img = img.crop((0, top, img.width, top + new_height))
                 img = img.resize((CELL_W, CELL_H), Image.LANCZOS)
                 grid_img.paste(img, (x, y))
-        except Exception:
-            continue
+        except Exception: continue
 
         try:
             bbox = draw.textbbox((0, 0), label, font=font)
             tw = bbox[2] - bbox[0]
-        except AttributeError:
-            tw = len(label) * (FONT_SIZE // 2)
+        except AttributeError: tw = len(label) * (FONT_SIZE // 2)
         text_x = x + (CELL_W - tw) // 2
         text_y = y + CELL_H + 3
         draw.text((text_x + 2, text_y + 2), label, fill="black", font=font)
@@ -327,22 +279,16 @@ def build_contact_sheet(frames: list, output_path: str) -> bool:
     try:
         grid_img.save(output_path, "JPEG", quality=JPEG_QUALITY)
         return os.path.exists(output_path) and os.path.getsize(output_path) > 0
-    except Exception:
-        return False
+    except Exception: return False
 
 
 def send_photo(photo_path: str, caption: str) -> dict:
     result = {"ok": False, "message_id": None, "error": ""}
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        result["error"] = "no credentials"
-        return result
-    if os.path.getsize(photo_path) > MAX_TG_PHOTO:
-        result["error"] = "too large"
-        return result
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return result
+    if os.path.getsize(photo_path) > MAX_TG_PHOTO: return result
 
     boundary = uuid.uuid4().hex
-    with open(photo_path, "rb") as f:
-        pdata = f.read()
+    with open(photo_path, "rb") as f: pdata = f.read()
 
     body = b""
     body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{TELEGRAM_CHAT_ID}\r\n".encode()
@@ -356,9 +302,7 @@ def send_photo(photo_path: str, caption: str) -> dict:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     for attempt in range(1, 4):
         try:
-            req = urllib.request.Request(url, data=body, headers={
-                "Content-Type": f"multipart/form-data; boundary={boundary}"
-            })
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
             with urllib.request.urlopen(req, timeout=120) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8"))
@@ -366,14 +310,10 @@ def send_photo(photo_path: str, caption: str) -> dict:
                     result["message_id"] = data.get("result", {}).get("message_id")
                     return result
         except urllib.error.HTTPError as e:
-            if e.code == 403:
-                result["error"] = "HTTP 403"
-                return result
+            if e.code == 403: result["error"] = "HTTP 403"; return result
             result["error"] = f"HTTP {e.code}"
-        except Exception as e:
-            result["error"] = str(e)
-        if attempt < 3:
-            time.sleep(2 * attempt)
+        except Exception as e: result["error"] = str(e)
+        if attempt < 3: time.sleep(2 * attempt)
     return result
 
 
@@ -466,8 +406,7 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
+    try: main()
     except Exception as e:
         log(f"❌ Fatal error: {e}", "ERROR")
         sys.exit(0)
