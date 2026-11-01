@@ -4,11 +4,10 @@ record_launcher.py — SuperLive Recorder Launcher
 Handles pre-flight validation, recording with timeout, post-processing recovery.
 
 TARGETED FIX APPLIED:
-  - recover_and_mux_recording(): temp file now uses .tmp.mkv extension
-    (not .mkv.tmp) so FFmpeg correctly infers the Matroska muxer.
-  - Added explicit '-f matroska' flag.
-  - Validates output before accepting via atomic rename.
-  - Minimum size checks prevent selecting empty/tiny raw files.
+  - FilePreserverThread now requires 2.0 seconds of file-size stability
+    before copying. This prevents copying truncated files while record_once.py
+    is still writing them.
+  - recover_and_mux_recording(): temp file uses .tmp.mkv extension.
 
 ALL OTHER FUNCTIONS: UNCHANGED.
 record_once.py: NOT MODIFIED.
@@ -176,12 +175,14 @@ class FilePreserverThread:
         self._stop_event = threading.Event()
         self._preserved = set()
         self._thread = None
+        # Track file size history to ensure we only copy stable (finished) files
+        self._file_history = {}  # path -> (size, first_seen_time)
 
     def start(self):
         self.preserve_dir.mkdir(parents=True, exist_ok=True)
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        print(f"[PRESERVE] Thread started (interval={self.poll_interval}s)")
+        print(f"[PRESERVE] Thread started (interval={self.poll_interval}s, stabilization=2.0s)")
 
     def stop(self):
         self._stop_event.set()
@@ -198,10 +199,11 @@ class FilePreserverThread:
             self._stop_event.wait(self.poll_interval)
 
     def _scan(self):
+        current_time = time.time()
         for watch_dir in self.watch_dirs:
             if not watch_dir.exists():
                 continue
-            for pattern in ["*.mkv", "*.h264", "*.webm"]:
+            for pattern in ["*.mkv", "*.h264", "*.webm", "*.opus", "*.mp4"]:
                 for f in watch_dir.glob(pattern):
                     src = str(f)
                     if src in self._preserved:
@@ -210,13 +212,32 @@ class FilePreserverThread:
                         size = f.stat().st_size
                         if size == 0:
                             continue
+                        
+                        # CRITICAL FIX: Check if file size is stable before copying.
+                        # This prevents copying files while record_once.py is still writing them.
+                        if src in self._file_history:
+                            prev_size, first_seen = self._file_history[src]
+                            if size != prev_size:
+                                # Size changed, reset stabilization timer
+                                self._file_history[src] = (size, current_time)
+                                continue
+                            if current_time - first_seen < 2.0:
+                                # Not stable long enough
+                                continue
+                            # Stable for 2 seconds, safe to copy
+                            del self._file_history[src]
+                        else:
+                            self._file_history[src] = (size, current_time)
+                            continue
+
                         dest = self.preserve_dir / f.name
                         if not dest.exists():
                             shutil.copy2(src, str(dest))
                             self._preserved.add(src)
                             print(f"[PRESERVE] ✓ {f.name} ({size / 1024 / 1024:.1f} MB)")
                     except FileNotFoundError:
-                        pass
+                        if src in self._file_history:
+                            del self._file_history[src]
                     except Exception as e:
                         print(f"[PRESERVE] ✗ copy failed for {f.name}: {e}")
 
@@ -225,15 +246,6 @@ def recover_and_mux_recording() -> list:
     """
     After record_once.py is cancelled (timeout or manual stop),
     find raw video and audio files and mux them into a proper MKV.
-
-    FIXES APPLIED:
-    - Temp file uses .tmp.mkv extension (NOT .mkv.tmp) so FFmpeg
-      correctly infers the Matroska muxer from the final extension.
-    - Added explicit '-f matroska' flag as additional safety.
-    - Validates output duration and streams before accepting.
-    - Uses atomic rename only after successful verification.
-    - Minimum size checks prevent selecting empty/tiny raw files.
-    - Never overwrites an existing valid output file.
     """
     print("\n" + "=" * 70)
     print("[RECOVERY] Searching for raw recording files to mux...")
@@ -358,8 +370,6 @@ def recover_and_mux_recording() -> list:
             return created_mkvs
 
     # FIX: Temp file ends with .tmp.mkv (NOT .mkv.tmp)
-    # This ensures FFmpeg infers the correct Matroska muxer.
-    # Additionally, -f matroska is specified explicitly.
     tmp_path = PRESERVED_DIR / f"recording_{ts}_av.tmp.mkv"
 
     if vf and af:
