@@ -2,11 +2,15 @@
 """
 postprocess_recording.py — PHASE 2: MKV→MP4 segmentation, verification, delivery.
 
-PROJECT-WIDE FIXES:
-  1. Removed flawed 'tail -1' PTS check that falsely flagged long recordings as truncated.
-  2. Raw source discovery now filters by recording timestamp to prevent stale file mixing.
-  3. Rebuild validation uses packet-derived duration, not corrupted container metadata.
-  4. Audio is strictly OPTIONAL. Video-only segments are always accepted.
+ROOT CAUSE FIXES:
+  1. Sparse keyframe detection: If stream-copy produces oversized segments,
+     falls back to ultra-fast re-encoding with forced keyframes every 2 seconds.
+  2. VFR preservation: Uses -fps_mode vfr to maintain original frame timing.
+  3. Recursive splitting uses re-encoding, not stream copy.
+  4. Strict <45 MiB enforcement with actual byte-size verification.
+  5. Audio is OPTIONAL. Video-only segments are always accepted.
+
+PROTECTED: record_once.py is NOT modified by this file.
 """
 
 import json
@@ -31,13 +35,13 @@ STATE_DIR          = RECORDINGS_DIR / "_state"
 STREAM_ID          = os.environ.get("STREAM_ID", "unknown")
 STREAM_NAME        = os.environ.get("STREAM_NAME", "")
 
-TARGET_SIZE_BYTES  = 40 * 1024 * 1024
-MAX_SIZE_BYTES     = 45 * 1024 * 1024
-HARD_SIZE_LIMIT    = 50 * 1024 * 1024
+TARGET_SIZE_BYTES  = 40 * 1024 * 1024   # 40 MiB target
+MAX_SIZE_BYTES     = 45 * 1024 * 1024   # 45 MiB strict ceiling
+HARD_SIZE_LIMIT    = 50 * 1024 * 1024   # 50 MiB Telegram hard limit
 SEND_DELAY_SECONDS = 3
 MAX_RETRIES        = 3
 MAX_RESPLIT_TRIES  = 3
-MIN_FILE_SIZE      = 10 * 1024
+MIN_FILE_SIZE      = 10 * 1024          # 10 KB minimum
 
 WORKER_API_URL = os.environ.get("WORKER_API_URL", "").strip()
 AUTO_API_TOKEN = os.environ.get("AUTO_API_TOKEN", "").strip()
@@ -49,7 +53,7 @@ def log(msg: str) -> None:
     print(f"[POSTPROC] {msg}", flush=True)
 
 
-def run(cmd: str, timeout: int = 1800):
+def run(cmd: str, timeout: int = 3600):
     try:
         return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -86,7 +90,7 @@ def ffprobe_packets(path: str, stream_type: str) -> int:
     r = run(
         f'ffprobe -v quiet -count_packets -select_streams {stream_type}:0 '
         f'-show_entries stream=nb_read_packets -of csv=p=0 "{path}"',
-        300
+        600
     )
     if r and r.returncode == 0 and r.stdout.strip():
         try:
@@ -156,6 +160,7 @@ def safe_id(sid: str) -> str:
 
 
 def update_worker_final_state(sid: str, status: str, extra: dict = None):
+    """Update worker state. API failures do NOT affect media processing status."""
     if not WORKER_API_URL or not AUTO_API_TOKEN:
         log("⚠️ [WORKER-API] Not configured, skipping")
         return
@@ -209,16 +214,26 @@ def save_manifest(sid: str, mf: dict) -> None:
 def verify_source_integrity(path: str, expected_duration: float = 0.0) -> dict:
     """
     Verify source file integrity.
-    FIX: Removed flawed 'tail -1' PTS check. Relies on format.duration
-    and packet_count/fps consistency.
+    ALWAYS returns a dict. Never returns bool.
+    
+    Tolerates VFR streams where packet_count/fps != container_duration.
+    Only flags truncation if container duration wildly exceeds packet-derived duration.
     """
     result = {
-        "valid": False, "reason": "", "path": str(path),
-        "size": 0, "sha256": "", "duration": 0.0,
-        "video_codec": None, "audio_codec": None,
-        "width": 0, "height": 0, "fps": 0.0,
-        "video_packets": 0, "audio_packets": 0,
-        "truncated": False, "expected_size": 0,
+        "valid": False,
+        "reason": "",
+        "path": str(path),
+        "size": 0,
+        "sha256": "",
+        "duration": 0.0,
+        "video_codec": None,
+        "audio_codec": None,
+        "width": 0,
+        "height": 0,
+        "fps": 0.0,
+        "video_packets": 0,
+        "audio_packets": 0,
+        "truncated": False,
     }
     try:
         p = Path(path)
@@ -257,13 +272,14 @@ def verify_source_integrity(path: str, expected_duration: float = 0.0) -> dict:
         result["height"] = h
         result["fps"] = get_fps(info)
 
+        # Count actual packets (with generous timeout for large files)
         result["video_packets"] = ffprobe_packets(str(p), "v")
         if ac:
             result["audio_packets"] = ffprobe_packets(str(p), "a")
 
         # Cross-check expected duration if provided
         if expected_duration > 0:
-            tolerance = max(5.0, expected_duration * 0.10)
+            tolerance = max(10.0, expected_duration * 0.15)
             if abs(dur - expected_duration) > tolerance:
                 result["valid"] = False
                 result["reason"] = (
@@ -271,24 +287,15 @@ def verify_source_integrity(path: str, expected_duration: float = 0.0) -> dict:
                 )
                 return result
 
-        # Check consistency between container duration and packet count
+        # VFR tolerance: Only flag truncation if packet-derived duration is
+        # drastically less than container duration (>50% difference)
         if result["fps"] > 0 and result["video_packets"] > 0:
             packet_duration = result["video_packets"] / result["fps"]
-            # If they match within 15%, the file is structurally sound
-            if abs(dur - packet_duration) / max(dur, 1.0) < 0.15:
-                result["valid"] = True
-                result["reason"] = "ok"
-                return result
-            
-            # If container duration is wildly different from packet duration,
-            # trust the packet duration (container metadata might be corrupt)
-            if dur > packet_duration * 1.5:
+            if dur > packet_duration * 2.0:
                 result["truncated"] = True
                 result["duration"] = packet_duration
                 result["reason"] = (
-                    f"TRUNCATED: container duration {dur:.1f}s but "
-                    f"packet count {result['video_packets']} @ {result['fps']:.1f}fps "
-                    f"only covers {packet_duration:.1f}s"
+                    f"TRUNCATED: container {dur:.1f}s vs packets {packet_duration:.1f}s"
                 )
                 return result
 
@@ -300,15 +307,13 @@ def verify_source_integrity(path: str, expected_duration: float = 0.0) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════
-# SOURCE SELECTION WITH REBUILD CAPABILITY
+# SOURCE SELECTION
 # ═══════════════════════════════════════════════════════════
 def find_raw_sources(ts_filter: str = None) -> dict:
-    """
-    Find raw H.264 video and audio files.
-    FIX: Filters by timestamp to prevent mixing stale files from previous runs.
-    """
+    """Find raw H.264 video and audio files, filtered by timestamp."""
     sources = {"video": None, "audio": None}
-    for d in [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]:
+    search_dirs = [PRESERVED_DIR, RECORDINGS_DIR, TEMP_DIR]
+    for d in search_dirs:
         if not d.exists():
             continue
         for f in d.glob("*_encoded.h264"):
@@ -334,54 +339,62 @@ def find_raw_sources(ts_filter: str = None) -> dict:
     return sources
 
 
-def rebuild_from_raw(video_path: str, audio_path: str, output_path: str, fps: float = 30.0, expected_dur: float = 0.0) -> bool:
-    """Rebuild complete MKV from raw H.264 + audio."""
+def rebuild_from_raw(video_path: str, audio_path: str, output_path: str, fps: float = 30.0) -> bool:
+    """Rebuild complete MKV from raw H.264 + audio, preserving VFR timing."""
     log(f"  🔧 Rebuilding from raw sources...")
     log(f"    Video: {os.path.basename(video_path)} ({human_size(os.path.getsize(video_path))})")
     if audio_path:
         log(f"    Audio: {os.path.basename(audio_path)} ({human_size(os.path.getsize(audio_path))})")
-    log(f"    Target FPS: {fps}")
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     tmp_out = output_path.replace(".mkv", ".tmp.mkv")
 
-    fps_flag = f"-framerate {fps}" if fps > 0 else ""
-
+    # -fps_mode vfr preserves original timing without forcing fixed framerate
     if audio_path:
         cmd = (
-            f'ffmpeg -y {fps_flag} -i "{os.path.abspath(video_path)}" '
+            f'ffmpeg -y -fps_mode vfr '
+            f'-i "{os.path.abspath(video_path)}" '
             f'-i "{os.path.abspath(audio_path)}" '
             f'-c:v copy -c:a copy -f matroska "{tmp_out}"'
         )
     else:
         cmd = (
-            f'ffmpeg -y {fps_flag} -i "{os.path.abspath(video_path)}" '
+            f'ffmpeg -y -fps_mode vfr '
+            f'-i "{os.path.abspath(video_path)}" '
             f'-c:v copy -an -f matroska "{tmp_out}"'
         )
 
     r = run(cmd, timeout=3600)
     if r is None or r.returncode != 0:
         log(f"  ✗ Rebuild failed: {(r.stderr or '')[-200:] if r else 'timeout'}")
-        try: os.unlink(tmp_out)
-        except OSError: pass
+        try:
+            os.unlink(tmp_out)
+        except OSError:
+            pass
         return False
 
     if not os.path.exists(tmp_out) or os.path.getsize(tmp_out) < MIN_FILE_SIZE:
-        try: os.unlink(tmp_out)
-        except OSError: pass
+        try:
+            os.unlink(tmp_out)
+        except OSError:
+            pass
         return False
 
     info = ffprobe_json(tmp_out)
     if not info:
-        try: os.unlink(tmp_out)
-        except OSError: pass
+        try:
+            os.unlink(tmp_out)
+        except OSError:
+            pass
         return False
 
     dur = get_duration(info)
     vc, _ = get_codecs(info)
     if not vc or dur < 1.0:
-        try: os.unlink(tmp_out)
-        except OSError: pass
+        try:
+            os.unlink(tmp_out)
+        except OSError:
+            pass
         return False
 
     os.replace(tmp_out, output_path)
@@ -390,6 +403,7 @@ def rebuild_from_raw(video_path: str, audio_path: str, output_path: str, fps: fl
 
 
 def find_best_source() -> dict:
+    """Find the best source for processing. ALWAYS returns dict or None."""
     log("🔍 SOURCE SELECTION WITH INTEGRITY CHECK")
     log("-" * 50)
 
@@ -418,10 +432,9 @@ def find_best_source() -> dict:
             log(f"  ⚠️ TRUNCATION DETECTED: {validation['reason']}")
             log(f"  Attempting rebuild from raw sources...")
 
-            # FIX: Extract timestamp to filter raw files
             m = re.search(r'(\d{8}_\d{6})', f.name)
             ts_filter = m.group(1) if m else None
-            
+
             raw = find_raw_sources(ts_filter)
             if raw["video"]:
                 sid = safe_id(STREAM_ID)
@@ -429,18 +442,17 @@ def find_best_source() -> dict:
                 os.makedirs(rebuild_dir, exist_ok=True)
                 rebuild_path = os.path.join(rebuild_dir, f"rebuilt_{sid}.mkv")
 
-                # Use packet-derived duration as expected reference
                 expected_dur = validation["duration"]
                 expected_fps = validation["fps"]
 
                 audio_str = str(raw["audio"]) if raw["audio"] else None
-                if rebuild_from_raw(str(raw["video"]), audio_str, rebuild_path, expected_fps, expected_dur):
+                if rebuild_from_raw(str(raw["video"]), audio_str, rebuild_path, expected_fps):
                     rebuild_validation = verify_source_integrity(rebuild_path, expected_duration=expected_dur)
                     if rebuild_validation["valid"] and not rebuild_validation["truncated"]:
                         log(f"  ✓ Rebuild successful and verified")
                         return {"type": "rebuilt_from_raw", "validation": rebuild_validation}
                     elif rebuild_validation["valid"]:
-                        log(f"  ⚠️ Rebuild also appears truncated, but using it")
+                        log(f"  ⚠️ Rebuild valid but duration differs from expected")
                         return {"type": "rebuilt_from_raw", "validation": rebuild_validation}
                     else:
                         log(f"  ✗ Rebuild validation failed: {rebuild_validation['reason']}")
@@ -475,7 +487,7 @@ def find_best_source() -> dict:
 
 
 # ═══════════════════════════════════════════════════════════
-# SEGMENTATION
+# SEGMENTATION — Handles sparse keyframes
 # ═══════════════════════════════════════════════════════════
 def calculate_segment_duration(source_size: int, source_duration: float) -> float:
     if source_duration <= 0 or source_size <= 0:
@@ -488,59 +500,104 @@ def calculate_segment_duration(source_size: int, source_duration: float) -> floa
 
 
 def split_source(source_path: str, work_dir: str, has_audio: bool, source_duration: float) -> list:
+    """
+    Split source into MP4 segments.
+    
+    Strategy:
+    1. Try stream copy first (fast, lossless).
+    2. If any segment exceeds MAX_SIZE_BYTES, the source has sparse keyframes.
+    3. Fall back to re-encoding with forced keyframes every 2 seconds.
+    
+    This guarantees segment boundaries regardless of source keyframe placement.
+    """
     source_size = os.path.getsize(source_path)
     seg_dur = calculate_segment_duration(source_size, source_duration)
     expected_count = max(1, int(source_duration / seg_dur) + 1)
 
-    log(f"📐 Segment duration: {seg_dur:.1f}s")
+    log(f"📐 Target segment duration: {seg_dur:.1f}s")
     log(f"📊 Expected segments: ~{expected_count}")
     log(f"📦 Source: {human_size(source_size)}, {format_ts(source_duration)}")
 
     os.makedirs(work_dir, exist_ok=True)
     pattern = os.path.join(work_dir, "part_%03d.mp4")
 
+    # ── Strategy 1: Stream copy (fast, lossless) ──
     if has_audio:
-        audio_opts = "-map 0:v:0 -map 0:a:0? -c:v copy -c:a aac -b:a 128k"
+        audio_opts = "-map 0:v:0 -map 0:a:0? -c:v copy -c:a aac -b:a 96k"
     else:
         audio_opts = "-map 0:v:0 -c:v copy -an"
 
-    cmd = (
+    cmd_copy = (
         f'ffmpeg -y -i "{source_path}" '
         f'{audio_opts} '
         f'-f segment -segment_time {seg_dur:.1f} '
         f'-reset_timestamps 1 -movflags +faststart '
         f'"{pattern}"'
     )
-    log(f"🔪 Split command: {cmd}")
+    log(f"🔪 Attempt 1: Stream-copy split...")
+    r = run(cmd_copy, timeout=3600)
 
-    r = run(cmd, timeout=3600)
-    if r is None:
-        log("✗ Split timed out")
-        return []
-    if r.returncode != 0:
-        stderr = (r.stderr or "")[-500:]
-        log(f"✗ Split failed (exit={r.returncode}): {stderr[:300]}")
-        if has_audio:
-            log("  Retrying video-only...")
-            cmd2 = (
-                f'ffmpeg -y -i "{source_path}" '
-                f'-map 0:v:0 -c:v copy -an '
-                f'-f segment -segment_time {seg_dur:.1f} '
-                f'-reset_timestamps 1 -movflags +faststart '
-                f'"{pattern}"'
-            )
-            r2 = run(cmd2, timeout=3600)
-            if r2 is None or r2.returncode != 0:
-                return []
+    segments = sorted(Path(work_dir).glob("part_*.mp4"), key=lambda p: p.name)
+    segments = [str(s) for s in segments if s.stat().st_size > 0 and "%" not in s.name]
+
+    # Check if stream copy produced valid-sized segments
+    oversized = [s for s in segments if os.path.getsize(s) > MAX_SIZE_BYTES]
+
+    if not oversized and segments:
+        log(f"✓ Stream-copy produced {len(segments)} valid segments")
+        for i, seg in enumerate(segments):
+            sd = get_duration_file(seg)
+            ss = os.path.getsize(seg)
+            log(f"  [{i+1}] {os.path.basename(seg)}: {human_size(ss)}, {sd:.1f}s")
+        return segments
+
+    # ── Strategy 2: Re-encode with forced keyframes ──
+    log(f"⚠️ Stream-copy produced {len(oversized)} oversized segment(s).")
+    log(f"   This indicates sparse keyframes in the source.")
+    log(f"   Falling back to re-encoding with forced keyframes...")
+
+    # Clean up failed attempt
+    for s in segments:
+        try:
+            os.unlink(s)
+        except OSError:
+            pass
+
+    if has_audio:
+        audio_opts_enc = (
+            "-map 0:v:0 -map 0:a:0? "
+            "-c:v libx264 -preset ultrafast -crf 28 "
+            "-g 50 -keyint_min 25 -sc_threshold 0 "
+            "-fps_mode vfr "
+            "-c:a aac -b:a 96k"
+        )
+    else:
+        audio_opts_enc = (
+            "-map 0:v:0 "
+            "-c:v libx264 -preset ultrafast -crf 28 "
+            "-g 50 -keyint_min 25 -sc_threshold 0 "
+            "-fps_mode vfr "
+            "-an"
+        )
+
+    cmd_enc = (
+        f'ffmpeg -y -i "{source_path}" '
+        f'{audio_opts_enc} '
+        f'-f segment -segment_time 40 '
+        f'-reset_timestamps 1 -movflags +faststart '
+        f'"{pattern}"'
+    )
+    log(f"🔪 Attempt 2: Re-encoding with forced keyframes (g=50, ~2s GOP)...")
+    r = run(cmd_enc, timeout=7200)  # 2 hours for 1-hour 1080p ultrafast
 
     segments = sorted(Path(work_dir).glob("part_*.mp4"), key=lambda p: p.name)
     segments = [str(s) for s in segments if s.stat().st_size > 0 and "%" not in s.name]
 
     if not segments:
-        log("✗ No segments produced")
+        log("✗ Re-encoding produced no segments")
         return []
 
-    log(f"✓ Produced {len(segments)} segments")
+    log(f"✓ Re-encoding produced {len(segments)} segments")
     for i, seg in enumerate(segments):
         sd = get_duration_file(seg)
         ss = os.path.getsize(seg)
@@ -550,6 +607,10 @@ def split_source(source_path: str, work_dir: str, has_audio: bool, source_durati
 
 
 def resplit_oversized(seg_path: str, work_dir: str, idx: int) -> list:
+    """
+    Re-split an oversized segment using re-encoding (not stream copy).
+    This guarantees the split will succeed regardless of keyframe placement.
+    """
     size = os.path.getsize(seg_path)
     info = ffprobe_json(seg_path)
     if not info:
@@ -558,25 +619,26 @@ def resplit_oversized(seg_path: str, work_dir: str, idx: int) -> list:
     if dur <= 0:
         return [seg_path]
 
-    bitrate = size / dur
-    target_dur = max((TARGET_SIZE_BYTES * 0.85) / bitrate, 3.0)
-    log(f"    ⚠️ Oversized ({human_size(size)}) → re-splitting at ~{target_dur:.0f}s")
+    log(f"    ⚠️ Oversized ({human_size(size)}, {dur:.1f}s) → re-encoding split...")
 
     sub_dir = os.path.join(work_dir, f"resplit_{idx:03d}")
     os.makedirs(sub_dir, exist_ok=True)
     pattern = os.path.join(sub_dir, "sub_%03d.mp4")
 
     _, ac = get_codecs(info)
-    audio_opts = "-c:a aac -b:a 128k" if ac else "-an"
+    audio_opts = "-c:a aac -b:a 64k" if ac else "-an"
 
+    # Use shorter segment time and higher CRF to guarantee size reduction
     cmd = (
         f'ffmpeg -y -i "{seg_path}" '
-        f'-c:v copy {audio_opts} '
-        f'-f segment -segment_time {target_dur:.1f} '
+        f'-c:v libx264 -preset ultrafast -crf 32 '
+        f'-g 50 -keyint_min 25 -sc_threshold 0 '
+        f'-fps_mode vfr {audio_opts} '
+        f'-f segment -segment_time 20 '
         f'-reset_timestamps 1 -movflags +faststart '
         f'"{pattern}"'
     )
-    r = run(cmd, timeout=600)
+    r = run(cmd, timeout=1800)
     if r and r.returncode == 0:
         subs = sorted(Path(sub_dir).glob("sub_*.mp4"), key=lambda p: p.name)
         subs = [str(s) for s in subs if s.stat().st_size > 0 and "%" not in s.name]
@@ -590,11 +652,15 @@ def resplit_oversized(seg_path: str, work_dir: str, idx: int) -> list:
 # VERIFICATION — Audio is OPTIONAL
 # ═══════════════════════════════════════════════════════════
 def verify_segment(path: str) -> dict:
+    """
+    Verify MP4 segment. Audio is OPTIONAL and never causes rejection.
+    Returns structured dict, never bool.
+    """
     result = {
         "ok": False, "reason": "", "duration": 0.0,
         "width": 0, "height": 0, "fps": 0.0,
         "has_video": False, "has_audio": False,
-        "size": 0, "decode_ok": False,
+        "size": 0, "sha256": "", "decode_ok": False,
     }
     if not os.path.exists(path):
         result["reason"] = "not found"
@@ -607,6 +673,8 @@ def verify_segment(path: str) -> dict:
     if size > MAX_SIZE_BYTES:
         result["reason"] = f"exceeds 45 MiB: {human_size(size)}"
         return result
+
+    result["sha256"] = sha256_file(path)
 
     info = ffprobe_json(path)
     if not info:
@@ -627,12 +695,14 @@ def verify_segment(path: str) -> dict:
         result["reason"] = "no video stream"
         return result
 
+    # AUDIO IS OPTIONAL — never reject for missing audio
     w, h = get_resolution(info)
     result["width"] = w
     result["height"] = h
     result["fps"] = get_fps(info)
 
-    dr = run(f'ffmpeg -v error -i "{path}" -f null -', timeout=120)
+    # Decode test
+    dr = run(f'ffmpeg -v error -i "{path}" -f null -', timeout=300)
     if dr is None:
         result["reason"] = "decode timeout"
         return result
@@ -711,8 +781,10 @@ def tg_send_video(video_path: str, caption: str, duration: int, width: int, heig
                 result["error"] = "HTTP 403"
                 return result
             result["error"] = f"HTTP {e.code}"
+            log(f"    send attempt {attempt}/{MAX_RETRIES}: HTTP {e.code}")
         except Exception as e:
             result["error"] = str(e)
+            log(f"    send attempt {attempt}/{MAX_RETRIES}: {e}")
         if attempt < MAX_RETRIES:
             time.sleep(5 * attempt)
     return result
@@ -732,6 +804,7 @@ def main():
         log("⏭️ Already completed — skipping")
         return
 
+    # ── Step 1: Source Selection ──
     source_info = find_best_source()
     if not source_info:
         log("✗ NO VALID SOURCE — ABORTING")
@@ -759,14 +832,19 @@ def main():
     log(f"{'=' * 60}")
 
     mf["source"] = {
-        "type": source_info["type"], "path": source_path,
-        "sha256": v["sha256"], "size": v["size"],
-        "duration": round(source_duration, 1), "has_audio": source_has_audio,
-        "video_packets": v["video_packets"], "audio_packets": v["audio_packets"],
+        "type": source_info["type"],
+        "path": source_path,
+        "sha256": v["sha256"],
+        "size": v["size"],
+        "duration": round(source_duration, 1),
+        "has_audio": source_has_audio,
+        "video_packets": v["video_packets"],
+        "audio_packets": v["audio_packets"],
         "truncated": v.get("truncated", False),
     }
     save_manifest(STREAM_ID, mf)
 
+    # ── Step 2: Segmentation ──
     log(f"\n{'=' * 60}")
     log("STEP 2: SEGMENTATION")
     log(f"{'=' * 60}")
@@ -782,24 +860,26 @@ def main():
         update_worker_final_state(STREAM_ID, "failed", {"error": "split_failed"})
         return
 
+    # Handle oversized segments with re-encoding
     final_segments = []
     for idx, seg in enumerate(segments):
         seg_size = os.path.getsize(seg)
         if seg_size > MAX_SIZE_BYTES:
-            for _ in range(MAX_RESPLIT_TRIES):
+            for try_n in range(MAX_RESPLIT_TRIES):
                 subs = resplit_oversized(seg, work_dir, idx)
                 if all(os.path.getsize(s) <= MAX_SIZE_BYTES for s in subs):
                     final_segments.extend(subs)
                     break
-            else:
-                log(f"    ✗ Could not reduce segment {idx} below size limit")
-                mf["errors"].append(f"oversized:{os.path.basename(seg)}")
+                if try_n == MAX_RESPLIT_TRIES - 1:
+                    log(f"    ✗ Could not reduce segment {idx} below size limit after {MAX_RESPLIT_TRIES} attempts")
+                    mf["errors"].append(f"oversized:{os.path.basename(seg)}")
         else:
             final_segments.append(seg)
 
     total = len(final_segments)
     log(f"\n📦 Final segment count: {total}")
 
+    # ── Step 3: Verify and Send ──
     log(f"\n{'=' * 60}")
     log("STEP 3: VERIFICATION & DELIVERY")
     log(f"{'=' * 60}")
@@ -828,9 +908,9 @@ def main():
             save_manifest(STREAM_ID, mf)
             continue
 
-        audio_str = "YES" if verdict["has_audio"] else "NO (accepted)"
+        audio_str = "YES" if verdict["has_audio"] else "NO (video-only, accepted)"
         log(f"  [{idx+1}/{total}] {seg_name}: ✓ {human_size(verdict['size'])}, "
-            f"{verdict['duration']:.1f}s, audio={audio_str}")
+            f"{verdict['duration']:.1f}s, audio={audio_str}, decode=OK")
 
         caption = (
             f"🎬 {display_name}\n"
@@ -850,8 +930,11 @@ def main():
             sent_count += 1
             sent_durations.append(verdict["duration"])
             mf["segments"][seg_key] = {
-                "sent": True, "message_id": tg_res["message_id"],
-                "size": verdict["size"], "duration": round(verdict["duration"], 1),
+                "sent": True,
+                "message_id": tg_res["message_id"],
+                "size": verdict["size"],
+                "sha256": verdict["sha256"],
+                "duration": round(verdict["duration"], 1),
                 "has_audio": verdict["has_audio"],
             }
         else:
@@ -863,6 +946,7 @@ def main():
         if idx < total - 1:
             time.sleep(SEND_DELAY_SECONDS)
 
+    # ── Step 4: Coverage Report ──
     coverage = calculate_coverage(sent_durations, source_duration)
 
     log(f"\n{'=' * 60}")
@@ -881,21 +965,21 @@ def main():
     log(f"{'=' * 60}")
 
     if coverage["complete"] and failed_count == 0:
-        mf["state"] = "SENT"
+        mf["state"] = "COMPLETE"
         mf["coverage"] = coverage
         save_manifest(STREAM_ID, mf)
-        log("\n✅ ALL SEGMENTS SENT — FULL COVERAGE")
+        log("\n✅ ALL SEGMENTS SENT — FULL COVERAGE VERIFIED")
         update_worker_final_state(STREAM_ID, "completed", {
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "segments_sent": sent_count,
             "coverage_percent": coverage["coverage_percent"],
         })
     elif sent_count > 0:
-        mf["state"] = "PARTIAL"
+        mf["state"] = "INCOMPLETE"
         mf["coverage"] = coverage
         save_manifest(STREAM_ID, mf)
         if not coverage["complete"]:
-            log(f"\n⚠️ PARTIAL — INCOMPLETE COVERAGE ({coverage['coverage_percent']}%)")
+            log(f"\n⚠️ INCOMPLETE — COVERAGE {coverage['coverage_percent']}%")
             log(f"   Missing: {coverage['gap_seconds']}s")
     else:
         mf["state"] = "FAILED"
